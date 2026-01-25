@@ -1,0 +1,26 @@
+# Core dependencies
+numpy>=1.23.5
+matplotlib>=3.7.5
+PyYAML>=6.0
+
+# PyBullet simulation
+pybullet>=3.2.5
+pyb_utils==2.2.1
+
+# Math/robotics
+spatialmath_python>=1.0.3
+qpsolvers>=4.2.0
+shapely>=2.0.0
+
+# Web observer
+flask>=2.0.0
+flask-socketio>=5.0.0
+
+# URDF handling
+xacrodoc>=0.3.0
+
+# Testing
+pytest>=7.4.2
+
+# Optional (from force_push)
+tqdm>=4.65.0

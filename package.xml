@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>contact_maintain</name>
+  <version>0.1.0</version>
+  <description>Contact maintenance with holonomic and differential-drive robots in PyBullet simulation.</description>
+  <maintainer email="user@example.com">User</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+</package>

@@ -1,0 +1,171 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="robotino3">
+    <!-- 
+    Robotino 3 Simplified Model for Contact Maintenance
+    
+    Based on Festo Robotino 3 from Webots.
+    - Cylindrical body (no wheel physics, pure velocity control)
+    - Sphere contact sensor ("bumper") at front
+    - 3 DOF: x, y translation and rotation around z
+    -->
+
+    <!-- Robot parameters - scaled to realistic small robot (radius ~0.06m) -->
+    <xacro:arg name="body_radius" default="0.06"/>
+    <xacro:arg name="body_height" default="0.08"/>
+    <xacro:arg name="body_mass" default="0.5"/>
+    <xacro:arg name="bumper_radius" default="0.015"/>
+    <xacro:arg name="bumper_mass" default="0.005"/>
+    <!-- Bumper is at front of robot, on the edge of the body -->
+    <xacro:arg name="bumper_offset" default="0.055"/>
+
+    <xacro:property name="body_radius" value="$(arg body_radius)"/>
+    <xacro:property name="body_height" value="$(arg body_height)"/>
+    <xacro:property name="body_mass" value="$(arg body_mass)"/>
+    <xacro:property name="bumper_radius" value="$(arg bumper_radius)"/>
+    <xacro:property name="bumper_mass" value="$(arg bumper_mass)"/>
+    <xacro:property name="bumper_offset" value="$(arg bumper_offset)"/>
+
+    <!-- Colors matching Robotino -->
+    <material name="robotino_orange">
+        <color rgba="1.0 0.4 0.0 1.0"/>
+    </material>
+    <material name="bumper_black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+    </material>
+    <material name="marker_blue">
+        <color rgba="0.0 0.33 1.0 1.0"/>
+    </material>
+
+    <!-- World link (fixed reference) -->
+    <link name="world"/>
+
+    <!-- X-axis prismatic joint carrier -->
+    <link name="x_carrier">
+        <inertial>
+            <mass value="0.001"/>
+            <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+        </inertial>
+    </link>
+
+    <joint name="x_joint" type="prismatic">
+        <parent link="world"/>
+        <child link="x_carrier"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <axis xyz="1 0 0"/>
+        <limit lower="-100" upper="100" effort="1000" velocity="10"/>
+        <dynamics damping="0.0" friction="0.0"/>
+    </joint>
+
+    <!-- Y-axis prismatic joint carrier -->
+    <link name="y_carrier">
+        <inertial>
+            <mass value="0.001"/>
+            <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+        </inertial>
+    </link>
+
+    <joint name="y_joint" type="prismatic">
+        <parent link="x_carrier"/>
+        <child link="y_carrier"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <axis xyz="0 1 0"/>
+        <limit lower="-100" upper="100" effort="1000" velocity="10"/>
+        <dynamics damping="0.0" friction="0.0"/>
+    </joint>
+
+    <!-- Rotation joint carrier -->
+    <link name="theta_carrier">
+        <inertial>
+            <mass value="0.001"/>
+            <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+        </inertial>
+    </link>
+
+    <joint name="theta_joint" type="continuous">
+        <parent link="y_carrier"/>
+        <child link="theta_carrier"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <axis xyz="0 0 1"/>
+        <limit effort="1000" velocity="10"/>
+        <dynamics damping="0.0" friction="0.0"/>
+    </joint>
+
+    <!-- Robot body (Robotino cylindrical base) -->
+    <link name="base_link">
+        <!-- Main cylinder body -->
+        <visual>
+            <geometry>
+                <cylinder radius="${body_radius}" length="${body_height}"/>
+            </geometry>
+            <origin xyz="0 0 ${body_height/2}" rpy="0 0 0"/>
+            <material name="robotino_orange"/>
+        </visual>
+        <!-- Blue ring marker on top (like Webots OUT_CIRCLE) -->
+        <visual>
+            <geometry>
+                <cylinder radius="${body_radius * 0.88 * 1.15}" length="0.006"/>
+            </geometry>
+            <origin xyz="0 0 ${body_height + 0.003}" rpy="0 0 0"/>
+            <material name="marker_blue"/>
+        </visual>
+        <collision>
+            <geometry>
+                <cylinder radius="${body_radius}" length="${body_height}"/>
+            </geometry>
+            <origin xyz="0 0 ${body_height/2}" rpy="0 0 0"/>
+        </collision>
+        <inertial>
+            <mass value="${body_mass}"/>
+            <origin xyz="0 0 ${body_height/2}" rpy="0 0 0"/>
+            <!-- Cylinder inertia: Ixx=Iyy=m*(3r^2+h^2)/12, Izz=m*r^2/2 -->
+            <inertia 
+                ixx="${body_mass*(3*body_radius*body_radius + body_height*body_height)/12}" 
+                ixy="0" ixz="0" 
+                iyy="${body_mass*(3*body_radius*body_radius + body_height*body_height)/12}" 
+                iyz="0" 
+                izz="${body_mass*body_radius*body_radius/2}"/>
+        </inertial>
+    </link>
+
+    <joint name="base_joint" type="fixed">
+        <parent link="theta_carrier"/>
+        <child link="base_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Bumper / Contact sensor (sphere at front of robot) -->
+    <!-- In Webots: translation -6.6e-06 0.19998 0.08, so roughly at y=0.2, z=0.08 -->
+    <!-- After rotation -90deg around z, this becomes x=0.2 in robot frame -->
+    <link name="bumper">
+        <visual>
+            <geometry>
+                <sphere radius="${bumper_radius}"/>
+            </geometry>
+            <material name="bumper_black"/>
+        </visual>
+        <collision>
+            <geometry>
+                <sphere radius="${bumper_radius}"/>
+            </geometry>
+        </collision>
+        <inertial>
+            <mass value="${bumper_mass}"/>
+            <!-- Sphere inertia: I = 2/5 * m * r^2 -->
+            <inertia 
+                ixx="${0.4*bumper_mass*bumper_radius*bumper_radius}" 
+                ixy="0" ixz="0" 
+                iyy="${0.4*bumper_mass*bumper_radius*bumper_radius}" 
+                iyz="0" 
+                izz="${0.4*bumper_mass*bumper_radius*bumper_radius}"/>
+        </inertial>
+    </link>
+
+    <!-- Bumper is at the front edge of the robot body -->
+    <joint name="bumper_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="bumper"/>
+        <!-- Position: front of robot (x = body_radius + small gap), at mid-height -->
+        <origin xyz="${bumper_offset} 0 ${body_height * 0.35}" rpy="0 0 0"/>
+    </joint>
+
+</robot>
