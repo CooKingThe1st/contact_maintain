@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -79,6 +80,7 @@ class Phase7History:
     contact_point_velocities: List[np.ndarray] = field(default_factory=list)
     object_positions: List[np.ndarray] = field(default_factory=list)
     object_velocities: List[np.ndarray] = field(default_factory=list)
+    object_angular_velocities: List[float] = field(default_factory=list)  # Object angular velocity (omega)
     contact_forces: List[float] = field(default_factory=list)
     in_contact: List[bool] = field(default_factory=list)
     v_base_history: List[float] = field(default_factory=list)
@@ -376,6 +378,7 @@ class Phase7ContactPointSpeedController:
             self.history.contact_point_velocities.append(contact_point_velocity.copy())
             self.history.object_positions.append(object_pos.copy())
             self.history.object_velocities.append(object_velocity.copy())
+            self.history.object_angular_velocities.append(object_angular_velocity)
             self.history.contact_forces.append(contact_force)
             self.history.in_contact.append(in_contact)
             self.history.v_base_history.append(v_base)
@@ -658,6 +661,7 @@ class Phase7AlphaController:
             self.history.contact_point_velocities.append(contact_point_velocity.copy())
             self.history.object_positions.append(object_pos.copy())
             self.history.object_velocities.append(object_velocity.copy())
+            self.history.object_angular_velocities.append(object_angular_velocity)
             self.history.contact_forces.append(contact_force)
             self.history.in_contact.append(in_contact)
             self.history.v_base_history.append(v_along)  # Store v_along as v_base for plotting
@@ -967,6 +971,7 @@ class Phase7BetaController:
             self.history.contact_point_velocities.append(contact_point_velocity.copy())
             self.history.object_positions.append(object_pos.copy())
             self.history.object_velocities.append(object_velocity.copy())
+            self.history.object_angular_velocities.append(object_angular_velocity)
             self.history.contact_forces.append(contact_force)
             self.history.in_contact.append(in_contact)
             # Store components for plotting
@@ -1245,7 +1250,7 @@ class Phase7BetaVerDecouple:
         
         # Total lateral velocity (feed-forward + position correction)
         # v_perp = v_perp_ff + v_perp_pos
-        v_perp = v_perp_ff * 0.8 + v_perp_pos
+        v_perp = v_perp_ff * 1 + v_perp_pos
         v_perp = np.clip(v_perp, -self.max_perp_speed, self.max_perp_speed)
         
         # STEP 5: Transform from contact frame to world frame
@@ -1277,6 +1282,7 @@ class Phase7BetaVerDecouple:
             self.history.contact_point_velocities.append(contact_point_velocity.copy())
             self.history.object_positions.append(object_pos.copy())
             self.history.object_velocities.append(object_velocity.copy())
+            self.history.object_angular_velocities.append(object_angular_velocity)
             self.history.contact_forces.append(contact_force)
             self.history.in_contact.append(in_contact)
             # Store components for plotting
@@ -1572,8 +1578,9 @@ class Phase7BetaVerDecoupleVerLocal:
         v_perp_pos = self.kp_perp * error_perp
         
         # Total lateral velocity (feed-forward + position correction)
-        # v_perp = v_perp_ff + v_perp_pos
-        v_perp = v_perp_ff * 0.8 + v_perp_pos
+        # v_perp = v_perp_ff * 0.8 + v_perp_pos
+        v_perp = v_perp_ff * 1 + v_perp_pos
+        # v_perp = v_perp_pos
         v_perp = np.clip(v_perp, -self.max_perp_speed, self.max_perp_speed)
         
         # STEP 5: Transform from contact frame to world frame
@@ -1605,6 +1612,7 @@ class Phase7BetaVerDecoupleVerLocal:
             self.history.contact_point_velocities.append(contact_point_velocity.copy())
             self.history.object_positions.append(object_pos.copy())
             self.history.object_velocities.append(object_velocity.copy())
+            self.history.object_angular_velocities.append(object_angular_velocity)
             self.history.contact_forces.append(contact_force)
             self.history.in_contact.append(in_contact)
             # Store components for plotting
@@ -1617,6 +1625,7 @@ class Phase7BetaVerDecoupleVerLocal:
 
 
 def setup_pybullet(gui: bool = True):
+    
     if gui:
         client_id = pyb.connect(pyb.GUI, options="--width=1280 --height=720")
     else:
@@ -1633,9 +1642,9 @@ def setup_pybullet(gui: bool = True):
     if gui:
         # Configure camera
         pyb.resetDebugVisualizerCamera(
-            cameraDistance=2.5,
-            cameraYaw=45,
-            cameraPitch=-45,
+            cameraDistance=4,
+            cameraYaw=-5,
+            cameraPitch=-85,
             cameraTargetPosition=[0, 0, 0]
         )
         # Disable GUI elements (tabs and tree view sidebar) - keep only the scene
@@ -1644,6 +1653,97 @@ def setup_pybullet(gui: bool = True):
     
     return ground
 
+def setup_video_recording(video_path: Path, object_uid: int):
+    """Setup PyBullet video recording from fixed top-down view.
+    
+    Sets the camera to a fixed top-down view at the start and keeps it there.
+    No camera tracking during simulation to avoid interfering with video recording.
+    
+    Parameters
+    ----------
+    video_path : Path
+        Absolute path to save the video file (should end with .mp4)
+    object_uid : int
+        PyBullet UID of the object (for initial camera positioning)
+    
+    Returns
+    -------
+    int
+        Video logging ID
+    """
+    # Get object position for initial camera positioning
+    pos, _ = pyb.getBasePositionAndOrientation(object_uid)
+    
+    
+    
+    # Ensure path is absolute and parent directory exists
+    video_path = video_path.resolve()
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Remove existing file if it exists
+    if video_path.exists():
+        print(f"Removing existing video file at {video_path}")
+        video_path.unlink()
+    
+    # Start video logging
+    video_path_str = str(video_path)
+    print(f"Starting video recording to: {video_path_str}")
+    print(f"  Camera: Fixed top-down view (no tracking)")
+    
+    video_log_id = pyb.startStateLogging(
+        pyb.STATE_LOGGING_VIDEO_MP4,
+        video_path_str
+    )
+    
+    if video_log_id < 0:
+        raise RuntimeError(f"Failed to start video recording (log_id={video_log_id})")
+    
+    print(f"✓ Video recording started (log_id={video_log_id})")
+    
+    return video_log_id
+
+def stop_video_recording(video_log_id: int, video_path: Path):
+    """Stop PyBullet video recording and ensure file is saved.
+    
+    Parameters
+    ----------
+    video_log_id : int
+        Video logging ID returned from setup_video_recording
+    video_path : Path
+        Absolute path where video should be saved
+    """
+    # Ensure path is absolute
+    video_path = video_path.resolve()
+    
+    if video_log_id < 0:
+        print(f"Error: Invalid video_log_id ({video_log_id})")
+        return
+    
+    # Stop the logging
+    pyb.stopStateLogging(video_log_id)
+    print(f"Stopped video logging (ID: {video_log_id})")
+
+
+
+    
+    
+    # Give it time to write the file
+    import time
+    time.sleep(3.0)  # Increased wait time
+    
+    # Verify file was created
+    if video_path.exists():
+        file_size = video_path.stat().st_size
+        if file_size > 0:
+            print(f"✓ Video saved successfully to {video_path} ({file_size / 1024 / 1024:.2f} MB)")
+        else:
+            print(f"⚠ Warning: Video file is empty (0 bytes)")
+    else:
+        print(f"✗ Error: Video file not found at {video_path}")
+        # Check what files are in the directory
+        mp4_files = list(video_path.parent.glob("*.mp4"))
+        if mp4_files:
+            print(f"  Found these .mp4 files: {mp4_files}")
 
 def get_object_state(object_uid):
     pos, orn = pyb.getBasePositionAndOrientation(object_uid)
@@ -1700,9 +1800,9 @@ def plot_phase7_velocities(
         print("No history to plot for Phase 7 velocities.")
         return
     
-    # Create subplots: one row per robot, 5 columns (added contact force)
+    # Create subplots: one row per robot, 7 columns (added object velocity plots)
     n_robots = len(histories)
-    fig, axes = plt.subplots(n_robots, 5, figsize=(20, 4 * n_robots))
+    fig, axes = plt.subplots(n_robots, 7, figsize=(28, 4 * n_robots))
     if n_robots == 1:
         axes = axes.reshape(1, -1)
     
@@ -1720,6 +1820,7 @@ def plot_phase7_velocities(
         robot_vels = np.array(history.robot_velocities)
         robot_speeds = np.linalg.norm(robot_vels[:, :2], axis=1)
         obj_vels = np.array(history.object_velocities)
+        obj_angular_vels = np.array(history.object_angular_velocities)
         cp_vels = np.array(history.contact_point_velocities)
         cp_speeds = np.linalg.norm(cp_vels, axis=1)
         desired_cp_speeds = np.array(history.desired_contact_point_speeds)
@@ -1779,6 +1880,28 @@ def plot_phase7_velocities(
         ax.set_ylim(-0.1, 1.1)
         ax.set_yticks([0, 1])
         ax.set_yticklabels(['No Contact', 'In Contact'])
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 6: Object linear velocity (x, y)
+        ax = axes[idx, 5]
+        ax.plot(times, obj_vels[:, 0], 'b-', label='vx', linewidth=1.5)
+        ax.plot(times, obj_vels[:, 1], 'r-', label='vy', linewidth=1.5)
+        ax.axhline(y=desired_obj_velocity[0], color='b', linestyle='--', alpha=0.5, label='desired vx')
+        ax.axhline(y=desired_obj_velocity[1], color='r', linestyle='--', alpha=0.5, label='desired vy')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Velocity (m/s)')
+        ax.set_title(f'{name}  Object Linear Velocity')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Plot 7: Object angular velocity (omega)
+        ax = axes[idx, 6]
+        ax.plot(times, obj_angular_vels, 'g-', label='omega', linewidth=1.5)
+        ax.axhline(y=desired_obj_omega, color='g', linestyle='--', alpha=0.5, label='desired omega')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Angular Velocity (rad/s)')
+        ax.set_title(f'{name} - Object Angular Velocity')
         ax.legend()
         ax.grid(True, alpha=0.3)
     
@@ -1942,6 +2065,8 @@ def main():
     parser.add_argument("--magnum-visualize", action="store_true", help="Visualize Magnum Four search (matplotlib)")
     parser.add_argument("--save-dir", type=str, default=None,
                        help="Directory to save plots (only for Phase 7 velocity controller)")
+    parser.add_argument("--record-video", action="store_true",
+                       help="Record PyBullet simulation as video (top-down view). Requires --save-dir.")
     
     args = parser.parse_args()
 
@@ -2088,7 +2213,7 @@ def main():
     if pushing_type == "velocity":
         # Phase 7 controller: track contact point speed calculated from desired object motion
         desired_obj_velocity = np.array([0.03, 0.05])  # Desired object linear velocity (vx, vy)
-        desired_obj_omega = 0  # Desired object angular velocity (rad/s)
+        desired_obj_omega = 0.2  # Desired object angular velocity (rad/s)
         
         for name, agent in robot_agents.items():
             # Get the target t_param for this robot
@@ -2122,6 +2247,23 @@ def main():
     target_map = {name: t_params[i] for i, name in enumerate(robots.keys())}
     print(f"Assigned targets: { {k: round(v, 4) for k, v in target_map.items()} }")
     host.assign_targets(target_map)
+
+    # Setup video recording if requested
+    video_log_id = None
+    video_path = None
+    if args.record_video and not args.no_gui:
+        if not args.save_dir:
+            raise ValueError("--record-video requires --save-dir to be specified")
+        
+        # Always save as phase7_topview.mp4 in save_dir
+        save_dir = Path(args.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        video_path = save_dir / "phase7_topview.mp4"
+        
+        
+
+        video_log_id = setup_video_recording(video_path, object_uid)
+
 
     # Run sim loop
     n_steps = int(args.duration / TIMESTEP)
@@ -2177,11 +2319,19 @@ def main():
                 else:
                     agent.robot.command_velocity(cmd)
 
+
         pyb.stepSimulation()
         t += TIMESTEP
         step_count += 1
+        
         if not args.no_gui:
             time.sleep(TIMESTEP * 0.3)
+
+    # Note: PyBullet video recording is finalized automatically when we disconnect
+    # We don't need to stop it manually - PyBullet will handle it
+    if video_log_id is not None:
+        print(f"Video recording will be finalized on PyBullet disconnect...")
+        stop_video_recording(video_log_id, video_path)
 
     # Plot results if save_dir is provided and using Phase 7 controller
     if args.save_dir and pushing_type == "velocity" and len(phase7_controllers) > 0:
@@ -2212,6 +2362,27 @@ def main():
         print(f"Saved plots to {save_path}")
 
     pyb.disconnect()
+    # Verify video file was created (after disconnect, PyBullet should have finalized it)
+    if video_log_id is not None and video_path is not None:
+        time.sleep(1.0)  # Give PyBullet time to finalize file after disconnect
+        
+        video_path = video_path.resolve()
+        if video_path.exists():
+            file_size = video_path.stat().st_size
+            if file_size > 0:
+                print(f"✓ Video saved successfully to {video_path} ({file_size / 1024 / 1024:.2f} MB)")
+            else:
+                print(f"✗ Warning: Video file exists but is empty (0 bytes) at {video_path}")
+        else:
+            print(f"✗ Warning: Video file not found at {video_path}")
+            print(f"  Expected path: {video_path.absolute()}")
+            print(f"  Parent directory exists: {video_path.parent.exists()}")
+            # List files in parent directory to see if it was created with different name
+            if video_path.parent.exists():
+                print(f"  Files in directory: {list(video_path.parent.glob('*.mp4'))}")
+            print(f"  This might indicate an issue with PyBullet video recording.")
+            print(f"  Make sure GUI is enabled (not --no-gui) and path is writable.")
+    
     print("Done.")
 
 
