@@ -5,8 +5,17 @@ import math
 import time
 import matplotlib.pyplot as plt
 from shapely.geometry import Point, Polygon, LineString
-from shapely.ops import transform
+from shapely.ops import transform, nearest_points
 from shapely.affinity import rotate, translate
+from pathlib import Path
+from typing import Union, Optional
+import ezdxf
+try:
+    import trimesh
+    TRIMESH_AVAILABLE = True
+except ImportError:
+    TRIMESH_AVAILABLE = False
+    trimesh = None
 
 import socket
 import struct
@@ -392,14 +401,14 @@ def create_standard_objects():
     )
     
     # Circle (radius 0.5m)
-    circle_geom = Point(0, 0).buffer(0.2 * S)
+    circle_geom = Point(0, 0).buffer(0.4 * S)
     circle_mass = estimate_realistic_mass(circle_geom)
     objects['circle'] = GenericObject(
         geometry=circle_geom,
         mass=circle_mass,
         lateral_friction=0.4,
         heading=0.0,
-        name="Circle"
+        name="True_Circle"
     )
     
 
@@ -440,6 +449,30 @@ def create_standard_objects():
         lateral_friction=0.33,
         heading=0.0,
         name="Fat Triangle"
+    )
+
+    # Narrow Triangle (symmetric, narrow base)
+    narrow_triangle_vertices = [(0*S, 0.9*S), (-0.01*S, -0.9*S), (0.01*S, -0.9*S)]
+    narrow_triangle_geom = Polygon(narrow_triangle_vertices)
+    narrow_triangle_mass = estimate_realistic_mass(narrow_triangle_geom)
+    objects['narrow_triangle'] = GenericObject(
+        geometry=narrow_triangle_geom,
+        mass=narrow_triangle_mass,
+        lateral_friction=0.33,
+        heading=0.0,
+        name="Narrow Triangle"
+    )
+
+    # Obese Triangle (symmetric, wide base)
+    obese_triangle_vertices = [(0*S, 0.05*S), (-0.9*S, -0.05*S), (0.9*S, -0.05*S)]
+    obese_triangle_geom = Polygon(obese_triangle_vertices)
+    obese_triangle_mass = estimate_realistic_mass(obese_triangle_geom)
+    objects['obese_triangle'] = GenericObject(
+        geometry=obese_triangle_geom,
+        mass=obese_triangle_mass,
+        lateral_friction=0.33,
+        heading=0.0,
+        name="Obese Triangle"
     )
     
     # Scalene Triangle (all sides different, non-symmetric)
@@ -650,24 +683,24 @@ def create_standard_objects():
         name="Arrow"
     )
     
-    # Comma/Hook shape (non-convex, non-symmetric) - FIXED
-    head_circle = Point(0, 0.15*S).buffer(0.12*S)
-    tail_vertices = [(-0.05*S, 0.05*S), (0.05*S, 0.05*S), (0.08*S, -0.18*S), (-0.02*S, -0.18*S)]
-    tail_poly = Polygon(tail_vertices)
-    hook_geom = head_circle.union(tail_poly)
+    # # Comma/Hook shape (non-convex, non-symmetric) - FIXED
+    # head_circle = Point(0, 0.15*S).buffer(0.12*S)
+    # tail_vertices = [(-0.05*S, 0.05*S), (0.05*S, 0.05*S), (0.08*S, -0.18*S), (-0.02*S, -0.18*S)]
+    # tail_poly = Polygon(tail_vertices)
+    # hook_geom = head_circle.union(tail_poly)
     
-    # Ensure single Polygon
-    if hook_geom.geom_type == 'MultiPolygon':
-        hook_geom = hook_geom.buffer(0.001).buffer(-0.001)
+    # # Ensure single Polygon
+    # if hook_geom.geom_type == 'MultiPolygon':
+    #     hook_geom = hook_geom.buffer(0.001).buffer(-0.001)
     
-    hook_mass = estimate_realistic_mass(hook_geom)
-    objects['hook'] = GenericObject(
-        geometry=hook_geom,
-        mass=hook_mass,
-        lateral_friction=0.31,
-        heading=0.0,
-        name="Hook"
-    )
+    # hook_mass = estimate_realistic_mass(hook_geom)
+    # objects['hook'] = GenericObject(
+    #     geometry=hook_geom,
+    #     mass=hook_mass,
+    #     lateral_friction=0.31,
+    #     heading=0.0,
+    #     name="Hook"
+    # )
     
     
     # Wedge (right triangle, non-symmetric)
@@ -699,6 +732,519 @@ def create_standard_objects():
     
     return objects
 
+
+def get_reachable_contact_points(
+    geometry: Polygon,
+    robot_radius: float,
+    n_samples: int = 512,
+):
+    """
+    Compute reachable contact points on the boundary of a 2D object for a
+    circular robot of radius `robot_radius` starting from infinity.
+
+    This uses a configuration-space formulation:
+    - Buffer the object geometry by `robot_radius` to obtain the C-obstacle
+      O ⊕ B(0, R).
+    - Take only the exterior ring of the buffered polygon; this corresponds
+      to the locus of robot centers that just touch the object from the
+      unbounded component of free space.
+    - Project these center points back to the original object boundary.
+
+    Args:
+        geometry: Shapely Polygon representing the object (workspace obstacle).
+        robot_radius: Radius of the circular robot.
+        n_samples: Number of samples along the reachable locus to return.
+
+    Returns:
+        np.ndarray of shape (N, 2): reachable contact points in world
+        coordinates, ordered along the reachable locus.
+    """
+    if not isinstance(geometry, Polygon):
+        raise TypeError(
+            f"get_reachable_contact_points expects a Polygon, got {type(geometry)}"
+        )
+    if robot_radius <= 0:
+        raise ValueError("robot_radius must be positive")
+
+    # 1. Build configuration-space obstacle via Minkowski sum with a disk
+    #    using a round buffer.
+    buffered = geometry.buffer(distance=robot_radius, join_style=1)  # 1 == ROUND
+
+    # Handle potential MultiPolygon from buffering non-convex shapes.
+    if buffered.geom_type == "MultiPolygon":
+        # Take largest component by area as the main C-obstacle.
+        buffered = max(buffered.geoms, key=lambda g: g.area)
+    elif buffered.geom_type != "Polygon":
+        raise RuntimeError(
+            f"Unsupported buffered geometry type: {buffered.geom_type}"
+        )
+
+    # 2. Extract the exterior ring of the buffered polygon: this is the path
+    #    of robot centers that touch the object from the outside.
+    center_path = buffered.exterior
+
+    # 3. Parameterize the center path and map each point back to the original
+    #    object boundary by closest-point projection.
+    path_length = center_path.length
+    if path_length <= 0 or n_samples <= 0:
+        return np.zeros((0, 2), dtype=float)
+
+    ts = np.linspace(0.0, path_length, int(n_samples), endpoint=False)
+    boundary = LineString(geometry.exterior.coords)
+
+    contact_points = []
+    for t in ts:
+        c = center_path.interpolate(t)
+        # Use boundary.project + interpolate, which is more efficient than
+        # nearest_points for many samples.
+        s = boundary.project(c)
+        contact = boundary.interpolate(s)
+        contact_points.append((contact.x, contact.y))
+
+    return np.asarray(contact_points, dtype=float)
+
+
+def get_reachable_contact_intervals(
+    geometry: Polygon,
+    robot_radius: float,
+    n_samples: int = 2048,
+    gap_factor: float = 3.0,
+):
+    """
+    Compute reachable intervals in boundary parameter space t ∈ [0, 1].
+
+    This uses the same C-space buffering approach as get_reachable_contact_points,
+    but returns contiguous intervals of boundary parameters where contact is
+    reachable by a circular robot of radius `robot_radius` starting from infinity.
+
+    Args:
+        geometry: Shapely Polygon representing the object (workspace obstacle).
+        robot_radius: Radius of the circular robot.
+        n_samples: Number of samples along the reachable locus for interval
+            estimation (higher = finer resolution).
+        gap_factor: Multiplier on nominal parameter step to detect gaps between
+            reachable regions. Larger values are more conservative.
+
+    Returns:
+        List of (t_start, t_end) tuples with 0 ≤ t_start ≤ t_end ≤ 1, covering
+        the approximate reachable subset of the boundary parameterization.
+    """
+    # Sample reachable contact points along the boundary
+    reachable_pts = get_reachable_contact_points(
+        geometry, robot_radius, n_samples=n_samples
+    )
+
+    boundary = LineString(geometry.exterior.coords)
+    boundary_length = boundary.length
+
+    if reachable_pts.size == 0 or boundary_length <= 0.0:
+        return []
+
+    # Map each reachable point back to a boundary parameter t ∈ [0, 1]
+    ts = []
+    for x, y in reachable_pts:
+        s = boundary.project(Point(x, y))  # arc-length along boundary
+        t = s / boundary_length
+        ts.append(t)
+
+    ts = np.sort(np.asarray(ts, dtype=float))
+
+    # Remove near-duplicates
+    if ts.size == 0:
+        return []
+    unique_ts = [ts[0]]
+    for val in ts[1:]:
+        if abs(val - unique_ts[-1]) > 1e-6:
+            unique_ts.append(val)
+    ts = np.asarray(unique_ts, dtype=float)
+
+    if ts.size == 0:
+        return []
+
+    # Nominal parameter step assuming uniform coverage
+    nominal_step = 1.0 / max(ts.size, 1)
+    gap_threshold = gap_factor * nominal_step
+
+    intervals = []
+    start_t = ts[0]
+    prev_t = ts[0]
+
+    for t in ts[1:]:
+        if t - prev_t > gap_threshold:
+            # Close previous interval
+            intervals.append((start_t, prev_t))
+            start_t = t
+        prev_t = t
+
+    # Close final interval
+    intervals.append((start_t, prev_t))
+
+    return intervals
+
+
+def dxf_to_generic(
+    dxf_path: Union[str, Path],
+    name: Optional[str] = None,
+    mass: Optional[float] = None,
+    lateral_friction: float = 0.8,
+    heading: float = 0.0,
+    reverse_sign: bool = True,
+) -> GenericObject:
+    """
+    Create a GenericObject from a DXF file containing a closed LWPOLYLINE.
+
+    ⚠️  **DEPRECATED / BUGGY**: This function has a confirmed bug where it extracts
+    vertices with incorrect signs: all x and y coordinates are negated (i.e., vertices
+    are in (-x, -y) format instead of (x, y)). This was verified by comparing with
+    Fusion 360's actual geometry.
+    
+    **DO NOT USE**: Use `read_obj_to_vertices` instead, which extracts 2D vertices
+    directly from OBJ files and gives correct coordinates. DXF files are no longer
+    needed in the pipeline.
+
+    This is the new geometry pipeline for complex shapes (bolt, pi, root, etc.):
+    we extract the 2D boundary directly from the DXF instead of hardcoding
+    vertices or using an intermediate JSON file.
+    
+    **Bug Fix Required**: To fix this function, reverse the sign of all x and y
+    values: `vertices = [(-x, -y) for x, y in vertices]` should become
+    `vertices = [(x, y) for x, y in vertices]` (or negate the extracted values).
+
+    Parameters
+    ----------
+    dxf_path : str | Path
+        Path to the DXF file.
+    name : str, optional
+        Name of the object. If None, uses the stem of the DXF file.
+    mass : float, optional
+        If provided, use this mass. Otherwise, estimate a reasonable mass
+        from the polygon area via estimate_realistic_mass.
+    lateral_friction : float
+        Lateral friction coefficient for the GenericObject.
+    heading : float
+        Initial heading (rotation) of the object in radians.
+    reverse_sign : bool
+        If True, reverse the sign of all x and y coordinates (default: True).
+        This fixes the known bug where DXF extraction gives (-x, -y) instead of (x, y).
+
+    Returns
+    -------
+    GenericObject
+        The constructed object ready for use with ContactPointParameterization.
+    """
+    dxf_path = Path(dxf_path)
+    if not dxf_path.exists():
+        raise FileNotFoundError(f"DXF file not found: {dxf_path}")
+
+    doc = ezdxf.readfile(str(dxf_path))
+    msp = doc.modelspace()
+
+    vertices = []
+
+    # Extract the first non-empty LWPOLYLINE as the outer boundary
+    for e in msp:
+        if e.dxftype() == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in e.get_points()]
+            # DXF LWPOLYLINE may repeat the first point at the end; drop duplicate
+            if len(pts) >= 2 and pts[0] == pts[-1]:
+                pts = pts[:-1]
+            if len(pts) >= 3:
+                vertices = pts
+                break
+
+    if not vertices:
+        raise ValueError(f"No valid LWPOLYLINE with >=3 points found in DXF: {dxf_path}")
+
+    # Reverse sign of x and y if requested (to fix the known bug)
+    if reverse_sign:
+        vertices = [(-x, -y) for x, y in vertices]
+
+    print(f"Vertices: {vertices}")
+    geometry = Polygon(vertices)
+    if not geometry.is_valid or geometry.area <= 0:
+        raise ValueError(f"DXF polygon is invalid or has zero area: {dxf_path}")
+
+    if mass is None:
+        obj_mass = estimate_realistic_mass(geometry)
+    else:
+        obj_mass = mass
+
+    obj_name = name if name is not None else dxf_path.stem
+
+    generic_obj = GenericObject(
+        geometry=geometry,
+        mass=obj_mass,
+        lateral_friction=lateral_friction,
+        heading=heading,
+        name=obj_name,
+    )
+
+    return generic_obj
+
+
+def read_obj_to_vertices(
+    obj_path: Union[str, Path],
+) -> list:
+    """
+    Extract 2D vertices from an OBJ file by slicing at the bottom (z_min).
+    
+    This function uses trimesh to load the OBJ file, then creates a cross-section
+    at the bottom of the mesh (minimum z-coordinate) to extract the 2D boundary.
+    This allows comparison with DXF-extracted vertices to detect orientation/vertex mismatches.
+    
+    Parameters
+    ----------
+    obj_path : str | Path
+        Path to the OBJ file.
+    
+    Returns
+    -------
+    list
+        List of (x, y) tuples representing the 2D boundary vertices.
+        The vertices are extracted from the bottom cross-section of the 3D mesh.
+    
+    Raises
+    ------
+    ImportError
+        If trimesh is not available.
+    FileNotFoundError
+        If the OBJ file does not exist.
+    ValueError
+        If the mesh cannot be sliced or no valid cross-section is found.
+    """
+    if not TRIMESH_AVAILABLE:
+        raise ImportError(
+            "trimesh is required for read_obj_to_vertices. "
+            "Install it with: pip install trimesh"
+        )
+    
+    obj_path = Path(obj_path)
+    if not obj_path.exists():
+        raise FileNotFoundError(f"OBJ file not found: {obj_path}")
+    
+    # Load mesh
+    try:
+        mesh = trimesh.load(str(obj_path))
+    except Exception as e:
+        raise ValueError(f"Failed to load OBJ file {obj_path}: {e}")
+    
+    # Get minimum z-coordinate (bottom of mesh)
+    z_min = mesh.bounds[0][2]
+    
+    # Create a cross-section at the bottom with plane normal pointing up (z-direction)
+    try:
+        section = mesh.section(
+            plane_origin=[0, 0, z_min],
+            plane_normal=[0, 0, 1]
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to create cross-section at z={z_min}: {e}")
+    
+    if section is None:
+        raise ValueError(
+            f"No valid cross-section found at z={z_min}. "
+            "The mesh may not intersect the slicing plane."
+        )
+    
+    # Convert to planar (2D) representation
+    try:
+        path2d, _ = section.to_planar()
+    except Exception as e:
+        raise ValueError(f"Failed to convert section to planar: {e}")
+    
+    # Extract vertices
+    # path2d.vertices is a numpy array of (x, y) coordinates
+    vertices_2d = path2d.vertices
+    
+    if len(vertices_2d) < 3:
+        raise ValueError(
+            f"Cross-section has only {len(vertices_2d)} vertices. "
+            "Need at least 3 vertices to form a valid polygon."
+        )
+    
+    # Convert to list of tuples
+    vertices = [(float(v[0]), float(v[1])) for v in vertices_2d]
+    
+    # Remove duplicate first/last vertex if present (closed polygon)
+    if len(vertices) >= 2 and vertices[0] == vertices[-1]:
+        vertices = vertices[:-1]
+    
+    if len(vertices) < 3:
+        raise ValueError(
+            f"After processing, only {len(vertices)} unique vertices remain. "
+            "Need at least 3 vertices for a valid polygon."
+        )
+    
+    return vertices
+
+
+def create_pybullet_objects():
+    """Create a focused set of 9 object shapes for PyBullet testing.
+    
+    Creates only the essential shapes that work well with object_bridge.py:
+    - Rectangle and Square (variations)
+    - Right Triangle, Scalene Triangle, Equilateral Triangle (variations)
+    - L-shape (symmetric and asymmetric variations)
+    - T-shape (symmetric and asymmetric variations)
+    
+    Object sizes are designed to work well with small robots (radius ~0.06m).
+    Most objects are in the 0.3-0.6m range, making them about 5-10x the robot size.
+    
+    Scale factor applied: ~2.5x from original sizes.
+    
+    Returns
+    -------
+    dict
+        Dictionary mapping shape names to GenericObject instances.
+    """
+    objects = {}
+    
+    # Scale factor for objects (2.5x larger than original)
+    S = 2.5
+    
+    # 1. RECTANGLE (0.875m x 0.625m)
+    box_vertices = [(-0.35*S, -0.25*S), (0.35*S, -0.25*S), (0.35*S, 0.25*S), (-0.35*S, 0.25*S)]
+    rect_geom = Polygon(box_vertices)
+    rect_mass = estimate_realistic_mass(rect_geom)
+    objects['rectangle'] = GenericObject(
+        geometry=rect_geom,
+        mass=rect_mass,
+        lateral_friction=0.3,
+        heading=0.0,
+        name="Rectangle"
+    )
+    
+    # 2. SQUARE (variation of rectangle, 0.625m x 0.625m)
+    square_size = 0.25 * S
+    square_vertices = [
+        (-square_size, -square_size),
+        (square_size, -square_size),
+        (square_size, square_size),
+        (-square_size, square_size)
+    ]
+    square_geom = Polygon(square_vertices)
+    square_mass = estimate_realistic_mass(square_geom)
+    objects['square'] = GenericObject(
+        geometry=square_geom,
+        mass=square_mass,
+        lateral_friction=0.3,
+        heading=0.0,
+        name="Square"
+    )
+    
+    # 3. RIGHT TRIANGLE (3-4-5 triangle)
+    right_triangle_vertices = [
+        (0.0, 0.0),           # Right angle at origin
+        (0.4*S, 0.0),         # Base (4 units)
+        (0.0, 0.3*S)          # Height (3 units)
+    ]
+    right_triangle_geom = Polygon(right_triangle_vertices)
+    right_triangle_mass = estimate_realistic_mass(right_triangle_geom)
+    objects['right_triangle'] = GenericObject(
+        geometry=right_triangle_geom,
+        mass=right_triangle_mass,
+        lateral_friction=0.35,
+        heading=0.0,
+        name="Right Triangle"
+    )
+    
+    # 4. SCALENE TRIANGLE (all sides different)
+    scalene_vertices = [
+        (0.1*S, 0.25*S),      # Top vertex
+        (-0.25*S, -0.1*S),    # Bottom left
+        (0.2*S, -0.18*S)      # Bottom right
+    ]
+    scalene_geom = Polygon(scalene_vertices)
+    scalene_mass = estimate_realistic_mass(scalene_geom)
+    objects['scalene_triangle'] = GenericObject(
+        geometry=scalene_geom,
+        mass=scalene_mass,
+        lateral_friction=0.34,
+        heading=0.0,
+        name="Scalene Triangle"
+    )
+    
+    # 5. EQUILATERAL TRIANGLE
+    equilateral_size = 0.35 * S
+    equilateral_vertices = [
+        (0.0, equilateral_size * np.sqrt(3) / 3),                    # Top vertex
+        (-equilateral_size / 2, -equilateral_size * np.sqrt(3) / 6),   # Bottom left
+        (equilateral_size / 2, -equilateral_size * np.sqrt(3) / 6)    # Bottom right
+    ]
+    equilateral_geom = Polygon(equilateral_vertices)
+    equilateral_mass = estimate_realistic_mass(equilateral_geom)
+    objects['equilateral_triangle'] = GenericObject(
+        geometry=equilateral_geom,
+        mass=equilateral_mass,
+        lateral_friction=0.35,
+        heading=0.0,
+        name="Equilateral Triangle"
+    )
+    
+    # 6. L-SHAPE (symmetric)
+    l_vertices = [
+        (0, 0), (0.3*S, 0), (0.3*S, 0.1*S), (0.1*S, 0.1*S), 
+        (0.1*S, 0.3*S), (0, 0.3*S)
+    ]
+    l_shape_geom = Polygon(l_vertices)
+    l_shape_mass = estimate_realistic_mass(l_shape_geom)
+    objects['l_shape'] = GenericObject(
+        geometry=l_shape_geom,
+        mass=l_shape_mass,
+        lateral_friction=0.25,
+        heading=0.0,
+        name="L-Shape (Symmetric)"
+    )
+    
+    # 7. L-SHAPE (asymmetric - different arm lengths)
+    asym_l_vertices = [
+        (0, 0), (0.28*S, 0), (0.28*S, 0.12*S), (0.12*S, 0.12*S), 
+        (0.12*S, 0.22*S), (0, 0.22*S)
+    ]
+    asym_l_geom = Polygon(asym_l_vertices)
+    asym_l_mass = estimate_realistic_mass(asym_l_geom)
+    objects['asym_l_shape'] = GenericObject(
+        geometry=asym_l_geom,
+        mass=asym_l_mass,
+        lateral_friction=0.26,
+        heading=0.0,
+        name="L-Shape (Asymmetric)"
+    )
+    
+    # 8. T-SHAPE (symmetric)
+    t_vertices = [
+        (-0.25*S, 0.15*S), (0.25*S, 0.15*S), (0.25*S, 0.05*S),
+        (0.08*S, 0.05*S), (0.08*S, -0.2*S), (-0.08*S, -0.2*S),
+        (-0.08*S, 0.05*S), (-0.25*S, 0.05*S)
+    ]
+    t_shape_geom = Polygon(t_vertices)
+    t_shape_mass = estimate_realistic_mass(t_shape_geom)
+    objects['t_shape'] = GenericObject(
+        geometry=t_shape_geom,
+        mass=t_shape_mass,
+        lateral_friction=0.28,
+        heading=0.0,
+        name="T-Shape (Symmetric)"
+    )
+    
+    # 9. T-SHAPE (asymmetric - offset stem)
+    asym_t_vertices = [
+        (-0.25*S, 0.15*S), (0.25*S, 0.15*S), (0.25*S, 0.05*S),
+        (0.12*S, 0.05*S), (0.12*S, -0.2*S), (-0.05*S, -0.2*S),
+        (-0.05*S, 0.05*S), (-0.25*S, 0.05*S)
+    ]
+    asym_t_geom = Polygon(asym_t_vertices)
+    asym_t_mass = estimate_realistic_mass(asym_t_geom)
+    objects['asym_t_shape'] = GenericObject(
+        geometry=asym_t_geom,
+        mass=asym_t_mass,
+        lateral_friction=0.28,
+        heading=0.0,
+        name="T-Shape (Asymmetric)"
+    )
+    
+    return objects
+
 # %%
 # STEP 2: CONTACT POINT PARAMETERIZATION SYSTEM
 # =============================================================================
@@ -726,6 +1272,10 @@ class ContactPointParameterization:
         
         # Pre-compute segment lengths and cumulative distances
         self._compute_segment_info()
+        
+        # Check polygon orientation (clockwise vs counter-clockwise)
+        # This is needed to correctly determine normal vector directions
+        self._is_clockwise = self._check_orientation()
     
     def _compute_segment_info(self):
         """Pre-compute segment lengths and cumulative distances along boundary."""
@@ -738,6 +1288,30 @@ class ContactPointParameterization:
             length = np.linalg.norm(p2 - p1)
             self.segment_lengths.append(length)
             self.cumulative_distances.append(self.cumulative_distances[-1] + length)
+    
+    def _check_orientation(self):
+        """
+        Check if the polygon boundary is oriented clockwise or counter-clockwise.
+        
+        Uses the shoelace formula to calculate signed area.
+        Positive signed area = counter-clockwise (CCW)
+        Negative signed area = clockwise (CW)
+        
+        Returns:
+            bool: True if clockwise, False if counter-clockwise
+        """
+        coords = self.boundary_coords
+        n = len(coords) - 1  # Last point is duplicate of first
+        
+        # Calculate signed area using shoelace formula
+        signed_area = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            signed_area += (coords[j][0] - coords[i][0]) * (coords[j][1] + coords[i][1])
+        
+        # If signed_area > 0, boundary is clockwise (CW)
+        # If signed_area < 0, boundary is counter-clockwise (CCW)
+        return signed_area > 0
     
     def parameter_to_point(self, t):
         """
@@ -889,26 +1463,17 @@ class ContactPointParameterization:
         tangent = self.get_tangent_vector(t)
         
         # Get normal by rotating tangent 90 degrees
-        # For outward normal: rotate clockwise (for standard orientation)
+        # For outward normal: rotate clockwise (for standard CCW orientation)
         if outward:
             normal = np.array([tangent[1], -tangent[0]])  # Rotate 90° clockwise
         else:
             normal = np.array([-tangent[1], tangent[0]])  # Rotate 90° counter-clockwise
         
-        # SPECIAL CASE: For circles, the boundary parameterization might be clockwise
-        # Check if we need to flip the normal direction
-        if hasattr(self.object, 'geometry') and hasattr(self.object.geometry, 'exterior'):
-            # For circular objects (buffered points), check orientation
-            coords = list(self.object.geometry.exterior.coords)
-            if len(coords) > 4:  # Likely a circle approximation
-                # Calculate signed area to determine orientation
-                signed_area = 0
-                for i in range(len(coords)-1):
-                    signed_area += (coords[i+1][0] - coords[i][0]) * (coords[i+1][1] + coords[i][1])
-                
-                # If signed_area > 0, boundary is clockwise, so flip normals
-                if signed_area > 0:
-                    normal = -normal
+        # FIX: Check polygon orientation for ALL polygons (not just circles)
+        # If the boundary is clockwise, we need to flip the normals
+        # because the normal calculation assumes counter-clockwise traversal
+        if self._is_clockwise:
+            normal = -normal
             
         return normal
     

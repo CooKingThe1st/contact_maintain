@@ -52,6 +52,7 @@ from object_utils import (
     create_standard_objects,
     WrenchSpaceVisualizer,
     DynamicObjectModel,
+    get_reachable_contact_intervals,
 )
 
 # %%
@@ -1131,6 +1132,21 @@ def generate_strategic_contact_samples(edge_characterizer, max_inscribed_circles
         samples.append((t_mid, 'midpoint'))
         
         # =====================================================================
+        # 2b. QUARTILE POINTS (first and third quartile)
+        # =====================================================================
+        # First quartile: midpoint between start and midpoint
+        t_quarter = t_start + 0.25 * t_range
+        # Third quartile: midpoint between midpoint and end
+        t_three_quarter = t_start + 0.75 * t_range
+        
+        # Only add if within bounds (with small margin to avoid duplicates with corners)
+        margin = 0.001 * t_range
+        if (t_start + margin) < t_quarter < (t_end - margin):
+            samples.append((t_quarter, 'first_quartile'))
+        if (t_start + margin) < t_three_quarter < (t_end - margin):
+            samples.append((t_three_quarter, 'third_quartile'))
+        
+        # =====================================================================
         # 3. NO-TORQUE POINT (where torque contribution is zero)
         # =====================================================================
         # Torque = α * (slope * t + offset) = 0
@@ -1278,6 +1294,47 @@ def _check_points_distinct(contacts, tolerance=0.01):
             
             if distance < tolerance:
                 return False  # Points too close together
+    
+    return True
+
+
+def _check_enough_space_for_robots(contacts, robot_radius: float, buffer: float = 0.1):
+    """
+    Check that robot centers have enough spacing to avoid collisions.
+    
+    For each contact point, the robot center is at:
+        robot_center = contact.position + robot_radius * normal_outward
+    
+    For any two robot centers, the distance must be >= 2 * robot_radius + buffer
+    to ensure the robots don't collide.
+    
+    Args:
+        contacts: list of ContactPoint objects
+        robot_radius: Radius of the circular robot
+        buffer: Additional safety buffer distance (default: 0.1 m)
+    
+    Returns:
+        bool: True if all robot centers have sufficient spacing, False otherwise
+    """
+    n = len(contacts)
+    if n < 2:
+        return True  # No spacing check needed for < 2 contacts
+    
+    # Compute robot center positions
+    robot_centers = []
+    for contact in contacts:
+        robot_center = np.array(contact.position) + robot_radius * np.array(contact.normal_outward)
+        robot_centers.append(robot_center)
+    
+    # Check all pairwise distances
+    min_required_distance = 2.0 * robot_radius + buffer
+    
+    for i in range(n):
+        for j in range(i + 1, n):
+            distance = np.linalg.norm(robot_centers[i] - robot_centers[j])
+            
+            if distance < min_required_distance:
+                return False  # Robots would collide
     
     return True
 
@@ -3434,7 +3491,8 @@ def _visualize_magnum_four_solution(solution, obj, max_inscribed_circles, edge_c
 
 # %%
 def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1.0,
-                            weighting_scheme='balanced', torque_method=3, preprocess_result=None):
+                            weighting_scheme='balanced', torque_method=3,
+                            preprocess_result=None, robot_radius: Optional[float] = None):
     """
     🆕 OPTIMIZED v3: Find four contact points with preprocessing and smart edge filtering.
     
@@ -3454,6 +3512,9 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
         weighting_scheme: 'balanced', 'focus_translational', or 'focus_rotational'
         torque_method: 1 (LP), 2 (convex hull), or 3 (geometric intersection)
         preprocess_result: Optional preprocessing result (to avoid redundant computation)
+        robot_radius: Optional radius of the circular robot. If provided, strategic
+            contact samples will be filtered using C-space reachability so that
+            only physically reachable boundary points are considered.
     
     Returns:
         dict: Solution containing contact points, closure metrics, timing, and statistics
@@ -3520,6 +3581,28 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
         for i, circle in enumerate(max_inscribed_circles):
             print(f"   Circle {i}: center=({circle['center'][0]:.3f}, {circle['center'][1]:.3f}), "
                   f"radius={circle['radius']:.3f}, tangency_points={circle['num_tangents']}")
+
+    # Optional: compute reachable boundary intervals in t-space for a circular robot
+    reachable_intervals = None
+    if robot_radius is not None:
+        try:
+            print(f"\n🔍 Step 1b: Computing reachable boundary intervals for robot radius={robot_radius:.4f}...")
+            reachable_intervals = get_reachable_contact_intervals(
+                obj.geometry,
+                robot_radius=robot_radius,
+                n_samples=2048,
+            )
+            if verbose:
+                if len(reachable_intervals) == 0:
+                    print("   ⚠️ No reachable boundary intervals found (all boundary treated as unreachable)")
+                else:
+                    print(f"   Reachable intervals in t-space (0-1):")
+                    for idx, (t0, t1) in enumerate(reachable_intervals):
+                        print(f"     [{idx}] t ∈ [{t0:.4f}, {t1:.4f}]")
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ Failed to compute reachable intervals: {e}")
+            reachable_intervals = None
     
     # =========================================================================
     # STEP 2: GENERATE STRATEGIC CONTACT POINT SAMPLES ON EACH EDGE
@@ -3532,6 +3615,28 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
         max_inscribed_circles,
         verbose=verbose
     )
+
+    # Optional: filter out samples that lie on unreachable parts of the boundary
+    if robot_radius is not None and reachable_intervals:
+        def _t_is_reachable(t_val: float) -> bool:
+            for t0, t1 in reachable_intervals:
+                if t0 <= t_val <= t1:
+                    return True
+            return False
+
+        filtered_edge_sample_points = {}
+        removed_total = 0
+        for edge_idx, samples in edge_sample_points.items():
+            filtered = []
+            for t_val, desc in samples:
+                if _t_is_reachable(t_val):
+                    filtered.append((t_val, desc))
+                else:
+                    removed_total += 1
+            filtered_edge_sample_points[edge_idx] = filtered
+        edge_sample_points = filtered_edge_sample_points
+        if verbose:
+            print(f"   ✅ Reachability filter removed {removed_total} unreachable samples")
     
     total_samples = sum(len(samples) for samples in edge_sample_points.values())
     timing['sampling'] = time.time() - start_time
@@ -3619,7 +3724,8 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
         'duplicate_points': 0,
         'parallel_normals': 0,
         'quick_force_closure_fail': 0,
-        'torque_closure_fail': 0
+        'torque_closure_fail': 0,
+        'insufficient_robot_spacing': 0
     }
     
     # Compute epsilon for spatial distinctness check
@@ -3669,6 +3775,12 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
                         if not _quick_force_closure_check(contacts):
                             pruned_count['quick_force_closure_fail'] += 1
                             continue
+                        
+                        # Prune 4: Check robot center spacing (if robot_radius provided)
+                        if robot_radius is not None:
+                            if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                                pruned_count['insufficient_robot_spacing'] += 1
+                                continue
                         
                         # =====================================================
                         # 🆕 OPTIMIZED CLOSURE CHECK (force closure already validated!)
@@ -3817,16 +3929,6 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
     }
 
 
-print("✅ find_the_magnum_four_v3() OPTIMIZED!")
-print("\n📝 Key optimizations:")
-print("   1. Preprocessing: Cache all valid 4-edge combinations for force closure")
-print("   2. Smart filtering: Only test force-closure-valid edge combos")
-print("   3. At most 1 edge duplication: Ensures ≥3 distinct edges")
-print("   4. Fast closure check: Force already validated, only check torque")
-print("   5. Comprehensive timing: Track time for each stage")
-print("\n⚡ Expected speedup: 10-100x depending on object geometry!")
-print("\n💡 Usage:")
-print("   result = find_the_magnum_four_v3(obj, verbose=True, torque_method=3)")
 
 # %%
 if __name__ == "__main__":
@@ -3845,7 +3947,8 @@ if __name__ == "__main__":
 
 # %%
 def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=1.0, 
-                                   weighting_scheme='balanced', preprocess_result=None):
+                                   weighting_scheme='balanced', preprocess_result=None,
+                                   robot_radius: Optional[float] = None):
     """
     🆕 OPTIMIZED v3 (NO TIMING LOGS): Fast version for fair performance comparison.
     
@@ -3893,12 +3996,57 @@ def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=
     if len(max_inscribed_circles) > 1:
         max_inscribed_circles = _rank_and_filter_circles(max_inscribed_circles, obj, max_circles=4)
     
+    # Optional: compute reachable boundary intervals in t-space for a circular robot
+    reachable_intervals = None
+    if robot_radius is not None:
+        try:
+            if verbose:
+                print(f"\n🔍 Magnum Three: Computing reachable boundary intervals for robot radius={robot_radius:.4f}...")
+            reachable_intervals = get_reachable_contact_intervals(
+                obj.geometry,
+                robot_radius=robot_radius,
+                n_samples=2048,
+            )
+            if verbose and reachable_intervals is not None:
+                if len(reachable_intervals) == 0:
+                    print("   ⚠️ No reachable boundary intervals found (all boundary treated as unreachable)")
+                else:
+                    print(f"   Reachable intervals in t-space (0-1):")
+                    for idx, (t0, t1) in enumerate(reachable_intervals):
+                        print(f"     [{idx}] t ∈ [{t0:.4f}, {t1:.4f}]")
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ Failed to compute reachable intervals for Magnum Three: {e}")
+            reachable_intervals = None
+    
     # STEP 2: Generate strategic samples
     edge_sample_points = generate_strategic_contact_samples(
         edge_characterizer,
         max_inscribed_circles,
         verbose=False
     )
+
+    # Optional: filter out samples that lie on unreachable parts of the boundary
+    if robot_radius is not None and reachable_intervals:
+        def _t_is_reachable_three(t_val: float) -> bool:
+            for t0, t1 in reachable_intervals:
+                if t0 <= t_val <= t1:
+                    return True
+            return False
+
+        filtered_edge_sample_points = {}
+        removed_total = 0
+        for edge_idx, samples in edge_sample_points.items():
+            filtered = []
+            for t_val, desc in samples:
+                if _t_is_reachable_three(t_val):
+                    filtered.append((t_val, desc))
+                else:
+                    removed_total += 1
+            filtered_edge_sample_points[edge_idx] = filtered
+        edge_sample_points = filtered_edge_sample_points
+        if verbose:
+            print(f"   ✅ Magnum Three reachability filter removed {removed_total} unreachable samples")
     
     # STEP 3: Sample on valid edge combinations
     valid_edge_combinations = preprocess_result['valid_3edge_combos']
@@ -3918,6 +4066,11 @@ def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=
                     
                     if not _check_points_distinct(contacts, tolerance=epsilon):
                         continue
+                    
+                    # Check robot center spacing (if robot_radius provided)
+                    if robot_radius is not None:
+                        if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                            continue
                     
                     solution = {
                         'contacts': contacts,
@@ -3960,7 +4113,7 @@ def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=
 
 
 def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_magnitude=1.0, 
-                              weighting_scheme='balanced'):
+                              weighting_scheme='balanced', robot_radius: Optional[float] = None):
     """
     🆕 OPTIMIZED v3: Find three contact points using preprocessing for force closure.
     
@@ -4046,6 +4199,28 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
         for i, circle in enumerate(max_inscribed_circles):
             print(f"   Circle {i}: center=({circle['center'][0]:.3f}, {circle['center'][1]:.3f}), "
                   f"radius={circle['radius']:.3f}, tangency_points={circle['num_tangents']}")
+
+    # Optional: compute reachable boundary intervals in t-space for a circular robot
+    reachable_intervals = None
+    if robot_radius is not None:
+        try:
+            print(f"\n🔍 Magnum Three (logtime): Computing reachable boundary intervals for robot radius={robot_radius:.4f}...")
+            reachable_intervals = get_reachable_contact_intervals(
+                obj.geometry,
+                robot_radius=robot_radius,
+                n_samples=2048,
+            )
+            if verbose:
+                if len(reachable_intervals) == 0:
+                    print("   ⚠️ No reachable boundary intervals found (all boundary treated as unreachable)")
+                else:
+                    print(f"   Reachable intervals in t-space (0-1):")
+                    for idx, (t0, t1) in enumerate(reachable_intervals):
+                        print(f"     [{idx}] t ∈ [{t0:.4f}, {t1:.4f}]")
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️ Failed to compute reachable intervals for Magnum Three (logtime): {e}")
+            reachable_intervals = None
     
     # =========================================================================
     # STEP 2: GENERATE STRATEGIC CONTACT POINT SAMPLES ON EACH EDGE
@@ -4058,6 +4233,28 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
         max_inscribed_circles,
         verbose=False
     )
+
+    # Optional: filter out samples that lie on unreachable parts of the boundary
+    if robot_radius is not None and reachable_intervals:
+        def _t_is_reachable_three_log(t_val: float) -> bool:
+            for t0, t1 in reachable_intervals:
+                if t0 <= t_val <= t1:
+                    return True
+            return False
+
+        filtered_edge_sample_points = {}
+        removed_total = 0
+        for edge_idx, samples in edge_sample_points.items():
+            filtered = []
+            for t_val, desc in samples:
+                if _t_is_reachable_three_log(t_val):
+                    filtered.append((t_val, desc))
+                else:
+                    removed_total += 1
+            filtered_edge_sample_points[edge_idx] = filtered
+        edge_sample_points = filtered_edge_sample_points
+        if verbose:
+            print(f"   ✅ Magnum Three (logtime) reachability filter removed {removed_total} unreachable samples")
     
     total_samples = sum(len(samples) for samples in edge_sample_points.values())
     timing['sampling'] = time.time() - start_time
@@ -4097,7 +4294,8 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
     valid_solutions = []
     iteration_count = 0
     pruned_count = {
-        'duplicate_points': 0
+        'duplicate_points': 0,
+        'insufficient_robot_spacing': 0
     }
     
     # Compute epsilon for spatial distinctness check
@@ -4132,6 +4330,12 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
                     if not _check_points_distinct(contacts, tolerance=epsilon):
                         pruned_count['duplicate_points'] += 1
                         continue
+                    
+                    # Check robot center spacing (if robot_radius provided)
+                    if robot_radius is not None:
+                        if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                            pruned_count['insufficient_robot_spacing'] += 1
+                            continue
                     
                     # Valid solution found! (force closure already validated)
                     solution = {

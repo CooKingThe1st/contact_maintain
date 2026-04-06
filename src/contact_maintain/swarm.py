@@ -114,12 +114,18 @@ class SwarmHost:
         generic_object,
         position_threshold: float = 0.05,  # 5cm for small robots
         contact_force_threshold: float = 0.5,  # 0.5N
+        startup_mode: str = "quick",
     ):
         self.robot_agents = robot_agents
         self.object_uid = object_uid
         self.generic_object = generic_object
         self.position_threshold = position_threshold
         self.contact_force_threshold = contact_force_threshold
+        if startup_mode not in ("quick", "full"):
+            raise ValueError(
+                f"Invalid startup_mode='{startup_mode}'. Expected 'quick' or 'full'."
+            )
+        self.startup_mode = startup_mode
         
         # Debug flag
         self.debug = False
@@ -151,16 +157,25 @@ class SwarmHost:
         self.object_angular_velocity = 0.0
     
     def assign_targets(self, target_t_params: Dict[str, float]):
-        """Assign target t_params to all robots and start REACHING.
+        """Assign target t_params and start startup sequence.
         
         Parameters
         ----------
         target_t_params : dict
             Mapping from robot name to target t_param (0-1).
         """
-        self._log_event(None, 'swarm_transition', 
-                       self.swarm_state.name, 'REACHING',
-                       f"SWARM STATE: {self.swarm_state.name} → REACHING")
+        startup_state = RobotState.APPROACHING if self.startup_mode == "quick" else RobotState.REACHING
+        startup_goal = 'approach' if self.startup_mode == "quick" else 'navigate'
+        startup_swarm_state = SwarmState.WAITING if self.startup_mode == "quick" else SwarmState.REACHING
+        startup_state_name = "APPROACHING (quick)" if self.startup_mode == "quick" else "REACHING"
+
+        self._log_event(
+            None,
+            'swarm_transition',
+            self.swarm_state.name,
+            startup_swarm_state.name,
+            f"SWARM STATE: {self.swarm_state.name} → {startup_state_name}",
+        )
         
         for name, t_param in target_t_params.items():
             if name not in self.robot_agents:
@@ -168,17 +183,17 @@ class SwarmHost:
             
             old_state = self.robot_states[name]
             self.target_t_params[name] = t_param
-            self.robot_states[name] = RobotState.REACHING
+            self.robot_states[name] = startup_state
             
-            # Tell robot agent to navigate to this t_param
+            # Tell robot agent to start with selected startup strategy
             agent = self.robot_agents[name]
-            agent.set_goal('navigate', t_param)
+            agent.set_goal(startup_goal, t_param)
             
             self._log_event(name, 'state_change',
-                           old_state.name, 'REACHING',
-                           f"{old_state.name} → REACHING (target t={t_param:.2f})")
+                           old_state.name, startup_state.name,
+                           f"{old_state.name} → {startup_state.name} (target t={t_param:.2f})")
         
-        self.swarm_state = SwarmState.REACHING
+        self.swarm_state = startup_swarm_state
     
     def reconfigure(self, new_t_params: Dict[str, float]):
         """Trigger reconfiguration to new t_param assignments.

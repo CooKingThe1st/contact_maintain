@@ -196,6 +196,165 @@ Hybrid approach that blends force and position control based on signal reliabili
 - `DiffDrivePositionBasedSolver`
 - `DiffDriveAdaptiveSolver`
 
+## Contact Optimization: Stochastic Magnum Search
+
+### Overview
+
+A major improvement in contact configuration search: **stochastic Latin square-based search** that finds sufficient contact configurations in **sub-second time** (typically 0.1-0.5s) compared to exhaustive search (50+ seconds), while maintaining high validity.
+
+### The Problem
+
+Previous exhaustive search methods (`find_the_magnum_four_v3`) were too slow for real-time multi-robot systems (MRS):
+- **Star shape example**: Found best solution at iteration 912 but continued for 50+ seconds testing 21,000+ configurations
+- **Not suitable for reactive robotics**: Need "good enough" solutions quickly, not optimal solutions slowly
+
+### The Solution: Stochastic "Anytime" Algorithm
+
+**Philosophy**: Move from "finding the highest number" (optimization) to "finding the first solution that works" (engineering sufficiency).
+
+**Key Innovation**: Use **Limit Surface (LS) containment** as the physical ground truth instead of arbitrary quality scores:
+- **Grasp Wrench Space (GWS)**: Set of wrenches the current 4-robot configuration can apply
+- **Limit Surface (LS)**: 3D boundary in wrench space representing maximum static friction
+- **Success criterion**: `GWS ⊇ threshold × LS` (typically threshold = 1.0 = 100% coverage)
+
+### Algorithm: Latin Square-Based Stochastic Search
+
+1. **Strategic Sampling**: Generate strategic contact points on object edges:
+   - Near-corner points (epsilon away from vertices)
+   - Edge midpoints and quartiles
+   - No-torque points (where τ(t) = 0)
+   - Tangency points (from max inscribed circles)
+
+2. **Latin Square Sampling**: Create uniform combinations without clustering:
+   - 4 columns (one per robot)
+   - N rows (N = number of strategic points)
+   - Each column is a random permutation of [0, 1, ..., N-1]
+   - Ensures each strategic point is used exactly once per batch
+
+3. **Early Pruning**: Fast geometric checks before expensive wrench space calculation:
+   - Distinct points check
+   - Non-parallel normals
+   - Quick force closure check
+   - Robot spacing validation
+
+4. **Sufficiency Check**: 3-plane projection test:
+   - Project GWS and LS onto (Fx, Fy), (Fx, τ), (Fy, τ)
+   - Check that GWS convex hull contains scaled LS ellipse in all projections
+   - **Early termination**: Return immediately when first sufficient configuration found
+
+### Performance
+
+**Speed Improvement**:
+- **Exhaustive search**: 50+ seconds (Star shape, 21,000+ configs)
+- **Stochastic search**: 0.1-0.5 seconds (typically finds solution in first batch)
+- **Speedup**: ~100-500× faster
+
+**Validity**:
+- Solutions satisfy physical sufficiency: `GWS ⊇ threshold × LS`
+- Same validity criteria as exhaustive search (just faster to find)
+- Success rate: Typically 90%+ on standard shapes
+
+**Real-Time Capability**:
+- Suitable for reactive MRS applications
+- Configurable timeout (default: 10s)
+- "Anytime" algorithm: returns best solution found so far if timeout reached
+
+### Usage
+
+```python
+from contact_optimizer_utils_test_ver import find_the_magnum_stochastic
+from object_utils import create_standard_objects
+
+# Get object
+standard_objects = create_standard_objects()
+obj = standard_objects['star']
+
+# Run stochastic search
+result = find_the_magnum_stochastic(
+    obj,
+    threshold=1.0,              # 100% LS coverage (default)
+    max_batches=30,             # Max Latin square batches
+    timeout=10.0,               # Timeout in seconds
+    force_range_scalar=2.0,     # Robots can exert 2× static friction
+    robot_radius=0.06,          # Robot radius for spacing checks
+    verbose=True
+)
+
+if result['success']:
+    contacts = result['contacts']
+    print(f"Found in {result['elapsed_time']:.3f}s")
+    print(f"Configs tested: {result['configs_tested']}")
+else:
+    print("No sufficient configuration found")
+```
+
+### Comprehensive Testing
+
+Run the test suite to evaluate performance across all standard shapes:
+
+```bash
+cd scripts/test
+python test_stochastic_magnum.py
+```
+
+**Output**:
+- Tests all standard shapes (rectangle, triangle, star, L-shape, etc.)
+- Records success rate, elapsed time, configs tested
+- Generates visualization plots showing:
+  - Object with contact points
+  - 2D wrench space projections (Fx-Fy, Fx-τ, Fy-τ)
+  - GWS coverage of Limit Surface
+- Saves plots to `/tmp/basic_test/stochastic_{shape_name}.jpg`
+
+**Example Output**:
+```
+📊 SUMMARY STATISTICS
+============================================================
+   Total shapes tested    : 15
+   Successful            : 14 (93.3%)
+   Failed                 : 1 (6.7%)
+   Average time per shape: 0.234 s
+   
+✅ Successful Searches:
+   Average time          : 0.198 s
+   Min time               : 0.089 s
+   Max time               : 0.512 s
+   Average configs tested: 12.3
+```
+
+### Technical Details
+
+**Force Range Calculation**:
+- Based on object's static friction: `max_force = force_range_scalar × static_friction × (mass × 9.81)`
+- Default `force_range_scalar = 2.0` assumes robots can exert 2× static friction limit
+
+**Limit Surface Calculation**:
+- Uses numerical integration for accurate moment calculation
+- Ellipsoid in (Fx, Fy, τ) space
+- Scaled by `threshold` parameter (1.0 = 100% coverage)
+
+**Visualization**:
+- 2×2 grid layout:
+  - Top-left: Object with contact points
+  - Top-right: Fx vs Fy projection
+  - Bottom-left: Fx vs Torque projection
+  - Bottom-right: Fy vs Torque projection
+- Shows GWS points, convex hull, and Limit Surface ellipse/circle
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `src/legacy/contact_optimizer_utils_test_ver.py` | Main implementation: `find_the_magnum_stochastic()` |
+| `src/legacy/object_utils.py` | `WrenchSpaceVisualizer`: Wrench space and limit surface calculation |
+| `scripts/test/test_stochastic_magnum.py` | Comprehensive test suite |
+
+### References
+
+- **Limit Surface Theory**: Maximum static friction boundary in wrench space
+- **Latin Hypercube Sampling**: Uniform sampling without clustering
+- **Anytime Algorithms**: Return best solution found so far, improve with time
+
 ## API
 
 ### Creating a Solver

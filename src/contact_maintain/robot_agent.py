@@ -112,6 +112,10 @@ class RobotAgent:
         self.approach_kp = 0.5  # P controller gain for approach phase
         self.approach_max_speed = 0.1  # Max speed during approach (slow)
         self.contact_target_force = 0.5  # Target contact force (N)
+        # Stop approach as soon as bumper senses this much force (N); lower than in_contact gate.
+        self.approach_stop_force_epsilon = 0.02
+        self.approach_close_effective_distance_m = 0.06
+        self.approach_creep_speed = 0.008  # m/s when close
         
         # Optional desired object motion for drive_desired mode (InstantVelocityMatcher)
         self.desired_object_velocity = None        # np.ndarray[2], world frame
@@ -328,10 +332,9 @@ class RobotAgent:
             if target_pos is None:
                 return np.zeros(3)
             
-            # Check if already in contact - if so, stop moving
+            # Stop on first sensed force, not only when in_contact crosses 0.5 N.
             self.update_contact_state()
-            if self.in_contact:
-                # Already have contact - stop
+            if self.contact_force > self.approach_stop_force_epsilon or self.in_contact:
                 return np.zeros(3)
             
             # Compute target heading
@@ -344,6 +347,9 @@ class RobotAgent:
             # Step 1: Rotate first if heading error is significant
             heading_threshold = 0.05  # radians (~6 degrees)
             if abs(heading_error) > heading_threshold:
+                self.update_contact_state()
+                if self.contact_force > self.approach_stop_force_epsilon:
+                    return np.zeros(3)
                 # Rotate in place - no translation
                 omega = 2.0 * heading_error
                 # Limit angular velocity
@@ -357,20 +363,20 @@ class RobotAgent:
             # Account for robot radius: we want robot edge to touch boundary, not center
             robot_radius = 0.06  # Robot radius
             effective_distance = distance - robot_radius
-            # print(f"distance: {distance} from target: {target_pos} to pos: {pos} and effective distance: {effective_distance} ")
+            if distance < 1e-6:
+                return np.zeros(3)
 
-            # if effective_distance > 0.01:
-            if True:
-                direction = direction / distance
-                # Use effective distance for P controller
-                # Limit speed - slow approach
-                speed = min(self.approach_kp * effective_distance, self.approach_max_speed)
-                # Clamp speed to zero when very close to the target (e.g., within 1 cm)
-                if effective_distance < 0.01:
-                    speed = 0.02
-                vel_2d = direction * speed
-            else:
-                vel_2d = np.zeros(2)
+            direction = direction / distance
+            speed = min(
+                self.approach_kp * max(0.0, effective_distance),
+                self.approach_max_speed,
+            )
+            if effective_distance < self.approach_close_effective_distance_m:
+                speed = min(speed, self.approach_creep_speed)
+            self.update_contact_state()
+            if self.contact_force > self.approach_stop_force_epsilon:
+                return np.zeros(3)
+            vel_2d = direction * max(0.0, speed)
             
             # Small heading correction while moving
             omega = 10.0 * heading_error

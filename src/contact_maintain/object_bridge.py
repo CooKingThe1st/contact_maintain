@@ -17,7 +17,7 @@ rospack = rospkg.RosPack()
 pkg_path = rospack.get_path("contact_maintain")
 sys.path.insert(0, str(Path(pkg_path) / "src" / "legacy"))
 
-from object_utils import GenericObject, create_standard_objects, estimate_realistic_mass
+from object_utils import GenericObject, create_standard_objects, estimate_realistic_mass, read_obj_to_vertices, dxf_to_generic
 from shapely.geometry import Polygon, Point
 from shapely.affinity import rotate, translate
 
@@ -113,8 +113,22 @@ def is_convex(polygon: Polygon) -> bool:
 def decompose_to_convex_parts(polygon: Polygon) -> List[Polygon]:
     """Decompose a non-convex polygon into convex parts.
     
-    Uses a simple ear-clipping based approach for basic shapes.
-    For complex shapes, falls back to bounding box approximation.
+    Supports:
+    - Triangles (already convex, returned as-is)
+    - Rectangles (already convex, returned as-is)
+    - L-shapes (decomposed into 2 rectangles)
+    - T-shapes (decomposed into 2 rectangles)
+    
+    For other shapes, falls back to convex hull approximation.
+    
+    ⚠️  KNOWN ISSUES:
+        - L-shape: Physics and t-param compatibility are quite okay
+        - T-shape: Has problems with t-param and cannot provide correct transformation
+                   (physics behavior not tested yet)
+        - Triangle: Physics is wrong (objects don't rotate when pushed at corners).
+                   This is weird since triangles should be simpler than rectilinear shapes.
+                   Double-check triangle creation vs rectilinear - the more complex shapes
+                   (L/T) work but the simple triangle doesn't, which is funny.
     
     Parameters
     ----------
@@ -133,6 +147,10 @@ def decompose_to_convex_parts(polygon: Polygon) -> List[Polygon]:
     coords = list(polygon.exterior.coords)[:-1]
     n = len(coords)
     
+    # Triangles are already convex (3 vertices)
+    if n == 3:
+        return [polygon]
+    
     # Try simple rectangle decomposition for L/T shapes (6-8 vertices)
     if 6 <= n <= 12:
         return _decompose_rectilinear(polygon)
@@ -144,73 +162,146 @@ def decompose_to_convex_parts(polygon: Polygon) -> List[Polygon]:
 def _decompose_rectilinear(polygon: Polygon) -> List[Polygon]:
     """Decompose rectilinear polygon (L, T shapes) into rectangles.
     
-    Uses axis-aligned bounding box partitioning.
+    Simple, direct approach for L and T shapes only.
+    Creates perfect tiling with no gaps.
+    
+    ⚠️  KNOWN ISSUES:
+        - L-shape: Physics and t-param compatibility are quite okay
+        - T-shape: Has problems with t-param and cannot provide correct transformation
+                   (physics behavior not tested yet)
     """
     coords = list(polygon.exterior.coords)[:-1]
+    n = len(coords)
     
-    # Get bounding box
+    # Get unique x and y coordinates (sorted)
+    xs = sorted(set(c[0] for c in coords))
+    ys = sorted(set(c[1] for c in coords))
     minx, miny, maxx, maxy = polygon.bounds
     
-    # For L-shape (6 vertices): split into 2 rectangles
-    if len(coords) == 6:
-        # Find the "corner" of the L
-        # The L-shape has one interior corner
-        xs = sorted(set(c[0] for c in coords))
-        ys = sorted(set(c[1] for c in coords))
+    # For L-shape (6 vertices): always has 3 unique x and 3 unique y values
+    # NOTE: L-shape has quite okay physics and t-param compatibility
+    if n == 6:
+        # L-shape decomposition: two rectangles that share a corner
+        # The corner is always at one of the middle coordinates
         
-        if len(xs) == 3 and len(ys) == 3:
-            # Typical L-shape with 3 unique x and y values
-            # Create two rectangles that cover the L
-            rect1 = Polygon([
-                (xs[0], ys[0]), (xs[2], ys[0]), (xs[2], ys[1]), (xs[0], ys[1])
-            ])
-            rect2 = Polygon([
-                (xs[0], ys[1]), (xs[1], ys[1]), (xs[1], ys[2]), (xs[0], ys[2])
-            ])
-            
-            # Only keep parts that intersect with original
-            parts = []
-            for rect in [rect1, rect2]:
-                intersection = polygon.intersection(rect)
-                if intersection.area > 0.001:
-                    if intersection.geom_type == 'Polygon':
-                        parts.append(intersection)
-            
-            if len(parts) >= 2:
-                return parts
+        # Try Option 1: Horizontal base (bottom) + Vertical arm (left)
+        # Base: xs[0] to xs[2], ys[0] to ys[1]
+        # Arm: xs[0] to xs[1], ys[1] to ys[2]
+        rect1 = Polygon([
+            (xs[0], ys[0]), (xs[2], ys[0]), (xs[2], ys[1]), (xs[0], ys[1])
+        ])
+        rect2 = Polygon([
+            (xs[0], ys[1]), (xs[1], ys[1]), (xs[1], ys[2]), (xs[0], ys[2])
+        ])
+        
+        # Check if this decomposition works (rectangles are contained in polygon)
+        if rect1.within(polygon.buffer(1e-6)) and rect2.within(polygon.buffer(1e-6)):
+            # Verify they cover the polygon
+            union_area = rect1.union(rect2).area
+            if abs(union_area - polygon.area) < 1e-4:
+                return [rect1, rect2]
+        
+        # Try Option 2: Vertical base (left) + Horizontal arm (bottom)
+        # Base: xs[0] to xs[1], ys[0] to ys[2]
+        # Arm: xs[1] to xs[2], ys[0] to ys[1]
+        rect1 = Polygon([
+            (xs[0], ys[0]), (xs[1], ys[0]), (xs[1], ys[2]), (xs[0], ys[2])
+        ])
+        rect2 = Polygon([
+            (xs[1], ys[0]), (xs[2], ys[0]), (xs[2], ys[1]), (xs[1], ys[1])
+        ])
+        
+        if rect1.within(polygon.buffer(1e-6)) and rect2.within(polygon.buffer(1e-6)):
+            union_area = rect1.union(rect2).area
+            if abs(union_area - polygon.area) < 1e-4:
+                return [rect1, rect2]
+        
+        # Try Option 3: Horizontal base (top) + Vertical arm (right)
+        # Base: xs[0] to xs[2], ys[1] to ys[2]
+        # Arm: xs[1] to xs[2], ys[0] to ys[1]
+        rect1 = Polygon([
+            (xs[0], ys[1]), (xs[2], ys[1]), (xs[2], ys[2]), (xs[0], ys[2])
+        ])
+        rect2 = Polygon([
+            (xs[1], ys[0]), (xs[2], ys[0]), (xs[2], ys[1]), (xs[1], ys[1])
+        ])
+        
+        if rect1.within(polygon.buffer(1e-6)) and rect2.within(polygon.buffer(1e-6)):
+            union_area = rect1.union(rect2).area
+            if abs(union_area - polygon.area) < 1e-4:
+                return [rect1, rect2]
+        
+        # Try Option 4: Vertical base (right) + Horizontal arm (top)
+        # Base: xs[1] to xs[2], ys[0] to ys[2]
+        # Arm: xs[0] to xs[1], ys[1] to ys[2]
+        rect1 = Polygon([
+            (xs[1], ys[0]), (xs[2], ys[0]), (xs[2], ys[2]), (xs[1], ys[2])
+        ])
+        rect2 = Polygon([
+            (xs[0], ys[1]), (xs[1], ys[1]), (xs[1], ys[2]), (xs[0], ys[2])
+        ])
+        
+        if rect1.within(polygon.buffer(1e-6)) and rect2.within(polygon.buffer(1e-6)):
+            union_area = rect1.union(rect2).area
+            if abs(union_area - polygon.area) < 1e-4:
+                return [rect1, rect2]
     
-    # For T-shape (8 vertices): split into 2 rectangles
-    if len(coords) == 8:
-        xs = sorted(set(c[0] for c in coords))
-        ys = sorted(set(c[1] for c in coords))
+    # For T-shape (8 vertices): top bar + stem
+    # ⚠️  WARNING: T-shape has problems with t-param and cannot provide correct transformation
+    #     (physics behavior not tested yet)
+    if n == 8:
+        # Find the y coordinate where stem meets top bar
+        # Look for the y value that has the most x coordinates (top bar)
+        y_counts = {}
+        for y in ys:
+            count = sum(1 for c in coords if abs(c[1] - y) < 1e-6)
+            y_counts[y] = count
         
-        if len(xs) >= 3 and len(ys) >= 3:
-            # Try horizontal + vertical split
+        # The top bar typically has 4 x coordinates, stem has 2
+        # Find the y with most coordinates (top bar)
+        max_count_y = max(y_counts.items(), key=lambda x: x[1])[0]
+        
+        # The stem junction is typically the second highest y
+        if len(ys) >= 3:
+            mid_y = ys[-2]  # Second highest y
+        else:
             mid_y = (miny + maxy) / 2
-            
-            # Top bar
-            top_rect = Polygon([
-                (minx, mid_y), (maxx, mid_y), (maxx, maxy), (minx, maxy)
-            ])
-            # Stem
+        
+        # Find stem x boundaries from bottom coordinates
+        bottom_coords = [c for c in coords if abs(c[1] - miny) < 1e-6]
+        if len(bottom_coords) >= 2:
+            x_at_bottom = sorted(set(c[0] for c in bottom_coords))
+            if len(x_at_bottom) == 2:
+                stem_x_min, stem_x_max = x_at_bottom[0], x_at_bottom[1]
+            else:
+                # Use middle x range
+                stem_x_min = xs[len(xs)//2 - 1] if len(xs) >= 3 else xs[0]
+                stem_x_max = xs[len(xs)//2] if len(xs) >= 3 else xs[-1]
+        else:
+            # Fallback: use center
             center_x = (minx + maxx) / 2
             stem_width = (maxx - minx) / 3
-            stem_rect = Polygon([
-                (center_x - stem_width, miny),
-                (center_x + stem_width, miny),
-                (center_x + stem_width, mid_y),
-                (center_x - stem_width, mid_y)
-            ])
-            
-            parts = []
-            for rect in [top_rect, stem_rect]:
-                intersection = polygon.intersection(rect)
-                if intersection.area > 0.001:
-                    if intersection.geom_type == 'Polygon':
-                        parts.append(intersection)
-            
-            if len(parts) >= 2:
-                return parts
+            stem_x_min = center_x - stem_width / 2
+            stem_x_max = center_x + stem_width / 2
+        
+        # Top bar rectangle (full width)
+        top_rect = Polygon([
+            (minx, mid_y), (maxx, mid_y), (maxx, maxy), (minx, maxy)
+        ])
+        
+        # Stem rectangle (narrow width)
+        stem_rect = Polygon([
+            (stem_x_min, miny),
+            (stem_x_max, miny),
+            (stem_x_max, mid_y),
+            (stem_x_min, mid_y)
+        ])
+        
+        # Verify decomposition
+        if top_rect.within(polygon.buffer(1e-6)) and stem_rect.within(polygon.buffer(1e-6)):
+            union_area = top_rect.union(stem_rect).area
+            if abs(union_area - polygon.area) < 1e-4:
+                return [top_rect, stem_rect]
     
     # Fallback: return convex hull
     return [polygon.convex_hull]
@@ -219,6 +310,23 @@ def _decompose_rectilinear(polygon: Polygon) -> List[Polygon]:
 # ============================================================================
 # GENERIC TO PYBULLET CONVERSION
 # ============================================================================
+
+# TODO: Alternative workflow for non-rectangular shapes (to fix physics issues):
+#   Instead of creating shapes programmatically, use dedicated URDF files:
+#   1. For shapes other than rectangle/square: load from URDF file
+#   2. Load URDF into PyBullet first (proper physics properties in URDF)
+#   3. Extract 2D vertices from top view (hardcoded for simplicity)
+#   4. Create GenericObject from extracted vertices + mass/inertia from URDF
+#   
+#   This workflow is backward: PyBullet -> GenericObject (instead of GenericObject -> PyBullet)
+#   But it ensures proper physics behavior since URDF files have correct collision meshes
+#   and inertia properties.
+#
+#   Implementation plan:
+#   - Create URDF files for: triangle, L-shape, T-shape, etc.
+#   - Add function: urdf_to_generic(urdf_path, shape_name) -> GenericObject
+#   - Modify generic_to_pybullet() to check if shape has URDF, use it if available
+#   - Extract 2D boundary from URDF collision mesh or use hardcoded vertices
 
 def generic_to_pybullet(
     generic_obj: GenericObject,
@@ -294,6 +402,7 @@ def generic_to_pybullet(
     physics_props['inertia_3d'] = inertia_3d
     
     # Check if convex
+    print(f"Polygon: {polygon} is convex: {is_convex(polygon)}")
     if is_convex(polygon):
         return _create_convex_body(
             polygon, physics_props, height, position, orientation, color
@@ -302,6 +411,7 @@ def generic_to_pybullet(
     if use_compound:
         # Decompose into convex parts
         parts = decompose_to_convex_parts(polygon)
+        print(f"Parts: {parts} and number of parts: {len(parts)}")
         if len(parts) == 1:
             return _create_convex_body(
                 parts[0], physics_props, height, position, orientation, color
@@ -327,8 +437,11 @@ def _create_convex_body(
 ) -> int:
     """Create a single convex PyBullet body from a polygon.
     
-    Uses box approximation for simplicity and reliability.
-    Properly sets mass, inertia, and friction from physics_props.
+    Uses appropriate shape type:
+    - Triangles: GEOM_MESH (proper triangle mesh)
+    - Circles: GEOM_CYLINDER
+    - Rectangles/Squares: GEOM_BOX
+    - Other: GEOM_MESH (extruded polygon)
     
     Parameters
     ----------
@@ -354,41 +467,97 @@ def _create_convex_body(
     inertia_3d = physics_props['inertia_3d']  # (Ixx, Iyy, Izz)
     object_friction = physics_props['object_friction']
     
-    # Get bounding box
+    # Get polygon coordinates (exterior ring, excluding duplicate closing point)
+    coords = list(polygon.exterior.coords)[:-1]
+    n_vertices = len(coords)
+    
+    # Check if it's roughly circular
     bounds = polygon.bounds
     half_extents = [
         (bounds[2] - bounds[0]) / 2,
         (bounds[3] - bounds[1]) / 2,
         height / 2
     ]
-    
-    # Check if it's roughly circular
     centroid = polygon.centroid
     is_circular = polygon.buffer(0).equals(polygon.convex_hull)
     
     # For circles, use cylinder
-    if is_circular and abs(half_extents[0] - half_extents[1]) < 0.01:
-        radius = (half_extents[0] + half_extents[1]) / 2
+    # if is_circular and abs(half_extents[0] - half_extents[1]) < 0.01:
+    #     radius = (half_extents[0] + half_extents[1]) / 2
+    #     collision_id = pyb.createCollisionShape(
+    #         shapeType=pyb.GEOM_CYLINDER,
+    #         radius=radius,
+    #         height=height
+    #     )
+    #     visual_id = pyb.createVisualShape(
+    #         shapeType=pyb.GEOM_CYLINDER,
+    #         radius=radius,
+    #         length=height,
+    #         rgbaColor=color
+    #     )
+    # For triangles, create proper triangle mesh
+    # ⚠️  WARNING: Triangle physics is wrong (objects don't rotate when pushed at corners).
+    #     This is weird since triangles should be simpler than rectilinear shapes.
+    #     Double-check triangle creation vs rectilinear - the more complex shapes (L/T) work
+    #     but the simple triangle doesn't, which is funny. Check _create_triangle_mesh().
+    if n_vertices == 3:
+        vertices_3d, indices = _create_triangle_mesh(coords, height)
         collision_id = pyb.createCollisionShape(
-            shapeType=pyb.GEOM_CYLINDER,
-            radius=radius,
-            height=height
+            shapeType=pyb.GEOM_MESH,
+            vertices=vertices_3d.tolist(),
+            indices=indices.flatten().tolist()
         )
         visual_id = pyb.createVisualShape(
-            shapeType=pyb.GEOM_CYLINDER,
-            radius=radius,
-            length=height,
+            shapeType=pyb.GEOM_MESH,
+            vertices=vertices_3d.tolist(),
+            indices=indices.flatten().tolist(),
             rgbaColor=color
         )
+    # For rectangles/squares (4 vertices, axis-aligned), use box
+    elif n_vertices == 4:
+        # Check if it's axis-aligned (rectangle/square)
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        x_unique = len(set(xs)) == 2
+        y_unique = len(set(ys)) == 2
+        
+        if x_unique and y_unique:
+            # Use box for rectangles/squares
+            collision_id = pyb.createCollisionShape(
+                shapeType=pyb.GEOM_BOX,
+                halfExtents=half_extents
+            )
+            visual_id = pyb.createVisualShape(
+                shapeType=pyb.GEOM_BOX,
+                halfExtents=half_extents,
+                rgbaColor=color
+            )
+        else:
+            # Non-axis-aligned quadrilateral, use mesh
+            vertices_3d, indices = _create_polygon_mesh(coords, height)
+            collision_id = pyb.createCollisionShape(
+                shapeType=pyb.GEOM_MESH,
+                vertices=vertices_3d.tolist(),
+                indices=indices.flatten().tolist()
+            )
+            visual_id = pyb.createVisualShape(
+                shapeType=pyb.GEOM_MESH,
+                vertices=vertices_3d.tolist(),
+                indices=indices.flatten().tolist(),
+                rgbaColor=color
+            )
     else:
-        # Use box approximation
+        # For other polygons, use mesh
+        vertices_3d, indices = _create_polygon_mesh(coords, height)
         collision_id = pyb.createCollisionShape(
-            shapeType=pyb.GEOM_BOX,
-            halfExtents=half_extents
+            shapeType=pyb.GEOM_MESH,
+            vertices=vertices_3d.tolist(),
+            indices=indices.flatten().tolist()
         )
         visual_id = pyb.createVisualShape(
-            shapeType=pyb.GEOM_BOX,
-            halfExtents=half_extents,
+            shapeType=pyb.GEOM_MESH,
+            vertices=vertices_3d.tolist(),
+            indices=indices.flatten().tolist(),
             rgbaColor=color
         )
     
@@ -411,20 +580,119 @@ def _create_convex_body(
     )
     
     # Set dynamics properties including inertia and friction
-    # Note: PyBullet automatically computes inertia from shape if not specified
-    # We override with our calculated values for consistency with object_utils.py
     pyb.changeDynamics(
         uid, -1,
         mass=mass,
         localInertiaDiagonal=list(inertia_3d),
         lateralFriction=object_friction,
-        spinningFriction=0.01,  # Small spinning friction
-        rollingFriction=0.01,   # Small rolling friction
-        linearDamping=0.0,      # No artificial damping
-        angularDamping=0.0      # No artificial damping
+        spinningFriction=0.01,
+        rollingFriction=0.01,
+        linearDamping=0.0,
+        angularDamping=0.0
     )
     
     return uid
+
+
+def _create_triangle_mesh(coords_2d, height):
+    """Create a 3D triangle mesh from 2D coordinates.
+    
+    ⚠️  KNOWN ISSUE: Triangle physics is wrong (objects don't rotate when pushed at corners).
+        This is weird since triangles should be simpler than rectilinear shapes.
+        The more complex shapes (L/T) work but the simple triangle doesn't.
+        Double-check this implementation vs rectilinear shape creation.
+        Possible issues: mesh vertex ordering, inertia calculation, or mass distribution.
+    
+    Parameters
+    ----------
+    coords_2d : list
+        List of 3 (x, y) coordinates
+    height : float
+        Extrusion height
+    
+    Returns
+    -------
+    tuple
+        (vertices_3d, indices) arrays
+    """
+    if len(coords_2d) != 3:
+        raise ValueError("Triangle must have exactly 3 vertices")
+    
+    vertices_3d = []
+    indices = []
+    
+    # Bottom face vertices (z = 0)
+    for x, y in coords_2d:
+        vertices_3d.append([x, y, 0.0])
+    
+    # Top face vertices (z = height)
+    for x, y in coords_2d:
+        vertices_3d.append([x, y, height])
+    
+    # Bottom face (counter-clockwise when viewed from below)
+    indices.append([0, 1, 2])
+    
+    # Top face (clockwise when viewed from above)
+    indices.append([3, 5, 4])
+    
+    # Side faces
+    indices.append([0, 3, 4])  # Side 0-1, triangle 1
+    indices.append([0, 4, 1])  # Side 0-1, triangle 2
+    indices.append([1, 4, 5])  # Side 1-2, triangle 1
+    indices.append([1, 5, 2])  # Side 1-2, triangle 2
+    indices.append([2, 5, 3])  # Side 2-0, triangle 1
+    indices.append([2, 3, 0])  # Side 2-0, triangle 2
+    
+    return np.array(vertices_3d, dtype=np.float64), np.array(indices, dtype=np.int32)
+
+
+def _create_polygon_mesh(coords_2d, height):
+    """Create a 3D polygon mesh from 2D coordinates by extrusion.
+    
+    Parameters
+    ----------
+    coords_2d : list
+        List of (x, y) coordinates
+    height : float
+        Extrusion height
+    
+    Returns
+    -------
+    tuple
+        (vertices_3d, indices) arrays
+    """
+    n = len(coords_2d)
+    if n < 3:
+        raise ValueError("Polygon must have at least 3 vertices")
+    
+    vertices_3d = []
+    indices = []
+    
+    # Bottom face vertices (z = 0)
+    for x, y in coords_2d:
+        vertices_3d.append([x, y, 0.0])
+    
+    # Top face vertices (z = height)
+    for x, y in coords_2d:
+        vertices_3d.append([x, y, height])
+    
+    # Bottom face: triangulate using fan from first vertex
+    for i in range(n - 2):
+        indices.append([0, i + 1, i + 2])
+    
+    # Top face: same triangulation but reversed winding
+    top_base = n
+    for i in range(n - 2):
+        indices.append([top_base, top_base + i + 2, top_base + i + 1])
+    
+    # Side faces: connect bottom and top outlines
+    for i in range(n):
+        next_i = (i + 1) % n
+        # Create two triangles for each side face
+        indices.append([i, next_i, top_base + next_i])
+        indices.append([i, top_base + next_i, top_base + i])
+    
+    return np.array(vertices_3d, dtype=np.float64), np.array(indices, dtype=np.int32)
 
 
 def _create_compound_body(
@@ -579,6 +847,18 @@ def _create_compound_body(
 # PYBULLET TO GENERIC CONVERSION
 # ============================================================================
 
+# TODO: Implement OBJ-based workflow here
+#   Function: obj_to_generic(obj_path: str, shape_name: str, 
+#                            position: Tuple, orientation: float) -> Tuple[GenericObject, int]
+#   - Load OBJ file into PyBullet using createCollisionShape/createVisualShape
+#   - Extract physics properties (mass, inertia) from PyBullet
+#   - Use hardcoded 2D vertices for the shape (from top view)
+#   - Create GenericObject with extracted properties
+#   - Return (GenericObject, pybullet_uid)
+#
+#   This is the "backward" workflow: PyBullet -> GenericObject
+#   But ensures correct physics since OBJ files have proper collision meshes
+
 def pybullet_to_generic(
     uid: int,
     link_idx: int = -1,
@@ -729,6 +1009,220 @@ def print_physics_comparison(generic_obj: GenericObject, pybullet_uid: int, heig
     print(f"  {'Inertia Iyy':<25} {inertia_3d[1]:<15.4f} {pyb_inertia[1]:<15.4f}")
     print(f"  {'Inertia Izz':<25} {inertia_3d[2]:<15.4f} {pyb_inertia[2]:<15.4f}")
     print("="*60)
+
+
+def obj_to_generic(
+    obj_path: str,
+    shape_name: str,
+    position: Tuple[float, float, float] = (0, 0, 0),
+    orientation: float = 0.0,
+    mass: float = 1.0,
+    lateral_friction: float = 0.8,
+    blind_test: bool = False,
+    **kwargs
+) -> Tuple[GenericObject, int]:
+    """Load object from OBJ file and create GenericObject from it.
+    
+    This is the "backward" workflow: PyBullet -> GenericObject
+    Used for shapes with physics issues (triangle, L-shape, T-shape).
+    
+    Workflow:
+    1. Load OBJ file into PyBullet using createCollisionShape/createVisualShape
+    2. Set physics properties (mass, inertia) manually or extract from PyBullet
+    3. Extract 2D vertices directly from the OBJ file using read_obj_to_vertices (slices at z_min)
+    4. Create GenericObject with extracted vertices and physics properties
+    
+    Parameters
+    ----------
+    obj_path : str
+        Path to OBJ file (relative to package urdf directory or absolute)
+    shape_name : str
+        Name of the shape (used for object naming and color selection)
+    position : tuple
+        (x, y, z) position in world frame
+    orientation : float
+        Rotation around z-axis in radians
+    mass : float
+        Mass of the object (default: 1.0 kg)
+    lateral_friction : float
+        Lateral friction coefficient (default: 0.8)
+    blind_test : bool
+        If True, skip vertex matching validation when using DXF fallback.
+        When OBJ polygon is invalid and DXF vertices don't match OBJ vertices,
+        this flag allows using DXF geometry without raising an error (default: False)
+    **kwargs
+        Additional arguments (e.g., moment_of_inertia) for physics properties
+    
+    Returns
+    -------
+    tuple
+        (GenericObject, pybullet_uid)
+    """
+    # Resolve OBJ path
+    if not Path(obj_path).is_absolute():
+        # Try package urdf directory first
+        obj_full_path = Path(pkg_path) / "urdf" / obj_path
+        if not obj_full_path.exists():
+            # Fallback to provided path
+            obj_full_path = Path(obj_path)
+        obj_path = str(obj_full_path)
+    
+    if not Path(obj_path).exists():
+        raise FileNotFoundError(f"OBJ file not found: {obj_path}")
+    
+    # Convert orientation to quaternion
+    
+    orientation_quat = pyb.getQuaternionFromEuler([0, 0, orientation])
+    
+    # Choose a simple per-shape color (MTL files are not reliably used by PyBullet
+    # when loading raw OBJ meshes, so we assign colors explicitly here).
+    shape_colors = {
+        'right_triangle': (0.8, 0.3, 0.3, 1.0),
+        # 'scalene_triangle': (0.3, 0.8, 0.3, 1.0),
+        # 'equilateral_triangle': (0.3, 0.3, 0.8, 1.0),
+        # 'l_shape': (0.8, 0.6, 0.2, 1.0),
+        # 'asym_l_shape': (0.6, 0.2, 0.8, 1.0),
+        # 't_shape': (0.2, 0.8, 0.8, 1.0),
+        # 'asym_t_shape': (0.8, 0.2, 0.5, 1.0),
+        # 'hourglass': (0.7, 0.7, 0.2, 1.0),
+        'bolt': (0.2, 0.8, 0.8, 1.0),
+        'pi': (0.9, 0.7, 0.3, 1.0),
+        'root': (0.6, 0.9, 0.6, 1.0),
+        'rectangle': (0.8, 0.8, 0.8, 1.0),
+    }
+    rgba = shape_colors.get(shape_name, (0.8, 0.8, 0.8, 1.0))
+
+    # Load OBJ file into PyBullet (similar to test_display_obj.py)
+    collision_shape_id = pyb.createCollisionShape(
+        shapeType=pyb.GEOM_MESH,
+        fileName=obj_path,
+        flags=pyb.URDF_INITIALIZE_SAT_FEATURES
+    )
+    
+    visual_shape_id = pyb.createVisualShape(
+        shapeType=pyb.GEOM_MESH,
+        fileName=obj_path,
+        rgbaColor=rgba,
+    )
+    
+    # Create multi-body
+    body_uid = pyb.createMultiBody(
+        baseMass=mass,
+        baseCollisionShapeIndex=collision_shape_id,
+        baseVisualShapeIndex=visual_shape_id,
+        basePosition=position,
+        baseOrientation=orientation_quat
+    )
+    
+    # Set dynamics properties
+    pyb.changeDynamics(
+        body_uid, -1,
+        lateralFriction=lateral_friction
+    )
+    
+    # Extract physics properties from PyBullet (after setting them)
+    dynamics_info = pyb.getDynamicsInfo(body_uid, -1)
+    actual_mass = dynamics_info[0]
+    actual_lateral_friction = dynamics_info[1]
+    local_inertia_diagonal = dynamics_info[2]  # (Ixx, Iyy, Izz)
+    moment_of_inertia = kwargs.get('moment_of_inertia', local_inertia_diagonal[2])  # Izz for 2D
+
+    # Extract 2D vertices directly from OBJ file (new pipeline - no DXF needed)
+    # This gives correct vertex coordinates (verified against Fusion 360)
+    try:
+        vertices_2d = read_obj_to_vertices(obj_path)
+    except Exception as e:
+        raise ValueError(
+            f"Failed to extract 2D vertices from OBJ file {obj_path}: {e}. "
+            "Ensure the OBJ file has a valid mesh that can be sliced at z_min."
+        )
+    
+    # Create polygon from extracted vertices
+    geometry = Polygon(vertices_2d)
+    if not geometry.is_valid or geometry.area <= 0.01:
+        print(f"⚠ Invalid polygon from OBJ vertices (area={geometry.area}, is_valid={geometry.is_valid})")
+        print(f"  Vertices from OBJ: {vertices_2d}")
+        print(f"  Attempting fallback: using DXF file with reverse_sign=True...")
+        
+        # Fallback: try using DXF file with reverse_sign=True
+        # Find corresponding DXF file (same name, different extension)
+        obj_path_obj = Path(obj_path)
+        dxf_path = obj_path_obj.with_suffix('.dxf')
+        
+        if not dxf_path.exists():
+            # Try in the same directory as OBJ
+            dxf_path = obj_path_obj.parent / f"{obj_path_obj.stem}.dxf"
+        
+        if not dxf_path.exists():
+            raise ValueError(
+                f"Invalid polygon from OBJ vertices and DXF file not found: {dxf_path}. "
+                f"OBJ vertices may be in wrong order. Check OBJ file geometry."
+            )
+        
+        # Use dxf_to_generic with reverse_sign=True
+        try:
+            dxf_generic_obj = dxf_to_generic(
+                dxf_path=str(dxf_path),
+                name=shape_name,
+                reverse_sign=True
+            )
+            dxf_vertices = list(dxf_generic_obj.geometry.exterior.coords[:-1])  # Exclude duplicate last point
+            
+            # Check if DXF vertices match OBJ vertices (with tolerance)
+            # Convert to sets of tuples for comparison (with tolerance)
+            tolerance = 1e-3
+            vertices_2d_set = set((round(v[0] / tolerance) * tolerance, round(v[1] / tolerance) * tolerance) for v in vertices_2d)
+            dxf_vertices_set = set((round(v[0] / tolerance) * tolerance, round(v[1] / tolerance) * tolerance) for v in dxf_vertices)
+            
+            if vertices_2d_set != dxf_vertices_set:
+                # Try with more lenient comparison (check if all OBJ vertices are close to some DXF vertex)
+                all_match = True
+                for obj_v in vertices_2d:
+                    found_match = False
+                    for dxf_v in dxf_vertices:
+                        if np.linalg.norm(np.array(obj_v) - np.array(dxf_v)) < tolerance:
+                            found_match = True
+                            break
+                    if not found_match:
+                        all_match = False
+                        break
+                
+                if not all_match:
+                    if blind_test:
+                        # In blind_test mode, skip validation and use DXF geometry anyway
+                        print(f"⚠ blind_test=True: Vertices don't match, but using DXF geometry anyway")
+                    else:
+                        raise ValueError(
+                            f"DXF vertices do not match OBJ vertices (tolerance={tolerance}). "
+                            f"OBJ vertices: {vertices_2d}, DXF vertices: {dxf_vertices}"
+                        )
+            
+            # Use geometry from DXF
+            geometry = dxf_generic_obj.geometry
+            print(f"✓ Using geometry from DXF file (area={geometry.area:.6f}, is_valid={geometry.is_valid})")
+            
+        except Exception as e:
+            raise ValueError(
+                f"Failed to use DXF fallback: {e}. "
+                f"OBJ vertices may be in wrong order. Check OBJ file geometry."
+            )
+    
+    # Estimate mass if not provided
+    if actual_mass <= 0:
+        actual_mass = estimate_realistic_mass(geometry) if mass <= 0 else mass
+    
+    # Create GenericObject with extracted geometry and physics properties
+    generic_obj = GenericObject(
+        geometry=geometry,
+        mass=actual_mass,
+        lateral_friction=actual_lateral_friction,
+        heading=orientation,
+        name=shape_name,
+    )
+    generic_obj.position = np.array([position[0], position[1]])
+    generic_obj.moment_of_inertia = moment_of_inertia
+
+    return generic_obj, body_uid
 
 
 # ============================================================================

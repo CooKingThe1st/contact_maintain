@@ -9,6 +9,8 @@ pyb_utils==2.2.1
 
 # Math/robotics
 spatialmath_python>=1.0.3
+heapdict>=1.0.1
+scipy>=1.10.0
 qpsolvers>=4.2.0
 shapely>=2.0.0
 

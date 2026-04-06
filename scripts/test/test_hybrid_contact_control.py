@@ -57,9 +57,9 @@ pkg_path = rospack.get_path("contact_maintain")
 sys.path.insert(0, str(Path(pkg_path) / "src"))
 sys.path.insert(0, str(Path(pkg_path) / "src" / "legacy"))
 
-from object_utils import create_standard_objects, ContactPointParameterization
+from object_utils import create_standard_objects, create_pybullet_objects, ContactPointParameterization
 from contact_maintain.robot_factory import create_robot, is_wheel_robot, get_wheel_velocities
-from contact_maintain.object_bridge import generic_to_pybullet
+from contact_maintain.object_bridge import generic_to_pybullet, obj_to_generic
 from contact_maintain.pyb_simulation import get_contact_force
 
 
@@ -138,8 +138,15 @@ def setup_pybullet(gui: bool = True):
     pyb.setTimeStep(TIMESTEP)
     pyb.setRealTimeSimulation(0)
     
+    # Set search paths BEFORE loading any URDF files (PyBullet requirement)
     pyb.setAdditionalSearchPath(pybullet_data.getDataPath())
     ground = pyb.loadURDF("plane.urdf", [0, 0, 0])
+
+    # Add URDF directory to search path for custom URDF files
+    urdf_dir = Path(pkg_path) / "urdf"
+    if urdf_dir.exists():
+        pyb.setAdditionalSearchPath(str(urdf_dir))
+    
     
     if gui:
         pyb.resetDebugVisualizerCamera(
@@ -232,7 +239,9 @@ def closest_point_on_desired_segment(
 class HybridContactControlTest:
     """Test hybrid contact control with position/force/velocity requirements."""
     
-    def __init__(self, kinematics: str, t_param: float, approach_distance: float = 0.5):
+    def __init__(self, kinematics: str, t_param: float, approach_distance: float = 0.5, 
+                 object_name: Optional[str] = None, object_index: Optional[int] = None,
+                 obj_shape: Optional[str] = None, obj_file: Optional[str] = None):
         """
         Parameters
         ----------
@@ -242,15 +251,109 @@ class HybridContactControlTest:
             Desired t_param on object boundary to track
         approach_distance : float
             Initial distance from object to spawn robot
+        object_name : str, optional
+            Object name from create_standard_objects() (e.g., 'rectangle')
+        object_index : int, optional
+            Object index from create_pybullet_objects() (1-based, e.g., 3 for right_triangle, 6 for l_shape)
+        obj_shape : str, optional
+            Shape name for OBJ mode (must exist in shape_data.json, e.g., 'right_triangle')
+        obj_file : str, optional
+            OBJ file path (relative to urdf directory or absolute). If None, uses '{obj_shape}.obj'
         """
         self.kinematics = kinematics
         self.desired_t_param = t_param
         self.approach_distance = approach_distance
         
-        # Create object
+        # Create object - support OBJ mode, object_index, object_name, or default
         print(f"\nCreating object with desired t_param={t_param:.3f}...")
-        standard_objects = create_standard_objects()
-        self.generic_object = standard_objects[DEFAULT_OBJECT_SHAPE]
+        
+        if obj_shape is not None:
+            # OBJ mode: Load from OBJ file and create GenericObject from shape data
+            if obj_file is None:
+                obj_file = f"{obj_shape}.obj"
+            
+            print(f"Loading object from OBJ: {obj_file} (shape: {obj_shape})")
+            self.generic_object, self.object_uid = obj_to_generic(
+                obj_path=obj_file,
+                shape_name=obj_shape,
+                position=(0.0, 0.0, 1),
+                orientation=0.0,
+                mass=1.0,
+                lateral_friction=DEFAULT_OBJECT_FRICTION
+            )
+            print(f"✓ Loaded OBJ object: {obj_shape}")
+            print(f"  Mass: {self.generic_object.mass:.3f} kg")
+            print(f"  Moment of inertia: {self.generic_object.moment_of_inertia:.6f} kg·m²")
+            print(f"  Lateral friction: {self.generic_object.lateral_friction:.3f}")
+            
+            # Set dynamics (ensure friction matches)
+            pyb.changeDynamics(self.object_uid, -1, 
+                              lateralFriction=DEFAULT_OBJECT_FRICTION)
+        elif object_index is not None:
+            # Use create_pybullet_objects() and select by index (1-based)
+            pybullet_objects = create_pybullet_objects()
+            object_names = list(pybullet_objects.keys())
+            
+            if object_index < 1 or object_index > len(object_names):
+                raise ValueError(
+                    f"Invalid object index {object_index}. "
+                    f"Valid range: 1-{len(object_names)}\n"
+                    f"Available objects:\n" +
+                    "\n".join([f"  {i+1}. {name}" for i, name in enumerate(object_names)])
+                )
+            
+            selected_name = object_names[object_index - 1]  # Convert to 0-based
+            self.generic_object = pybullet_objects[selected_name]
+            print(f"Selected object by index {object_index}: '{selected_name}'")
+            
+            # Create object in PyBullet at origin
+            self.object_uid = generic_to_pybullet(
+                self.generic_object,
+                height=DEFAULT_OBJECT_HEIGHT,
+                position=(0.0, 0.0, 0),
+                orientation=0.0,
+                color=(0.4, 0.7, 0.4, 1.0)
+            )
+            pyb.changeDynamics(self.object_uid, -1, 
+                              lateralFriction=DEFAULT_OBJECT_FRICTION, 
+                              mass=1.0)
+        elif object_name is not None:
+            # Use create_standard_objects() and select by name
+            standard_objects = create_standard_objects()
+            if object_name not in standard_objects:
+                raise ValueError(f"Unknown object '{object_name}'. Available: {list(standard_objects.keys())}")
+            self.generic_object = standard_objects[object_name]
+            print(f"Selected object by name: '{object_name}'")
+            
+            # Create object in PyBullet at origin
+            self.object_uid = generic_to_pybullet(
+                self.generic_object,
+                height=DEFAULT_OBJECT_HEIGHT,
+                position=(0.0, 0.0, 0),
+                orientation=0.0,
+                color=(0.4, 0.7, 0.4, 1.0)
+            )
+            pyb.changeDynamics(self.object_uid, -1, 
+                              lateralFriction=DEFAULT_OBJECT_FRICTION, 
+                              mass=1.0)
+        else:
+            # Default: use rectangle from create_standard_objects()
+            standard_objects = create_standard_objects()
+            self.generic_object = standard_objects[DEFAULT_OBJECT_SHAPE]
+            print(f"Using default object: '{DEFAULT_OBJECT_SHAPE}'")
+            
+            # Create object in PyBullet at origin
+            self.object_uid = generic_to_pybullet(
+                self.generic_object,
+                height=DEFAULT_OBJECT_HEIGHT,
+                position=(0.0, 0.0, 0),
+                orientation=0.0,
+                color=(0.4, 0.7, 0.4, 1.0)
+            )
+            pyb.changeDynamics(self.object_uid, -1, 
+                              lateralFriction=DEFAULT_OBJECT_FRICTION, 
+                              mass=1.0)
+        
         self.parameterization = ContactPointParameterization(self.generic_object)
         
         # Get contact point info at desired t_param
@@ -258,6 +361,7 @@ class HybridContactControlTest:
         self.contact_point_body = contact_info['point']
         self.normal_outward = contact_info['normal_outward']
         self.normal_inward = -self.normal_outward
+        self.tangent = contact_info['tangent']  # Unit tangent vector along boundary (for Phase 7 Beta)
 
         # Precompute the segment (two vertices) that contains desired t_param (in body frame)
         _, seg_idx, _ = self.parameterization.parameter_to_point(t_param)
@@ -265,20 +369,9 @@ class HybridContactControlTest:
         self.desired_seg_p1_body = np.array(self.parameterization.boundary_coords[self.desired_seg_idx], dtype=float)
         self.desired_seg_p2_body = np.array(self.parameterization.boundary_coords[self.desired_seg_idx + 1], dtype=float)
         
-        # Create object in PyBullet at origin
-        self.object_uid = generic_to_pybullet(
-            self.generic_object,
-            height=DEFAULT_OBJECT_HEIGHT,
-            position=(0.0, 0.0, 0),
-            orientation=0.0,
-            color=(0.4, 0.7, 0.4, 1.0)
-        )
-        pyb.changeDynamics(self.object_uid, -1, 
-                          lateralFriction=DEFAULT_OBJECT_FRICTION, 
-                          mass=1.0)
-        
         # Calculate robot spawn position
         spawn_position_body = self.contact_point_body + self.approach_distance * self.normal_outward
+        
         
         # Create robot at spawn position
         print(f"Creating {kinematics} wheel robot at spawn position...")
@@ -2112,6 +2205,7 @@ Avg Heading Error: {np.degrees(metrics['avg_heading_error']):.2f} deg
                     print(f"\n[t={t:.2f}s] Phase 7 Analysis:")
                     print(f"  Robot pos: {robot_pos}, heading: {robot_heading:.3f} rad")
                     print(f"  Desired contact point speed: {desired_contact_point_speed:.4f} m/s")
+                    print(f"  Desired contact point position: {contact_point_world}")
                     print(f"  Actual contact point speed: {contact_point_speed:.4f} m/s")
                     print(f"  Actual contact point velocity: {contact_point_velocity} m/s")
                     print(f"  Object velocity: {object_velocity} m/s, omega: {object_angular_velocity:.4f} rad/s")
@@ -2136,6 +2230,201 @@ Avg Heading Error: {np.degrees(metrics['avg_heading_error']):.2f} deg
             if gui:
                 time.sleep(TIMESTEP * 0.3)
 
+        return self._compute_phase_1_metrics()  # reuse metrics structure
+
+    # ----------------------------------------------------------------------
+    # PHASE 7 BETA: Simplified Tripartite Decoupled Control (Single Robot)
+    # ----------------------------------------------------------------------
+    def run_phase_7_beta(self, desired_object_velocity: np.ndarray, desired_object_angular_velocity: float, 
+                          gui: bool = True, duration: float = 10.0) -> Dict:
+        """Phase 7 Beta: Simplified Tripartite Decoupled Control for single robot pushing.
+        
+        This phase uses a simplified version of Phase7BetaVerDecouple adapted for single robot:
+        - v_along = v_ff_along (feed-forward only, no corrections)
+        - v_tangent = v_ff_tangent + K * error (feed-forward + proportional error correction)
+        - omega = K * error (proportional heading error)
+        
+        Control Structure:
+        ------------------
+        1. Longitudinal Axis (v_along): Feed-forward only from desired contact point velocity
+        2. Lateral Axis (v_tangent): Feed-forward + proportional position error correction
+        3. Angular (ω): Proportional heading error control
+        
+        Parameters
+        ----------
+        desired_object_velocity : np.ndarray
+            Desired object linear velocity (vx, vy) in world frame
+        desired_object_angular_velocity : float
+            Desired object angular velocity (rad/s)
+        gui : bool
+            Show GUI
+        duration : float
+            Test duration (s)
+        """
+        print(f"\n{'='*60}")
+        print(f"PHASE 7 BETA: Simplified Tripartite Decoupled Control (Single Robot)")
+        print(f"{'='*60}")
+        print(f"  Desired t_param: {self.desired_t_param:.3f}")
+        print(f"  Desired object velocity: {desired_object_velocity}")
+        print(f"  Desired object angular velocity: {desired_object_angular_velocity:.3f} rad/s")
+        print(f"  Duration: {duration:.1f} s")
+        
+        # Control gains
+        kp_tangent = 1.5  # Proportional gain for tangent position error
+        kp_heading = 10.0  # Proportional gain for heading error
+        
+        # Limits
+        max_linear_speed = 0.5
+        max_along_speed = 0.4
+        max_tangent_speed = 0.3
+        
+        # Contact detection with hysteresis
+        contact_threshold_on = 2.0
+        contact_threshold_off = 0.2
+        in_contact_prev = False
+        
+        n_steps = int(duration / TIMESTEP)
+        step_count = 0
+        t = 0.0
+        
+        for step in range(n_steps):
+            if step_count % CTRL_STEP == 0:
+                # Robot state
+                robot_pos, robot_heading, robot_vel = self.robot.get_state()
+                
+                # Object state
+                obj_pos, obj_orn = pyb.getBasePositionAndOrientation(self.object_uid)
+                obj_vel_lin, obj_vel_ang = pyb.getBaseVelocity(self.object_uid)
+                euler = pyb.getEulerFromQuaternion(obj_orn)
+                object_pos = np.array([obj_pos[0], obj_pos[1]])
+                object_orientation = euler[2]
+                object_velocity = np.array([obj_vel_lin[0], obj_vel_lin[1]])
+                object_angular_velocity = obj_vel_ang[2]
+                
+                # Contact detection with hysteresis
+                contact_force = self._get_contact_force()
+                if in_contact_prev:
+                    self.in_contact = contact_force > contact_threshold_off
+                else:
+                    self.in_contact = contact_force > contact_threshold_on
+                in_contact_prev = self.in_contact
+                
+                # Contact point & frame vectors in world
+                cos_t = np.cos(object_orientation)
+                sin_t = np.sin(object_orientation)
+                R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+                contact_point_world = R @ self.contact_point_body + object_pos
+                normal_outward_world = R @ self.normal_outward
+                normal_inward_world = -normal_outward_world
+                tangent_world = R @ self.tangent
+                
+                # Intended position: contact point + robot_radius * normal_outward
+                intended_pos = contact_point_world + ROBOT_RADIUS * normal_outward_world
+                position_error = intended_pos - robot_pos
+                
+                # Heading control: point toward contact point
+                desired_heading = np.arctan2(
+                    (contact_point_world - robot_pos)[1],
+                    (contact_point_world - robot_pos)[0]
+                )
+                heading_error = np.arctan2(
+                    np.sin(desired_heading - robot_heading),
+                    np.cos(desired_heading - robot_heading)
+                )
+                
+                # ===== SIMPLIFIED TRIPARTITE DECOUPLED CONTROL =====
+                
+                # STEP 1: Compute desired contact point velocity from desired object motion
+                # Transform desired object velocity to body frame
+                R_T = R.T
+                r_cp_body = self.contact_point_body
+                v_obj_desired_body = R_T @ desired_object_velocity
+                v_rotation_body = desired_object_angular_velocity * np.array([-r_cp_body[1], r_cp_body[0]])
+                v_cp_desired_body = v_obj_desired_body + v_rotation_body
+                v_cp_desired = R @ v_cp_desired_body
+                
+                # STEP 2: Project desired contact point velocity onto contact frame axes
+                v_ff_along = np.dot(v_cp_desired, normal_inward_world)  # Feed-forward along normal
+                v_ff_tangent = np.dot(v_cp_desired, tangent_world)       # Feed-forward along tangent
+                
+                # STEP 3: Decompose position error in contact frame
+                error_along = np.dot(position_error, normal_inward_world)  # Error along normal
+                error_tangent = np.dot(position_error, tangent_world)      # Error along tangent
+                
+                # STEP 4: Control Law (Simplified)
+                # v_along = v_ff_along (feed-forward only, no corrections)
+                v_along = v_ff_along + error_along * kp_tangent
+                # v_along = v_ff_along
+                v_along = np.clip(v_along, -max_along_speed, max_along_speed)
+                
+                # v_tangent = v_ff_tangent + K * error (feed-forward + proportional error)
+                v_tangent = v_ff_tangent + kp_tangent * error_tangent
+                v_tangent = np.clip(v_tangent, -max_tangent_speed, max_tangent_speed)
+                
+                # omega = K * error (proportional heading error)
+                omega = kp_heading * heading_error
+                omega = np.clip(omega, -1.0, 1.0)
+                
+                # STEP 5: Transform from contact frame to world frame
+                vel_cmd_xy = v_along * normal_inward_world + v_tangent * tangent_world
+                
+                # Clamp total speed
+                speed = np.linalg.norm(vel_cmd_xy)
+                if speed > max_linear_speed:
+                    vel_cmd_xy = vel_cmd_xy * (max_linear_speed / speed)
+                
+                cmd = np.array([vel_cmd_xy[0], vel_cmd_xy[1], omega])
+                self.robot.command_velocity(cmd)
+                
+                # Contact point velocity (for reference)
+                r_cp = contact_point_world - object_pos
+                v_rotation = object_angular_velocity * np.array([-r_cp[1], r_cp[0]])
+                contact_point_velocity = object_velocity + v_rotation
+                
+                # Record history (reuse Phase 5 structure)
+                self.history.times.append(t)
+                self.history.robot_positions.append(robot_pos.copy())
+                self.history.robot_headings.append(robot_heading)
+                self.history.robot_velocities.append(robot_vel.copy())
+                self.history.robot_cmd_velocities.append(cmd.copy())
+                self.history.intended_positions.append(intended_pos.copy())
+                self.history.position_errors.append(position_error.copy())
+                self.history.desired_headings.append(desired_heading)
+                self.history.heading_errors.append(heading_error)
+                self.history.closest_points_on_desired_segment.append(contact_point_world.copy())
+                self.history.closest_u_on_desired_segment.append(0.0)  # Not used in this phase
+                self.history.object_positions.append(object_pos.copy())
+                self.history.object_orientations.append(object_orientation)
+                self.history.object_velocities.append(object_velocity.copy())
+                self.history.object_angular_velocities.append(object_angular_velocity)
+                self.history.contact_point_positions.append(contact_point_world.copy())
+                self.history.contact_point_velocities.append(contact_point_velocity.copy())
+                self.history.contact_forces.append(contact_force)
+                self.history.in_contact.append(self.in_contact)
+                # Phase 7 Beta velocity components (reuse Phase 5 fields)
+                self.history.v_base_history.append(v_along)  # Longitudinal velocity
+                self.history.v_constant_history.append(v_ff_tangent)  # Feed-forward tangent
+                self.history.v_velo_error_pi_history.append(kp_tangent * error_tangent)  # Tangent error correction
+                
+                # Debug print occasionally
+                if step_count % (CTRL_STEP * 10) == 0:
+                    print(f"\n[t={t:.2f}s] Phase 7 Beta Analysis:")
+                    print(f"  Robot pos: {robot_pos}, heading: {robot_heading:.3f} rad")
+                    print(f"  Desired object velocity: {desired_object_velocity}")
+                    print(f"  Actual object velocity: {object_velocity}")
+                    print(f"  v_ff_along: {v_ff_along:.4f} m/s, v_along: {v_along:.4f} m/s")
+                    print(f"  v_ff_tangent: {v_ff_tangent:.4f} m/s, error_tangent: {error_tangent:.4f} m")
+                    print(f"  v_tangent: {v_tangent:.4f} m/s")
+                    print(f"  omega: {omega:.4f} rad/s (heading error: {heading_error:.3f} rad)")
+                    print(f"  Contact: {self.in_contact}, force: {contact_force:.2f} N")
+            
+            pyb.stepSimulation()
+            t += TIMESTEP
+            step_count += 1
+            
+            if gui:
+                time.sleep(TIMESTEP * 0.3)
+        
         return self._compute_phase_1_metrics()  # reuse metrics structure
 
     # ----------------------------------------------------------------------
@@ -2355,8 +2644,9 @@ Examples:
     python test_hybrid_contact_control.py --phase 7 --t-param 0.125 --desired-speed 0.1
         """
     )
-    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 25, 3, 4, 5, 6, 7],
-                       help="Test phase (default: 1)")
+    parser.add_argument("--phase", type=str, default="1", 
+                       choices=["1", "2", "25", "3", "4", "5", "6", "7", "7beta"],
+                       help="Test phase (default: 1). Use '7beta' for Phase 7 Beta.")
     parser.add_argument("--kinematics", "-k", default="holonomic",
                        choices=['holonomic', 'diffdrive'],
                        help="Kinematics type (default: holonomic)")
@@ -2368,6 +2658,18 @@ Examples:
                        help="Desired contact force for Phase 2/4 (default: 5.0 N)")
     parser.add_argument("--desired-speed", type=float, default=0.1,
                        help="Desired speed magnitude for Phase 5/6/7 (object speed for 5/6, contact point speed for 7) (default: 0.1 m/s)")
+    parser.add_argument("--desired-object-velocity", type=str, default="0.03,0.05",
+                       help="Desired object velocity (vx,vy) for Phase 7beta as 'vx,vy' (default: 0.03,0.05)")
+    parser.add_argument("--desired-object-angular-velocity", type=float, default=0.2,
+                       help="Desired object angular velocity (rad/s) for Phase 7beta (default: 0.2)")
+    parser.add_argument("--object", type=str, default=None,
+                       help="Object name from create_standard_objects() (e.g., 'rectangle')")
+    parser.add_argument("--object-index", type=int, default=None,
+                       help="Object index from create_pybullet_objects() (1-based, e.g., 3 for right_triangle, 6 for l_shape)")
+    parser.add_argument("--obj-shape", type=str, default=None,
+                       help="Shape name for OBJ mode (must exist in shape_data.json, e.g., 'right_triangle')")
+    parser.add_argument("--obj-file", type=str, default=None,
+                       help="OBJ file path (relative to urdf directory or absolute). If None, uses '{obj-shape}.obj'")
     parser.add_argument("--duration", type=float, default=10.0,
                        help="Test duration (default: 10.0 s)")
     parser.add_argument("--no-gui", action="store_true",
@@ -2385,10 +2687,18 @@ Examples:
     test = HybridContactControlTest(
         kinematics=args.kinematics,
         t_param=args.t_param,
-        approach_distance=args.approach_distance
+        approach_distance=args.approach_distance,
+        object_name=args.object,
+        object_index=args.object_index,
+        obj_shape=args.obj_shape,
+        obj_file=args.obj_file
     )
     
-    if args.phase == 1:
+    # Convert phase string to int for backward compatibility
+    phase_str = args.phase
+    phase_int = int(phase_str) if phase_str.isdigit() else None
+    
+    if phase_str == "1" or phase_int == 1:
         # Phase 1: Basic requirements
         results = test.run_phase_1(gui=not args.no_gui, duration=args.duration)
         
@@ -2409,7 +2719,7 @@ Examples:
         else:
             test.plot_phase_1_results()
     
-    elif args.phase == 2:
+    elif phase_str == "2" or phase_int == 2:
         results = test.run_phase_2(desired_force=args.desired_force, gui=not args.no_gui, duration=args.duration)
 
         print("\n" + "="*60)
@@ -2430,7 +2740,7 @@ Examples:
         else:
             test.plot_phase_1_results()
     
-    elif args.phase == 25:
+    elif phase_str == "25":
         results = test.run_phase_25(desired_force=args.desired_force, gui=not args.no_gui, duration=args.duration)
 
         print("\n" + "="*60)
@@ -2451,7 +2761,7 @@ Examples:
         else:
             test.plot_phase_1_results()
 
-    elif args.phase == 3:
+    elif phase_str == "3" or phase_int == 3:
         results = test.run_phase_3(gui=not args.no_gui, duration=args.duration)
 
         print("\n" + "="*60)
@@ -2476,7 +2786,7 @@ Examples:
             test.plot_phase_1_results()
             test.plot_phase3_velocities()
     
-    elif args.phase == 4:
+    elif phase_str == "4" or phase_int == 4:
         results = test.run_phase_4(desired_force=args.desired_force, gui=not args.no_gui, duration=args.duration)
 
         print("\n" + "="*60)
@@ -2497,7 +2807,7 @@ Examples:
         else:
             test.plot_phase_1_results()
     
-    elif args.phase == 5:
+    elif phase_str == "5" or phase_int == 5:
         results = test.run_phase_5(
             desired_speed=args.desired_speed,
             gui=not args.no_gui,
@@ -2525,7 +2835,7 @@ Examples:
             test.plot_phase_1_results()
             test.plot_phase_5_velocities(args.desired_speed)
     
-    elif args.phase == 6:
+    elif phase_str == "6" or phase_int == 6:
         results = test.run_phase_6(
             desired_speed=args.desired_speed,
             gui=not args.no_gui,
@@ -2553,7 +2863,7 @@ Examples:
             test.plot_phase_1_results()
             test.plot_phase_5_velocities(args.desired_speed, phase=6)
     
-    elif args.phase == 7:
+    elif phase_str == "7" or phase_int == 7:
         results = test.run_phase_7(
             desired_contact_point_speed=args.desired_speed,
             gui=not args.no_gui,
@@ -2580,6 +2890,50 @@ Examples:
         else:
             test.plot_phase_1_results()
             test.plot_phase_5_velocities(args.desired_speed, phase=7)
+    
+    elif phase_str == "7beta":
+        # Parse desired object velocity
+        try:
+            vel_parts = [float(x.strip()) for x in args.desired_object_velocity.split(',')]
+            if len(vel_parts) != 2:
+                raise ValueError("Desired object velocity must have 2 components (vx, vy)")
+            desired_obj_velocity = np.array(vel_parts)
+        except Exception as e:
+            print(f"Error parsing desired object velocity: {e}")
+            print("Using default: [0.03, 0.05]")
+            desired_obj_velocity = np.array([0.03, 0.05])
+        
+        results = test.run_phase_7_beta(
+            desired_object_velocity=desired_obj_velocity,
+            desired_object_angular_velocity=args.desired_object_angular_velocity,
+            gui=not args.no_gui,
+            duration=args.duration
+        )
+        
+        print("\n" + "="*60)
+        print("PHASE 7 BETA RESULTS (Simplified Tripartite Decoupled Control)")
+        print("="*60)
+        print(f"  Contact achieved: {results['contact_achieved']}")
+        if results['contact_achieved']:
+            print(f"  Contact time: {results['contact_time']:.2f} s")
+            print(f"  Avg position error: {results['avg_position_error']*100:.2f} cm")
+            print(f"  Avg heading error: {np.degrees(results['avg_heading_error']):.2f} deg")
+            print(f"  Avg segment projection error (u off [0,1]): {results['avg_segment_u_error']:.4f}")
+        print("="*60)
+        
+        if args.save_dir:
+            save_path = Path(args.save_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+            test.plot_phase_1_results(save_path / "phase7beta_results.png")
+            # Use Phase 5 velocity plot with phase=7 for correct labels
+            test.plot_phase_5_velocities(
+                np.linalg.norm(desired_obj_velocity), 
+                save_path / "phase7beta_velocities.png", 
+                phase=7
+            )
+        else:
+            test.plot_phase_1_results()
+            test.plot_phase_5_velocities(np.linalg.norm(desired_obj_velocity), phase=7)
     
     if not args.no_gui:
         print("\nPress Enter to exit...")

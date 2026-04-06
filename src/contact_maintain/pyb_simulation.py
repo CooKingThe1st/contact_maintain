@@ -99,6 +99,34 @@ def get_contact_force_copy_from_henrik(
     return force
 
 
+def get_object_state(object_uid):
+    """Get object state (position, orientation, velocity, angular velocity) from PyBullet.
+    
+    Parameters
+    ----------
+    object_uid : int
+        PyBullet UID of the object
+        
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - "position": np.ndarray, 2D position (x, y) in world frame
+        - "orientation": float, orientation angle (radians) around z-axis
+        - "velocity": np.ndarray, 2D linear velocity (vx, vy) in world frame
+        - "angular_velocity": float, angular velocity (rad/s) around z-axis
+    """
+    pos, orn = pyb.getBasePositionAndOrientation(object_uid)
+    vel_lin, vel_ang = pyb.getBaseVelocity(object_uid)
+    euler = pyb.getEulerFromQuaternion(orn)
+    return {
+        "position": np.array([pos[0], pos[1]]),
+        "orientation": euler[2],
+        "velocity": np.array([vel_lin[0], vel_lin[1]]),
+        "angular_velocity": vel_ang[2],
+    }
+
+
 class BulletBody(pyb_utils.BulletBody):
     """Generic rigid body in PyBullet."""
 
