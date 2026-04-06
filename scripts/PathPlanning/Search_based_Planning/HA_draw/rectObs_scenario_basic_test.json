@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "map": {
+    "width": 60.0,
+    "height": 40.0,
+    "resolution": 1.0
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 2.0,
+    "length": 3.0,
+    "shape_name": "pentagon_asym",
+    "safety_margin": 0.0
+  },
+  "pose": {
+    "start": [
+      5.0,
+      5.0,
+      0.0
+    ],
+    "goal": [
+      50.0,
+      30.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 1.0
+  },
+  "planner": {
+    "yaw_fill_mode": "linear"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [
+        15.302225192554204,
+        12.285122654015979,
+        7.194241451469765,
+        3.8811039409244756
+      ],
+      "RECT_002": [
+        28.460114163005482,
+        20.61529696624413,
+        6.152969662441254,
+        2.271865721516768
+      ],
+      "RECT_003": [
+        40.76605348788797,
+        24.02309554851928,
+        5.017036801682863,
+        4.070426084384209
+      ]
+    },
+    "lines": {},
+    "rect_count": 3,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "rectObs_scenario_basic_test.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

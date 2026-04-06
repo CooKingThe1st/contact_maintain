@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "map": {
+    "width": 14.0,
+    "height": 14.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 2.0,
+    "length": 3.0,
+    "shape_name": "plus"
+  },
+  "pose": {
+    "start": [
+      3.0,
+      3.0,
+      0.0
+    ],
+    "goal": [
+      10.0,
+      10.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 1.0
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [
+        40.76605348788797,
+        24.02309554851928,
+        5.017036801682863,
+        4.070426084384209
+      ],
+      "RECT_002": [
+        4.498197714548661,
+        5.487000536850983,
+        2.186670756959888,
+        0.8835033361454112
+      ],
+      "RECT_003": [
+        7.8775979753048535,
+        3.189891862872919,
+        2.8713858424725824,
+        1.6123935884653715
+      ]
+    },
+    "lines": {},
+    "rect_count": 3,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "scenario_plus.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

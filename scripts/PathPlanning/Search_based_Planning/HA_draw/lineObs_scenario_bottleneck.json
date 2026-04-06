@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "map": {
+    "width": 14.0,
+    "height": 14.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 2.0,
+    "length": 3.0,
+    "shape_name": "plus",
+    "safety_margin": 0.0
+  },
+  "pose": {
+    "start": [
+      3.0,
+      3.0,
+      0.0
+    ],
+    "goal": [
+      10.0,
+      10.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 1.0
+  },
+  "planner": {
+    "yaw_fill_mode": "none"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [
+        1.3502433147500712,
+        4.745157327789852,
+        7.048284985353869,
+        7.857885287725597
+      ],
+      "RECT_002": [
+        8.790258433336483,
+        5.467529150524427,
+        2.2373810356231694,
+        0.08774043276953591
+      ]
+    },
+    "lines": {},
+    "rect_count": 2,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "lineObs_scenario_bottleneck.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}
