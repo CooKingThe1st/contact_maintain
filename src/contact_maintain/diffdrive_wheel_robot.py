@@ -22,8 +22,9 @@ import rospkg
 WHEEL_RADIUS = 0.02   # meters (scaled from 0.063)
 WHEEL_BASE = 0.10     # distance between wheels (meters, scaled from 0.30)
 
-# Maximum speeds (adjusted for smaller wheels)
-MAX_WHEEL_SPEED = 60.0  # rad/s (increased to compensate for smaller wheels)
+# Maximum speeds
+# Raised 5x for high-speed matching diagnostics in stop_go stale-reference tests.
+MAX_WHEEL_SPEED = 50.0  # rad/s
 MAX_LINEAR_SPEED = WHEEL_RADIUS * MAX_WHEEL_SPEED  # m/s
 MAX_ANGULAR_SPEED = 2 * WHEEL_RADIUS * MAX_WHEEL_SPEED / WHEEL_BASE  # rad/s
 

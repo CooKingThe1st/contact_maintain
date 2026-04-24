@@ -17,6 +17,19 @@ This script:
      the contact-point trajectories match.
   4. Shows the holonomic case for comparison (trivial: translation matches
      contact velocity, heading is reactive).
+
+python3 test_matching_velo_nonconvex.py \
+  --shape pi \
+  --t_param 0.25 \
+  --vx_body 0.0 \
+  --vy_body 0.0 \
+  --omega 0.3 \
+  --duration 5.0 \
+  --dt 0.01 \
+  --robot_radius 0.06 \
+  --silent \
+  --save self_rotate_pi.png
+
 """
 
 import argparse

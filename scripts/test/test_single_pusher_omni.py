@@ -26,13 +26,13 @@ Phases:
 
 Usage:
     # Phase 1: Basic requirements calculation
-    python test_hybrid_contact_control.py --phase 1 --t-param 0.125
+    python test_single_pusher_omni.py --phase 1 --t-param 0.125
     
     # Phase 2: Force-position hybrid control
-    python test_hybrid_contact_control.py --phase 2 --t-param 0.125 --desired-force 5.0
+    python test_single_pusher_omni.py --phase 2 --t-param 0.125 --desired-force 5.0
     
     # Phase 3: Velocity-position hybrid control
-    python test_hybrid_contact_control.py --phase 3 --t-param 0.125
+    python test_single_pusher_omni.py --phase 3 --t-param 0.125
 """
 import argparse
 import sys
@@ -1971,6 +1971,21 @@ Avg Heading Error: {np.degrees(metrics['avg_heading_error']):.2f} deg
     # ----------------------------------------------------------------------
     # PHASE 7: Feed-Forward + PI Control tracking Contact Point Speed
     # ----------------------------------------------------------------------
+    # NOTE FOR FUTURE DIFF-DRIVE PHASE7 WORK (design summary):
+    # - For each constant object-twist segment, with object-side contact point fixed,
+    #   the intended robot-side alpha* and initial heading zeta0* are solved from the
+    #   matching equations (not hand-picked).
+    # - In that constant-alpha regime, feed-forward uses constant (vr_ff, omega_ff)
+    #   with omega_ff = omega_object and vr_ff constant (vr_dot = 0).
+    # - Additive feedback structure for diff-drive:
+    #     vr = vr_ff + Kp_pos * e_pos_projected
+    #     omega_r = omega_ff - Kp_alpha * wrap(alpha_current - alpha*)
+    #   where alpha tracking is angle-level (preferred over dot-level here).
+    # - Two runtime strategies to compare:
+    #   (1) stop-and-go: re-align to solved zeta0* each segment, then push;
+    #   (2) continuous: shift references at segment boundaries and track through.
+    # - Test hint: approach no-torque pose (heading toward CoM) to make differences
+    #   between stop-and-go and continuous behavior more visible.
     def run_phase_7(self, desired_contact_point_speed: float, gui: bool = True, duration: float = 10.0) -> Dict:
         """Phase 7: Feed-Forward + PI Control tracking contact point speed (not object speed).
 

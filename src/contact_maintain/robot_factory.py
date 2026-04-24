@@ -7,6 +7,7 @@ Supported combinations:
 - holonomic + wheel  → OmniwheelRobot (4-wheel omni control)
 - diffdrive + dummy  → DifferentialDriveRobot (direct velocity control)
 - diffdrive + wheel  → DiffDriveWheelRobot (2-wheel control)
+- diffdrive + wheel_physics → DiffDriveWheelPhysicsRobot (wheel-contact driven)
 """
 from pathlib import Path
 from typing import Tuple, Optional, Union, Literal
@@ -22,9 +23,10 @@ URDF_DIR = PKG_PATH / "urdf"
 
 # Type aliases
 KinematicsType = Literal['holonomic', 'diffdrive']
-ModelType = Literal['dummy', 'wheel']
+ModelType = Literal['dummy', 'wheel', 'wheel_physics']
 RobotType = Union['HolonomicRobot', 'OmniwheelRobot', 
-                  'DifferentialDriveRobot', 'DiffDriveWheelRobot']
+                  'DifferentialDriveRobot', 'DiffDriveWheelRobot',
+                  'DiffDriveWheelPhysicsRobot']
 
 
 # Robot class imports (lazy to avoid circular imports)
@@ -37,11 +39,13 @@ def _get_robot_classes():
         from contact_maintain.robots import HolonomicRobot, DifferentialDriveRobot
         from contact_maintain.omniwheel_robot import OmniwheelRobot
         from contact_maintain.diffdrive_wheel_robot import DiffDriveWheelRobot
+        from contact_maintain.diffdrive_wheel_physics_robot import DiffDriveWheelPhysicsRobot
         _robot_classes = {
             ('holonomic', 'dummy'): HolonomicRobot,
             ('holonomic', 'wheel'): OmniwheelRobot,
             ('diffdrive', 'dummy'): DifferentialDriveRobot,
             ('diffdrive', 'wheel'): DiffDriveWheelRobot,
+            ('diffdrive', 'wheel_physics'): DiffDriveWheelPhysicsRobot,
         }
     return _robot_classes
 
@@ -52,6 +56,7 @@ URDF_PATHS = {
     ('holonomic', 'wheel'): URDF_DIR / "omniwheel_robot.urdf",
     ('diffdrive', 'dummy'): URDF_DIR / "holonomic_robot.urdf",  # Uses same URDF, different control
     ('diffdrive', 'wheel'): URDF_DIR / "diffdrive_wheel_robot.urdf",
+    ('diffdrive', 'wheel_physics'): URDF_DIR / "diffdrive_wheel_robot_disc_bumper.urdf",
 }
 
 
@@ -70,7 +75,8 @@ def create_robot(
     kinematics : str
         'holonomic' for omni-directional, 'diffdrive' for differential drive.
     model : str
-        'dummy' for direct velocity control, 'wheel' for realistic wheel physics.
+        'dummy' for direct velocity control, 'wheel' for existing wheel model,
+        'wheel_physics' for wheel-contact-driven diff drive.
     position : tuple
         Initial (x, y) position.
     orientation : float
@@ -83,7 +89,8 @@ def create_robot(
     Returns
     -------
     Robot instance
-        One of HolonomicRobot, OmniwheelRobot, DifferentialDriveRobot, or DiffDriveWheelRobot.
+        One of HolonomicRobot, OmniwheelRobot, DifferentialDriveRobot,
+        DiffDriveWheelRobot, or DiffDriveWheelPhysicsRobot.
     
     Raises
     ------
@@ -94,6 +101,7 @@ def create_robot(
     --------
     >>> robot = create_robot('holonomic', 'dummy', (0, 0), orientation=0.0)
     >>> robot = create_robot('diffdrive', 'wheel', (1, 1), orientation=np.pi/2)
+    >>> robot = create_robot('diffdrive', 'wheel_physics', (1, 1), orientation=np.pi/2)
     """
     key = (kinematics, model)
     
@@ -133,7 +141,7 @@ def get_robot_info(kinematics: KinematicsType, model: ModelType) -> dict:
     kinematics : str
         'holonomic' or 'diffdrive'.
     model : str
-        'dummy' or 'wheel'.
+        'dummy', 'wheel', or 'wheel_physics'.
     
     Returns
     -------
@@ -170,6 +178,7 @@ def list_robot_configurations() -> list:
         ('holonomic', 'wheel'),
         ('diffdrive', 'dummy'),
         ('diffdrive', 'wheel'),
+        ('diffdrive', 'wheel_physics'),
     ]
 
 

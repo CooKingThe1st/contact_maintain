@@ -26,7 +26,7 @@ Optionally, it can also plot the differential-drive robot contact-maintenance
 trajectory via the existing constant-velocity matching logic.
 
 Example (copy/paste):
-  python scripts/test/basic_test/test_motion_primitive.py \
+  python3 test_motion_primitive.py \
     --shape pi --t_param 0.25 \
     --x_end 0.20 --y_end 0.10 --theta_end 0.20 \
     --v_speed 1.0 --dt 0.01 \
@@ -91,6 +91,7 @@ def solve_constant_body_twist_from_SE2(
     theta_end: float,
     *,
     v_speed: float = 1.0,
+    pure_spin_duration: float = 1.0,
     eps: float = 1e-9,
 ) -> tuple[np.ndarray, float, float]:
     """
@@ -103,21 +104,36 @@ def solve_constant_body_twist_from_SE2(
     Returns:
       v_body (2,), omega (float), T (float>0)
     """
-    if v_speed <= 0:
-        raise ValueError("v_speed must be > 0.")
+    if v_speed < 0:
+        raise ValueError("v_speed must be >= 0.")
+    if pure_spin_duration <= 0:
+        raise ValueError("pure_spin_duration must be > 0.")
 
     x_end = float(x_end)
     y_end = float(y_end)
     theta_end = float(theta_end)
+    disp = np.array([x_end, y_end], dtype=float)
+    dist = float(np.linalg.norm(disp))
+
+    # Pure-rotation special case: requested translation is (near-)zero while
+    # orientation change is nonzero. This is valid under the model with v_body=0.
+    if abs(theta_end) >= eps and dist < eps:
+        T = float(pure_spin_duration)
+        omega = float(theta_end / T)
+        v_body = np.zeros(2, dtype=float)
+        return v_body, omega, T
 
     # Straight-line special case
     if abs(theta_end) < eps:
-        disp = np.array([x_end, y_end], dtype=float)
-        dist = float(np.linalg.norm(disp))
         if dist < eps:
             raise ValueError(
                 "Ambiguous request: end pose has near-zero displacement and "
                 "theta_end~0, so no meaningful motion duration/velocity exists."
+            )
+        if v_speed <= 0:
+            raise ValueError(
+                "Straight-line request needs v_speed > 0. "
+                "Use nonzero theta_end with near-zero displacement for pure spin."
             )
         omega = 0.0
         T = dist / v_speed
@@ -145,6 +161,8 @@ def solve_constant_body_twist_from_SE2(
             "nonzero theta_end under the constant-speed body-twist model."
         )
 
+    if v_speed <= 0:
+        raise ValueError("Arc request needs v_speed > 0.")
     omega_mag = v_speed / z_norm  # |omega|
     omega = float(np.sign(theta) * omega_mag)
     T = float(theta / omega)  # positive by construction
@@ -590,6 +608,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--theta_end", type=float, required=True, help="End orientation (rad) in SE2.")
 
     p.add_argument("--v_speed", type=float, default=1.0, help="Fixed magnitude ||v_body|| in m/s.")
+    p.add_argument(
+        "--pure_spin_duration",
+        type=float,
+        default=1.0,
+        help="Duration T used when x_end,y_end~0 and theta_end!=0 (pure spin case).",
+    )
     p.add_argument("--dt", type=float, default=0.01, help="Time step for plotting.")
     p.add_argument("--duration_fallback_dt", type=float, default=0.01, help="(unused) compatibility knob.")
 
@@ -633,12 +657,20 @@ def main() -> None:
 
     # Inverse kinematics: end pose -> (v_body, omega, T)
     v_body, omega, T = solve_constant_body_twist_from_SE2(
-        args.x_end, args.y_end, args.theta_end, v_speed=args.v_speed
+        args.x_end,
+        args.y_end,
+        args.theta_end,
+        v_speed=args.v_speed,
+        pure_spin_duration=args.pure_spin_duration,
     )
-    v_dir = v_body / np.linalg.norm(v_body)
+    v_norm = float(np.linalg.norm(v_body))
 
     print("\nSolved constant body twist:")
-    print(f"  v_body unit direction = [{v_dir[0]:+.6f}, {v_dir[1]:+.6f}]")
+    if v_norm > 1e-12:
+        v_dir = v_body / v_norm
+        print(f"  v_body unit direction = [{v_dir[0]:+.6f}, {v_dir[1]:+.6f}]")
+    else:
+        print("  v_body unit direction = [undefined: pure spin v_body=0]")
     print(f"  omega                = {omega:+.6f} rad/s")
     print(f"  duration T          = {T:.6f} s")
 

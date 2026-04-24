@@ -63,6 +63,10 @@ from contact_maintain.diffdrive_path_control import (
     DiffDriveSegmentPhase,
     build_segment_primitive_plans,
     build_vertex_thetas_for_hybrid_path,
+    compute_dd_solutions_forward_backward,
+    contact_point_velocity_world,
+    outward_normal_world,
+    phi0_inward_from_outward_normal,
     orientation_pid_omega_simple,
     robot_heading_goal_co_rotate,
     robot_rotate_command_diffdrive,
@@ -2361,6 +2365,38 @@ def main():
                                 float(plan_rot.mid_theta_world),
                                 float(obj_state["angular_velocity"]),
                             )
+                            # CRITICAL FIX:
+                            # Previously this phase reused Phase7Beta's world-frame [vx, vy, omega]
+                            # output and then projected [vx, vy] -> v_forward at the very end for
+                            # diff-drive. That silently discards lateral demand and breaks the intended
+                            # differential-flatness primitive during object self-rotation.
+                            #
+                            # In OBJECT_ROTATE we must command diff-drive robots directly using the
+                            # closed-form velocity-matching mapping with constant commands:
+                            #   omega_r = omega_obj,
+                            #   (v_r, zeta0) from the contact-point velocity equation.
+                            th_obj = float(obj_state["orientation"])
+                            omega_obj = float(desired_obj_omega)
+                            for name, agent in robot_agents.items():
+                                cp_b, n_b = robot_contact_body[name]
+                                v_cp_w = contact_point_velocity_world(
+                                    th_obj,
+                                    np.array([0.0, 0.0], dtype=float),
+                                    omega_obj,
+                                    cp_b,
+                                )
+                                n_w = outward_normal_world(th_obj, n_b)
+                                phi0 = phi0_inward_from_outward_normal(n_w)
+                                fwd, bwd = compute_dd_solutions_forward_backward(
+                                    v_cp_w, omega_obj, ROBOT_RADIUS, phi0
+                                )
+                                _pos, rh, _ = agent.robot.get_state()
+                                err_fwd = abs(np.arctan2(np.sin(float(fwd["zeta0"]) - rh), np.cos(float(fwd["zeta0"]) - rh)))
+                                err_bwd = abs(np.arctan2(np.sin(float(bwd["zeta0"]) - rh), np.cos(float(bwd["zeta0"]) - rh)))
+                                chosen = fwd if err_fwd <= err_bwd else bwd
+                                dd_robot_cmd_override_persistent[name] = np.array(
+                                    [float(chosen["v_r"]), float(chosen["omega_r"])], dtype=float
+                                )
                             err_th = abs(
                                 np.arctan2(
                                     np.sin(plan_rot.mid_theta_world - obj_state["orientation"]),

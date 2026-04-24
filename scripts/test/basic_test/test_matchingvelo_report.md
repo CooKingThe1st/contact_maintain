@@ -102,6 +102,10 @@ $$\boxed{\omega_r = \omega}$$
 
 This is the key insight: the robot rotates at the **same rate as the object**, preserving the relative contact geometry. There is no differential rotation at the contact patch, hence no parasitic friction torque.
 
+This is exactly the $\dot\alpha=0$ special case of the relaxed model in
+`test_matchingvelo_relaxform_report.md`, where
+$\omega_r+\dot\alpha=\omega \Rightarrow \omega_r=\omega$.
+
 ### Condition 2: initial velocity matching
 
 At $t = 0$, the velocity-matching equation becomes:

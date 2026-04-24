@@ -35,6 +35,9 @@ from contact_maintain.diffdrive_wheel_robot import (
     compute_wheel_velocities_diffdrive,
     compute_body_velocity_diffdrive,
 )
+from contact_maintain.diffdrive_wheel_physics_robot import (
+    DiffDriveWheelPhysicsRobot,
+)
 from contact_maintain.control import (
     HolonomicVelocityController,
     DifferentialDriveController,
