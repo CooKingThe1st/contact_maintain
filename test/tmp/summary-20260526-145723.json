@@ -1,0 +1,4 @@
+{
+  "summary": "Improved test_matchingvelo_segment.py motion plot to follow test_motion_primitive.plot_2d: large spatial panel with object CoM/contact/endpoint trajectories, object polygon at start/end/mid, robot bumper trajectories, bumper snapshots with heading arrows along the path, and autoscale limits. Robot propagation now uses exact unicycle integration (propagate_bumper_dd_exact). Fixed feasibility to use a1=a2,b1=b2 zeta solve instead of disc-style alpha_diff pre-reject. Added --n-snap and --no-mid-object CLI flags.",
+  "current_status": "Motion plot saves to /tmp/matching_velo/*_segment_motion.png with visible trajectories and snapshots; rect omega=0 case verified. Nonzero omega on rect edge 0 remains infeasible (expected strict bumper constraint)."
+}

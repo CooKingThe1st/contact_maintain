@@ -1,0 +1,4 @@
+{
+  "summary": "User reported possible long-prompt failure mixed with template-like fragments (email/questions); confirmed full message received here, attributed likely failure to client/automation not model truncation, declined inventing email. No code.",
+  "current_status": "Integration debugging context only; no repo changes."
+}

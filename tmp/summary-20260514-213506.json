@@ -1,0 +1,4 @@
+{
+  "summary": "Implemented CSV cross-track ω trim: _signed_cross_track_to_screw_path_m, omega_path_ref = omega_nom + clip(k*e_d), object servo tracks omega_path_ref; seg_ref refreshed each push tick when csv_cross_track_omega (like live-resolve but no smoothing under fixed-ref) with one-time alpha snap; push_segment_alpha_ref for history; argparse --csv-cross-track-omega/--csv-cross-track-k/--csv-cross-track-omega-max; default CSV replan on unless --no-csv-replan-each-push; legacy --csv-replan-each-push documented as no-op with segment-csv.",
+  "current_status": "Code complete in test_multi_pusher_single_movement_diffdrive_liveupdate.py; py_compile OK."
+}

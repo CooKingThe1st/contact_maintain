@@ -1,0 +1,4 @@
+{
+  "summary": "Final test — not modifying .cursor/rules/after_each_chat.mdc. The rule is left exactly as you wrote it (alwaysApply: true, description preserved, body unchanged); only writing tmp/summary-*.json and replying in chat as agreed. If the Cursor extension/Telegram bridge tries to rewrite this rule on its own, that's the extension's behavior, not this agent — I performed zero edits to the .mdc this turn. Confirm by running: git diff -- .cursor/rules/after_each_chat.mdc (should show no changes from me).",
+  "current_status": "received"
+}

@@ -1,0 +1,4 @@
+{
+  "summary": "User retested remote/Cursor handshake with a short acknowledgment message; replied briefly confirming connectivity. No code or config changes.",
+  "current_status": "Idle connectivity check; project unchanged."
+}

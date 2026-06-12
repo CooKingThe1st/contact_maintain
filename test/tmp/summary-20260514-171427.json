@@ -1,0 +1,4 @@
+{
+  "summary": "Agreed with nuance: couple is formation-local; controller lacks explicit feedback vs global cyan path (along/cross-track or pose outer loop). Object v/ω servo exists but does not substitute for path-relative pose. Framed issue as missing outer states (s,e or x,y,θ) not strictly \"velocity-only\" vs accelerations.",
+  "current_status": "Conceptual alignment on controller blind spot vs intentional path; no code changes."
+}

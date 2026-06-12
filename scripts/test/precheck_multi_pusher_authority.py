@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(pkg_path) / "src" / "legacy"))
 from object_utils import ContactPointParameterization
 from contact_maintain.object_bridge import obj_to_generic
 from contact_optimizer_utils import find_the_magnum_four_v3
+from contact_maintain.diffdrive_path_control import solve_constant_body_twist_from_SE2
 
 
 DEFAULT_OBJECT_SHAPE = "rect"
@@ -68,6 +69,20 @@ class AuthorityRow:
     tangential_authority: float
     branch_sign: float
     role: str
+
+
+@dataclass
+class SegmentTwist:
+    segment_idx: int
+    t_start: float
+    t_end: float
+    p_start: List[float]
+    p_end: List[float]
+    theta_start: float
+    theta_end: float
+    v_ref_body: List[float]
+    omega_ref: float
+    duration: float
 
 
 def _wrap_angle(x: float) -> float:
@@ -167,6 +182,81 @@ def _classify_role(normal_ratio: float, vr_ff: float, passive_ratio: float, spee
     return "passive_tangential"
 
 
+def _load_object_states_csv(csv_path: Path) -> List[Dict[str, float]]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Object states CSV not found: {csv_path}")
+    rows: List[Dict[str, float]] = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        # We relax the CSV time constraint: only (x, y, theta) is required.
+        # If a `t` column exists, we keep it only for labeling/export.
+        required = {"x", "y", "theta"}
+        missing = required.difference(set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(
+                f"CSV must include columns {sorted(required)}; missing {sorted(missing)}"
+            )
+        for i, row in enumerate(reader, start=2):
+            try:
+                t_val = float(row["t"]) if row.get("t") not in (None, "") else float(i)
+                rows.append(
+                    {
+                        "x": float(row["x"]),
+                        "y": float(row["y"]),
+                        "theta": float(row["theta"]),
+                        "t": t_val,
+                    }
+                )
+            except Exception as exc:
+                raise ValueError(f"Invalid numeric value in {csv_path} line {i}: {exc}") from exc
+    if len(rows) < 2:
+        raise ValueError("CSV must contain at least two object states.")
+    return rows
+
+
+def _build_segment_twists_from_states(
+    states: List[Dict[str, float]],
+    v_speed: float,
+) -> List[SegmentTwist]:
+    segments: List[SegmentTwist] = []
+    for idx in range(len(states) - 1):
+        s0 = states[idx]
+        s1 = states[idx + 1]
+        p0 = np.array([s0["x"], s0["y"]], dtype=float)
+        p1 = np.array([s1["x"], s1["y"]], dtype=float)
+        th0 = float(s0["theta"])
+        th1 = float(s1["theta"])
+
+        c, ss = np.cos(th0), np.sin(th0)
+        Rinv = np.array([[c, ss], [-ss, c]], dtype=float)
+        local_delta = Rinv @ (p1 - p0)
+        dx, dy = float(local_delta[0]), float(local_delta[1])
+        dtheta = _wrap_angle(th1 - th0)
+
+        v_body_unit, omega_unit, T_unit = solve_constant_body_twist_from_SE2(
+            dx, dy, dtheta, v_speed=v_speed
+        )
+        v_body_exec = np.asarray(v_body_unit, dtype=float)
+        omega_exec = float(omega_unit)
+        T_exec = float(T_unit)
+
+        segments.append(
+            SegmentTwist(
+                segment_idx=idx,
+                t_start=float(s0["t"]),
+                t_end=float(s1["t"]),
+                p_start=[float(p0[0]), float(p0[1])],
+                p_end=[float(p1[0]), float(p1[1])],
+                theta_start=th0,
+                theta_end=th1,
+                v_ref_body=[float(v_body_exec[0]), float(v_body_exec[1])],
+                omega_ref=omega_exec,
+                duration=T_exec,
+            )
+        )
+    return segments
+
+
 def analyze_authority(
     parameterization: ContactPointParameterization,
     t_params: List[float],
@@ -241,14 +331,15 @@ def _role_color(role: str) -> str:
     }.get(role, "tab:blue")
 
 
-def plot_authority(
+def _plot_authority_panel(
+    axes: np.ndarray,
     rows: List[AuthorityRow],
     parameterization: ContactPointParameterization,
     v_ref_body: np.ndarray,
     omega_ref: float,
     passive_ratio: float,
     speed_floor: float,
-    save_path: Path,
+    title_prefix: str,
 ) -> None:
     names = [r.robot for r in rows]
     x = np.arange(len(rows))
@@ -260,15 +351,6 @@ def plot_authority(
     vr_ff = np.array([r.vr_ff for r in rows], dtype=float)
     cp_speed = np.array([r.cp_speed for r in rows], dtype=float)
     tangential_authority = np.array([r.tangential_authority for r in rows], dtype=float)
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle(
-        "Pre-push diff-drive authority diagnostic\n"
-        f"object twist body: v=({v_ref_body[0]:+.3f}, {v_ref_body[1]:+.3f}) m/s, "
-        f"omega={omega_ref:+.3f} rad/s | passive_ratio={passive_ratio:.2f}, "
-        f"speed_floor={speed_floor:.4f} m/s",
-        fontsize=12,
-    )
 
     ax_geo = axes[0][0]
     boundary = np.asarray(parameterization.boundary_coords, dtype=float)
@@ -288,7 +370,7 @@ def plot_authority(
                      head_width=0.015, head_length=0.02, color=color, alpha=0.7)
         ax_geo.arrow(cp[0], cp[1], 0.12 * move_dir[0], 0.12 * move_dir[1],
                      head_width=0.015, head_length=0.02, color=color, alpha=0.35, linestyle="--")
-    ax_geo.set_title("contact geometry: inward normal and movement direction")
+    ax_geo.set_title(f"{title_prefix}\ncontact geometry: inward normal and movement direction")
     ax_geo.set_xlabel("object body x (m)")
     ax_geo.set_ylabel("object body y (m)")
     ax_geo.axis("equal")
@@ -301,7 +383,10 @@ def plot_authority(
     ax_auth.plot(x, tangential_authority, "o--", color="tab:blue", label="tangential authority")
     ax_auth.set_xticks(x, names)
     ax_auth.set_ylabel("m/s")
-    ax_auth.set_title("normal authority = |vr_ff| * cos(true alpha)")
+    ax_auth.set_title(
+        f"normal authority = |vr_ff| * cos(true alpha)\n"
+        f"v=({v_ref_body[0]:+.3f},{v_ref_body[1]:+.3f}) omega={omega_ref:+.3f}"
+    )
     ax_auth.legend(fontsize=8)
     ax_auth.grid(True, axis="y", alpha=0.3)
 
@@ -350,7 +435,75 @@ def plot_authority(
     table.set_fontsize(8)
     table.scale(1.0, 1.35)
 
+
+def plot_authority(
+    rows: List[AuthorityRow],
+    parameterization: ContactPointParameterization,
+    v_ref_body: np.ndarray,
+    omega_ref: float,
+    passive_ratio: float,
+    speed_floor: float,
+    save_path: Path,
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(
+        "Pre-push diff-drive authority diagnostic\n"
+        f"object twist body: v=({v_ref_body[0]:+.3f}, {v_ref_body[1]:+.3f}) m/s, "
+        f"omega={omega_ref:+.3f} rad/s | passive_ratio={passive_ratio:.2f}, "
+        f"speed_floor={speed_floor:.4f} m/s",
+        fontsize=12,
+    )
+    _plot_authority_panel(
+        axes=axes,
+        rows=rows,
+        parameterization=parameterization,
+        v_ref_body=v_ref_body,
+        omega_ref=omega_ref,
+        passive_ratio=passive_ratio,
+        speed_floor=speed_floor,
+        title_prefix="single twist",
+    )
     fig.tight_layout(rect=[0, 0, 1, 0.94])
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_authority_segments(
+    all_rows: List[List[AuthorityRow]],
+    segments: List[SegmentTwist],
+    parameterization: ContactPointParameterization,
+    passive_ratio: float,
+    speed_floor: float,
+    save_path: Path,
+) -> None:
+    n = len(all_rows)
+    fig, axes = plt.subplots(2 * n, 2, figsize=(16, 10 * n))
+    if n == 1:
+        axes = np.asarray(axes).reshape(2, 2)
+    fig.suptitle(
+        "Pre-push diff-drive authority diagnostic (CSV segments)\n"
+        f"{n} consecutive object-state segments",
+        fontsize=12,
+    )
+    for i in range(n):
+        sub_axes = axes[(2 * i):(2 * i + 2), :]
+        seg = segments[i]
+        v_ref_body = np.asarray(seg.v_ref_body, dtype=float)
+        _plot_authority_panel(
+            axes=sub_axes,
+            rows=all_rows[i],
+            parameterization=parameterization,
+            v_ref_body=v_ref_body,
+            omega_ref=float(seg.omega_ref),
+            passive_ratio=passive_ratio,
+            speed_floor=speed_floor,
+            title_prefix=(
+                f"segment {seg.segment_idx}: t[{seg.t_start:.2f},{seg.t_end:.2f}] "
+                f"dt={seg.duration:.3f}s"
+            ),
+        )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -392,6 +545,18 @@ def main() -> None:
     parser.add_argument("--speed-floor", type=float, default=0.003)
     parser.add_argument("--save-dir", type=str, default="/tmp/multi_pusher_authority")
     parser.add_argument("--prefix", type=str, default="authority_precheck")
+    parser.add_argument(
+        "--object-states-csv",
+        type=str,
+        default=None,
+        help="Optional CSV with columns x,y,theta[,t]. When set, evaluate one authority page per consecutive state segment (t is only used for labeling).",
+    )
+    parser.add_argument(
+        "--primitive-speed",
+        type=float,
+        default=0.1,
+        help="Unit-speed used by primitive inversion for CSV segment extraction.",
+    )
     args = parser.parse_args()
 
     t_params = _parse_t_params(args.t_params)
@@ -435,33 +600,95 @@ def main() -> None:
             print(f"[magnum] solved t_params: {[round(t, 4) for t in t_params]}")
 
         parameterization = ContactPointParameterization(generic_object)
-        rows = analyze_authority(
-            parameterization=parameterization,
-            t_params=t_params,
-            v_ref_body=v_ref_body,
-            omega_ref=float(args.omega_ref),
-            passive_ratio=float(args.passive_ratio),
-            speed_floor=float(args.speed_floor),
-        )
-        for row in rows:
-            print(
-                f"{row.robot}: t={row.t_param:.4f} vr_ff={row.vr_ff:+.4f} "
-                f"normal={row.normal_authority:+.4f} ratio={row.normal_ratio:+.3f} "
-                f"true_alpha={row.true_alpha_deg:.1f}deg role={row.role}"
-            )
+        if args.object_states_csv:
+            states = _load_object_states_csv(Path(args.object_states_csv).expanduser().resolve())
+            segments = _build_segment_twists_from_states(states, v_speed=float(args.primitive_speed))
+            all_rows: List[List[AuthorityRow]] = []
+            rows_for_export: List[Dict[str, object]] = []
+            for seg in segments:
+                seg_v = np.asarray(seg.v_ref_body, dtype=float)
+                seg_rows = analyze_authority(
+                    parameterization=parameterization,
+                    t_params=t_params,
+                    v_ref_body=seg_v,
+                    omega_ref=float(seg.omega_ref),
+                    passive_ratio=float(args.passive_ratio),
+                    speed_floor=float(args.speed_floor),
+                )
+                all_rows.append(seg_rows)
+                print(
+                    f"[segment {seg.segment_idx}] t=[{seg.t_start:.3f},{seg.t_end:.3f}] "
+                    f"v_body=({seg_v[0]:+.4f},{seg_v[1]:+.4f}) omega={seg.omega_ref:+.4f}"
+                )
+                for row in seg_rows:
+                    print(
+                        f"  {row.robot}: vr_ff={row.vr_ff:+.4f} normal={row.normal_authority:+.4f} "
+                        f"ratio={row.normal_ratio:+.3f} role={row.role}"
+                    )
+                    payload = dict(row.__dict__)
+                    payload.update(
+                        {
+                            "segment_idx": seg.segment_idx,
+                            "t_start": seg.t_start,
+                            "t_end": seg.t_end,
+                            "segment_duration": seg.duration,
+                            "segment_v_ref_x": float(seg_v[0]),
+                            "segment_v_ref_y": float(seg_v[1]),
+                            "segment_omega_ref": float(seg.omega_ref),
+                        }
+                    )
+                    rows_for_export.append(payload)
 
-        plot_path = save_dir / f"{args.prefix}.png"
-        plot_authority(
-            rows=rows,
-            parameterization=parameterization,
-            v_ref_body=v_ref_body,
-            omega_ref=float(args.omega_ref),
-            passive_ratio=float(args.passive_ratio),
-            speed_floor=float(args.speed_floor),
-            save_path=plot_path,
-        )
-        print(f"Saved {plot_path}")
-        write_outputs(rows, save_dir, args.prefix)
+            plot_path = save_dir / f"{args.prefix}.png"
+            plot_authority_segments(
+                all_rows=all_rows,
+                segments=segments,
+                parameterization=parameterization,
+                passive_ratio=float(args.passive_ratio),
+                speed_floor=float(args.speed_floor),
+                save_path=plot_path,
+            )
+            print(f"Saved {plot_path}")
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            json_path = save_dir / f"{args.prefix}.json"
+            csv_path = save_dir / f"{args.prefix}.csv"
+            with open(json_path, "w") as f:
+                json.dump(rows_for_export, f, indent=2)
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows_for_export[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows_for_export)
+            print(f"Saved {json_path}")
+            print(f"Saved {csv_path}")
+        else:
+            rows = analyze_authority(
+                parameterization=parameterization,
+                t_params=t_params,
+                v_ref_body=v_ref_body,
+                omega_ref=float(args.omega_ref),
+                passive_ratio=float(args.passive_ratio),
+                speed_floor=float(args.speed_floor),
+            )
+            for row in rows:
+                print(
+                    f"{row.robot}: t={row.t_param:.4f} vr_ff={row.vr_ff:+.4f} "
+                    f"normal={row.normal_authority:+.4f} ratio={row.normal_ratio:+.3f} "
+                    f"true_alpha={row.true_alpha_deg:.1f}deg role={row.role}"
+                )
+
+            plot_path = save_dir / f"{args.prefix}.png"
+            plot_authority(
+                rows=rows,
+                parameterization=parameterization,
+                v_ref_body=v_ref_body,
+                omega_ref=float(args.omega_ref),
+                passive_ratio=float(args.passive_ratio),
+                speed_floor=float(args.speed_floor),
+                save_path=plot_path,
+            )
+            print(f"Saved {plot_path}")
+            write_outputs(rows, save_dir, args.prefix)
     finally:
         # In this geometry-only diagnostic, explicit disconnect can trigger a
         # PyBullet cleanup abort in this environment after the files are saved.

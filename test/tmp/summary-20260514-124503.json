@@ -1,0 +1,4 @@
+{
+  "summary": "Read test_matchingvelo_report.md: for diff-drive, alpha_0 = phi_0 - zeta_0 with phi_0 from inward normal and zeta_0 from t=0 velocity match with omega_r = omega. Explained user's theory: along one straight edge phi_0 is constant; for constant object twist, v_cp is independent of contact point only when omega = 0, so alpha_0 is constant along an edge (and piecewise per edge) in pure translation; for omega != 0, v_cp varies with r^b along the edge so alpha_0 need not be shared along the same edge.",
+  "current_status": "Conceptual question answered from report formulas; no code changes."
+}

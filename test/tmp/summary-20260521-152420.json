@@ -1,0 +1,4 @@
+{
+  "summary": "Located object-robot push/touch friction in test_multi_pusher_single_movement_diffdrive_liveupdate.py: object side via DEFAULT_OBJECT_FRICTION=0.8 passed to obj_to_generic(lateral_friction=...); robot side via bumper_contact_mu=0.8 passed to create_robot(contact_mu=...), which sets bumper link lateralFriction in diffdrive_wheel_physics_robot. Effective PyBullet friction is product of both. No CLI flags for these; wheel/ground/caster frictions are separate. User can change constants or add bumper_contact_mu wiring like test_magnum_diffdrive_control.py.",
+  "current_status": "Friction locations documented; push contact uses 0.8 object + 0.8 bumper defaults with no argparse override in liveupdate script."
+}

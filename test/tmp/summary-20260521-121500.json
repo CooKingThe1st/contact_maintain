@@ -1,0 +1,4 @@
+{
+  "summary": "Explained why lowering contact friction in liveupdate may show no change: bumper_contact_mu defaults to 0.01 with no CLI; object friction fixed at 0.2; printed friction omits bumper/object; planar_cheat_control drives robots via planar joints not wheel traction; multi-pusher redundancy lets tangent robot contribute little wrench so mu on robot 1 barely affects object twist. Confirmed alpha is purely kinematic (DEFINED twist + CHOSEN contact); Lynch friction/motion cone not in multi-pusher pipeline—only needed for twist/contact planning credibility and slip validation, not for phase-7 command generation. Suggested tests: expose mu flags, disable planar cheat, isolate load-bearing contact, log slip/forces.",
+  "current_status": "Conceptual split clarified: velocity-matching sufficient for control; friction relevant for planning/validation not alpha. No code changes; user experiment consistent with sim harness not probing cone mechanics."
+}

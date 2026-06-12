@@ -1,0 +1,4 @@
+{
+  "summary": "Drafted v1: cross-track to omega only behind new CLI flag; default --csv-replan-each-push on for segment-csv with opt-out pattern; explained rigid-body single omega_cmd vs per-robot v_cp_ref and _init_segment_reference changing vr_ff and alpha_star; live-resolve vs fixed-ref caveat; branch lock and servo ordering notes.",
+  "current_status": "Design only; user requested no code. Implementation pending."
+}

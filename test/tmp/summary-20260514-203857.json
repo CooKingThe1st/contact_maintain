@@ -1,0 +1,4 @@
+{
+  "summary": "Read CSV segment load, push-loop servo, Phase7, segment completion, and replan in test_multi_pusher_single_movement_diffdrive_liveupdate.py; drafted path-tracking layer: define reference (screw vs polyline), (e_d,e_s,e_psi) via projection, bounded twist corrections before v_cp_ref_w, segment/replan resets, logging and staged rollout; tied to MPCC contour/lag intuition without requiring MPC.",
+  "current_status": "Design document only; no code changes. Ready for implementation when user chooses reference geometry and injection point."
+}

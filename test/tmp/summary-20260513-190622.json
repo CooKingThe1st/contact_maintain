@@ -1,0 +1,4 @@
+{
+  "summary": "Read Phase7 command composition and object-level twist servo in test_multi_pusher_single_movement_diffdrive_liveupdate.py; answered the user with no code: map each problem (object ω loop, small-ω SNR vs α/tangent, open-loop T vs physics, segment handoffs, polish) to concrete tuning and policy levers (kp_object_omega, live_object_servo_scale, deadbands/caps, time-scale/pose-stop, replan/feasibility).",
+  "current_status": "Strategic recommendations only; codebase unchanged. CSV/Phase7 test harness and controller structure understood for future implementation work."
+}

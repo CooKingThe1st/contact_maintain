@@ -1,0 +1,4 @@
+{
+  "summary": "Mapped Figure 1 (multi-pusher controller framework) to test_multi_pusher_single_movement_diffdrive_liveupdate.py: Magnum Four form-closure in main() (~3536); desired twist via v_ref_body/omega_ref; pre-push STAGE/APPROACH/REALIGN/HOLD in run() with PUSH READY barriers; outer loop at 100 Hz; twist-change via test_transition/CSV _reset_startup_barriers; feed-forward in _init_segment_reference; orientation/position PD in _compute_phase7_command; command_velocity as actuator interface.",
+  "current_status": "Flowchart-to-code mapping delivered for user review; no code changes made."
+}

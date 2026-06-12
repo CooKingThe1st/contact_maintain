@@ -17,18 +17,24 @@ This script:
      the contact-point trajectories match.
   4. Shows the holonomic case for comparison (trivial: translation matches
      contact velocity, heading is reactive).
+
+Mode ``--mode alpha_scan`` skips trajectory propagation: it prints boundary
+parameter ``t`` in [0,1), per-edge ``t`` intervals, a table of ``alpha_0``, and
+(by default) a single spatial figure with the object centered and compact robot
+solid heading vectors (``zeta_0`` / ``alpha``) and dashed robot vectors (center → contact) along each edge.
 """
 
 import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pybullet as pyb
 import rospkg
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Polygon as MplPolygon
 
 rospack = rospkg.RosPack()
@@ -225,6 +231,23 @@ def holonomic_matching(
 # ---------------------------------------------------------------------------
 # 4. Diff-drive: analytical constant-velocity solution
 # ---------------------------------------------------------------------------
+def edge_global_t_ranges(cpp: ContactPointParameterization) -> List[Tuple[int, float, float]]:
+    """
+    Global boundary parameter t in [0, 1] is arc-length / total perimeter
+    (see ContactPointParameterization.parameter_to_point).  Return each
+    polyline segment's corresponding interval [t_lo, t_hi].
+    """
+    L = float(cpp.total_length)
+    if L <= 0:
+        return []
+    out: List[Tuple[int, float, float]] = []
+    for i in range(cpp.n_segments):
+        t0 = cpp.cumulative_distances[i] / L
+        t1 = cpp.cumulative_distances[i + 1] / L
+        out.append((i, t0, t1))
+    return out
+
+
 def compute_dd_solutions(
     v_cp_world0: np.ndarray,
     omega_obj: float,
@@ -442,11 +465,330 @@ def plot_results(
 
 
 # ---------------------------------------------------------------------------
-# 7. CLI & main
+# 7. Alpha scan: alpha_0 vs boundary parameter t (+ optional spatial figure)
+# ---------------------------------------------------------------------------
+def collect_alpha_scan_rows(
+    cpp: ContactPointParameterization,
+    centroid: np.ndarray,
+    v_body: np.ndarray,
+    omega: float,
+    R_r: float,
+    theta0: float,
+    n_t: int,
+    which_solutions: str = "forward",
+    obj_pos: Optional[np.ndarray] = None,
+) -> Tuple[List[dict], List[Tuple[int, float, float]]]:
+    """Sample boundary t and compute analytical DD solutions at t=0 geometry."""
+    if n_t < 2:
+        raise ValueError("n_t must be at least 2")
+    if obj_pos is None:
+        obj_pos = np.zeros(2)
+    t_samples = np.linspace(0.0, 1.0, n_t, endpoint=False)
+    ranges = edge_global_t_ranges(cpp)
+    R0 = rot2d(theta0)
+    branch = "backward" if which_solutions == "backward" else "forward"
+
+    rows: List[dict] = []
+    for t in t_samples:
+        info = cpp.get_contact_info(float(t))
+        cp_body = np.asarray(info["point"], dtype=float) - centroid
+        n_out_body = np.asarray(info["normal_outward"], dtype=float)
+        n_out_w0 = R0 @ n_out_body
+        cp_world = obj_pos + R0 @ cp_body
+        phi0 = float(np.arctan2(-n_out_w0[1], -n_out_w0[0]))
+        robot_center = cp_world + R_r * n_out_w0
+        v_cp_body = v_body + omega * np.array([-cp_body[1], cp_body[0]])
+        v_cp_world0 = R0 @ v_cp_body
+        sols = compute_dd_solutions(v_cp_world0, omega, R_r, phi0)
+        by_label = {s["label"]: s for s in sols}
+        s = by_label[branch]
+
+        row = {
+            "t": float(t),
+            "edge": int(info["segment_index"]),
+            "local_t": float(info["local_parameter"]),
+            "phi0": phi0,
+            "phi0_deg": float(np.degrees(phi0)),
+            "cp_world": cp_world.copy(),
+            "robot_center": robot_center.copy(),
+            "zeta0": float(s["zeta0"]),
+            "alpha": float(s["alpha"]),
+            "alpha_deg": float(np.degrees(s["alpha"])),
+            "zeta0_deg": float(np.degrees(s["zeta0"])),
+            "v_r": float(s["v_r"]),
+        }
+        if which_solutions in ("forward", "both"):
+            sf = by_label["forward"]
+            row["alpha_fwd_deg"] = float(np.degrees(sf["alpha"]))
+            row["zeta0_fwd_deg"] = float(np.degrees(sf["zeta0"]))
+            row["v_r_fwd"] = float(sf["v_r"])
+        if which_solutions in ("backward", "both"):
+            sb = by_label["backward"]
+            row["alpha_bwd_deg"] = float(np.degrees(sb["alpha"]))
+            row["zeta0_bwd_deg"] = float(np.degrees(sb["zeta0"]))
+            row["v_r_bwd"] = float(sb["v_r"])
+        rows.append(row)
+    return rows, ranges
+
+
+def _alpha_scan_branch_key(which_solutions: str) -> str:
+    return "alpha_bwd_deg" if which_solutions == "backward" else "alpha_fwd_deg"
+
+
+def print_alpha_scan_table(
+    rows: List[dict],
+    ranges: List[Tuple[int, float, float]],
+    which_solutions: str,
+    cpp: ContactPointParameterization,
+    v_body: np.ndarray,
+    omega: float,
+    R_r: float,
+    theta0: float,
+) -> None:
+    """Print per-edge t ranges, sample table, and per-edge alpha span."""
+    print("\n" + "=" * 72)
+    print("Alpha_0 scan (global boundary parameter t, no trajectory propagation)")
+    print("=" * 72)
+    print(f"  v_body = {v_body},  omega = {omega:.6g} rad/s,  R_r = {R_r} m")
+    print(f"  theta0 = {theta0:.6g} rad (world);  centroid offset for cp_body")
+    print("\nGlobal t is arc_length / perimeter (see ContactPointParameterization).")
+    print("Per-edge t intervals [t_lo, t_hi]:\n")
+    for i, t0, t1 in ranges:
+        sl = cpp.segment_lengths[i] if i < len(cpp.segment_lengths) else 0.0
+        print(f"  edge {i:3d}:  t in [{t0:.6f}, {t1:.6f}]   segment_len = {sl:.6g} m")
+
+    print("\nSample table (each row is one contact location on the boundary):\n")
+    if which_solutions == "forward":
+        hdr = f"{'t':>10} {'edge':>5} {'loc_t':>8} {'phi0_deg':>10} {'alpha_fwd_deg':>14} {'zeta0_fwd_deg':>15} {'v_r_fwd':>12}"
+        print(hdr)
+        print("-" * len(hdr))
+        for r in rows:
+            print(
+                f"{r['t']:10.6f} {r['edge']:5d} {r['local_t']:8.4f} "
+                f"{r['phi0_deg']:10.3f} {r['alpha_fwd_deg']:14.4f} "
+                f"{r['zeta0_fwd_deg']:15.4f} {r['v_r_fwd']:12.6f}"
+            )
+    elif which_solutions == "backward":
+        hdr = (
+            f"{'t':>10} {'edge':>5} {'loc_t':>8} {'phi0_deg':>10} "
+            f"{'alpha_bwd_deg':>14} {'zeta0_bwd_deg':>15} {'v_r_bwd':>12}"
+        )
+        print(hdr)
+        print("-" * len(hdr))
+        for r in rows:
+            print(
+                f"{r['t']:10.6f} {r['edge']:5d} {r['local_t']:8.4f} "
+                f"{r['phi0_deg']:10.3f} {r['alpha_bwd_deg']:14.4f} "
+                f"{r['zeta0_bwd_deg']:15.4f} {r['v_r_bwd']:12.6f}"
+            )
+    else:
+        hdr = (
+            f"{'t':>10} {'edge':>5} {'loc_t':>8} {'phi0_deg':>10} "
+            f"{'a_fwd':>10} {'a_bwd':>10} {'vr_f':>10} {'vr_b':>10}"
+        )
+        print(hdr + "   (angles deg)")
+        print("-" * len(hdr))
+        for r in rows:
+            print(
+                f"{r['t']:10.6f} {r['edge']:5d} {r['local_t']:8.4f} "
+                f"{r['phi0_deg']:10.3f} {r['alpha_fwd_deg']:10.3f} {r['alpha_bwd_deg']:10.3f} "
+                f"{r['v_r_fwd']:10.5f} {r['v_r_bwd']:10.5f}"
+            )
+
+    # Per-edge statistics on sampled alpha (forward branch by default)
+    key_alpha = "alpha_fwd_deg" if which_solutions != "backward" else "alpha_bwd_deg"
+    print("\nPer-edge alpha range on this t-sample (useful when omega != 0):\n")
+    print(f"{'edge':>5} {'n':>6}  {key_alpha + ' min':>14}  {key_alpha + ' max':>14}  {'span':>10}")
+    print("-" * 58)
+    for i, _, _ in ranges:
+        vals = [r[key_alpha] for r in rows if r["edge"] == i]
+        if not vals:
+            print(f"{i:5d} {0:6d}  {'—':>14}  {'—':>14}  {'—':>10}")
+            continue
+        arr = np.array(vals)
+        print(
+            f"{i:5d} {len(vals):6d}  {arr.min():14.4f}  {arr.max():14.4f}  "
+            f"{arr.max() - arr.min():10.4f}"
+        )
+
+
+def plot_alpha_scan_figure(
+    rows: List[dict],
+    ranges: List[Tuple[int, float, float]],
+    verts: np.ndarray,
+    centroid: np.ndarray,
+    shape_name: str,
+    v_body: np.ndarray,
+    omega: float,
+    R_r: float,
+    theta0: float,
+    obj_pos: np.ndarray,
+    which_solutions: str,
+    save_path: Optional[Path] = None,
+    show_plot: bool = True,
+) -> None:
+    """
+    One-shot spatial view: object at center; solid heading vectors (zeta_0) and
+    dashed R_r vectors (center → contact); color by edge to show alpha_0 bands.
+    """
+    branch = "backward" if which_solutions == "backward" else "forward"
+    key_alpha = _alpha_scan_branch_key(which_solutions)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.set_aspect("equal")
+
+    _draw_shape(ax, verts, obj_pos, theta0, centroid,
+                color="tab:gray", alpha_fill=0.35, lw=1.5)
+
+    # Boundary polyline (world frame at t=0)
+    R0 = rot2d(theta0)
+    bnd = (R0 @ (verts[:, :2] - centroid).T).T + obj_pos
+    ax.plot(bnd[:, 0], bnd[:, 1], "k-", lw=1.0, alpha=0.35, zorder=1)
+
+    cmap = plt.cm.tab10
+    n_edges = max((r["edge"] for r in rows), default=0) + 1
+    edge_colors = {i: cmap(i % 10) for i in range(n_edges)}
+
+    cp_all = np.array([r["cp_world"] for r in rows])
+    ax.scatter(cp_all[:, 0], cp_all[:, 1], s=14, c="crimson", zorder=4,
+               label="Object contact", edgecolors="k", linewidths=0.3)
+
+    heading_scale = 0.55 * R_r
+    for r in rows:
+        ec = edge_colors[r["edge"]]
+        rc = r["robot_center"]
+        cp = r["cp_world"]
+        zeta = r["zeta0"]
+
+        # Heading (zeta_0): solid — primary cue for alpha variation along the edge
+        hx = rc[0] + heading_scale * np.cos(zeta)
+        hy = rc[1] + heading_scale * np.sin(zeta)
+        ax.annotate(
+            "",
+            xy=(hx, hy),
+            xytext=(rc[0], rc[1]),
+            arrowprops=dict(arrowstyle="-|>", color=ec, lw=1.6, mutation_scale=10),
+            zorder=4,
+        )
+        # Robot center → contact (R_r): dashed — geometry reference only
+        ax.plot(
+            [rc[0], cp[0]], [rc[1], cp[1]],
+            color=ec, ls="--", lw=1.0, alpha=0.7, zorder=2,
+        )
+        ax.plot(rc[0], rc[1], ".", color=ec, ms=3, zorder=3)
+
+    # Legend: one entry per edge with alpha span on the sample
+    legend_handles = []
+    for i, _, _ in ranges:
+        vals = [r[key_alpha] for r in rows if r["edge"] == i]
+        if not vals:
+            continue
+        arr = np.array(vals)
+        span = arr.max() - arr.min()
+        legend_handles.append(
+            Line2D(
+                [0], [0], color=edge_colors[i], lw=2,
+                label=f"edge {i}: α ∈ [{arr.min():.1f}°, {arr.max():.1f}°]  (span {span:.1f}°)",
+            )
+        )
+    legend_handles.append(
+        Line2D([0], [0], color="k", ls="-", lw=2,
+               label=f"heading ζ₀ ({branch}, 0.55·R_r)")
+    )
+    legend_handles.append(
+        Line2D([0], [0], color="gray", ls="--", lw=1.2,
+               label=f"robot vector (R_r={R_r:.3f} m, dashed)")
+    )
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=8,
+              framealpha=0.92, borderpad=0.6)
+
+    omega_note = "constant α per edge" if abs(omega) < 1e-12 else "α varies along edge (band)"
+    ax.set_title(
+        f"Feasible DD contact geometry — {shape_name}\n"
+        f"v_body=({v_body[0]:.3g}, {v_body[1]:.3g}) m/s,  ω={omega:.3g} rad/s  "
+        f"[{branch}]  ({omega_note})",
+        fontsize=11,
+    )
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+
+    # Tight limits around object + robot offsets
+    pts = np.vstack([cp_all, np.array([r["robot_center"] for r in rows])])
+    pad = max(R_r * 2.5, 0.08)
+    ax.set_xlim(pts[:, 0].min() - pad, pts[:, 0].max() + pad)
+    ax.set_ylim(pts[:, 1].min() - pad, pts[:, 1].max() + pad)
+
+    fig.tight_layout()
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(save_path), dpi=150, bbox_inches="tight")
+        print(f"\n  Saved alpha_scan figure to {save_path}")
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def run_alpha_scan(
+    cpp: ContactPointParameterization,
+    centroid: np.ndarray,
+    verts: np.ndarray,
+    shape_name: str,
+    v_body: np.ndarray,
+    omega: float,
+    R_r: float,
+    theta0: float,
+    n_t: int,
+    which_solutions: str = "forward",
+    save_path: Optional[Path] = None,
+    show_plot: bool = True,
+    do_spatial_plot: bool = True,
+) -> None:
+    """Print alpha_0 table and optionally render the spatial feasibility figure."""
+    obj_pos = np.zeros(2)
+    rows, ranges = collect_alpha_scan_rows(
+        cpp, centroid, v_body, omega, R_r, theta0, n_t, which_solutions, obj_pos,
+    )
+    print_alpha_scan_table(
+        rows, ranges, which_solutions, cpp, v_body, omega, R_r, theta0,
+    )
+    if do_spatial_plot:
+        plot_alpha_scan_figure(
+            rows, ranges, verts, centroid, shape_name,
+            v_body, omega, R_r, theta0, obj_pos,
+            which_solutions, save_path=save_path, show_plot=show_plot,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI & main
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description="Velocity-matching test: constant-velocity diff-drive solution",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["plot", "alpha_scan"],
+        default="plot",
+        help="plot: full simulation + figure; alpha_scan: table + spatial alpha_0 figure",
+    )
+    p.add_argument(
+        "--alpha-scan-no-plot",
+        action="store_true",
+        help="With --mode alpha_scan, skip the spatial feasibility figure",
+    )
+    p.add_argument(
+        "--n-t",
+        type=int,
+        default=41,
+        help="Number of global t samples in [0,1) for --mode alpha_scan",
+    )
+    p.add_argument(
+        "--alpha-scan-solutions",
+        choices=["forward", "backward", "both"],
+        default="forward",
+        help="Which DD branch(es) to list in alpha_scan table",
     )
     p.add_argument("--shape", default="pi", choices=list(OBJ_FILE_MAP))
     p.add_argument("--t_param", type=float, default=0.25)
@@ -477,15 +819,39 @@ def main():
     centroid = np.array([generic.geometry.centroid.x, generic.geometry.centroid.y])
     verts = np.array(generic.geometry.exterior.coords)
 
+    v_body = np.array([args.vx_body, args.vy_body])
+    omega = args.omega
+    R_r = args.robot_radius
+    theta0 = 0.0
+
+    if args.mode == "alpha_scan":
+        scan_save = SAVE_DIR / (
+            args.save or f"{args.shape}_alpha_scan_w{args.omega:.2f}.png"
+        )
+        run_alpha_scan(
+            cpp,
+            centroid,
+            verts,
+            args.shape,
+            v_body,
+            omega,
+            R_r,
+            theta0,
+            n_t=args.n_t,
+            which_solutions=args.alpha_scan_solutions,
+            save_path=scan_save,
+            show_plot=not args.silent,
+            do_spatial_plot=not args.alpha_scan_no_plot,
+        )
+        print("\nDone (alpha_scan).")
+        return
+
     cp_info = cpp.get_contact_info(args.t_param)
     cp_body = cp_info["point"] - centroid
     n_out_body = cp_info["normal_outward"]
     print(f"  cp_body = {cp_body},  n_out_body = {n_out_body}")
 
     # ---- Object propagation ----
-    v_body = np.array([args.vx_body, args.vy_body])
-    omega = args.omega
-    theta0 = 0.0
     obj = propagate_object(v_body, omega, args.duration, args.dt,
                            0.0, 0.0, theta0, cp_body, n_out_body)
 
@@ -497,8 +863,6 @@ def main():
     v_cp_world0 = rot2d(theta0) @ v_cp_body
     print(f"  v_cp (body, constant) = {v_cp_body}")
     print(f"  v_cp (world, t=0)     = {v_cp_world0}")
-
-    R_r = args.robot_radius
 
     # ---- Holonomic ----
     print(f"\nHolonomic (R={R_r}m):")

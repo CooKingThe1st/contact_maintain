@@ -1,0 +1,4 @@
+{
+  "summary": "Delivered block-by-block input/output equations for the Figure 1 controller mapped to the user's CLI (--segment-csv, --fixed-ref, kp-position=0, k-tangent=0.1, k-couple=0.5, kd-alpha/kd-pos, etc.), including Magnum Four setup, CSV twist segments, pre-push STAGE/APPROACH/REALIGN/HOLD gates, outer-loop object servo, fixed-ref feed-forward solve, Phase-7 PD terms, coupling, and planar-cheat actuator.",
+  "current_status": "Equation reference for live multi-pusher CSV run documented; no code changes."
+}

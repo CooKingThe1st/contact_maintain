@@ -1,0 +1,4 @@
+{
+  "summary": "User journaled branch timeout choice (2s for pong tests) and uncertainty; advised typical margin (2-5s), retries, and distinguishing transport vs content success. No code changes.",
+  "current_status": "Self-note / integration tuning discussion only."
+}

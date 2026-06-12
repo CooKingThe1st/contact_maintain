@@ -145,6 +145,24 @@ Given the object motion $(\mathbf{v}^b, \omega)$ and a chosen contact point on t
 
 When $\omega = 0$: $\omega_r = 0$, $a = v_{\text{cp},x}(0)$, $b = v_{\text{cp},y}(0)$. The robot heading aligns with the contact velocity direction and the robot goes straight at constant speed $\|\mathbf{v}_{\text{cp}}\|$. No rotation of either the object or the robot.
 
+### $\alpha_0$ along a boundary edge: bands vs pure translation
+
+Fix a desired constant object twist $(\mathbf{v}^b,\omega)$ and consider moving the **contact assignment** along a single **straight** polygonal edge (same $\hat{\mathbf{n}}^b$, hence same $\varphi_0$ at $t=0$ for all points on that edge).
+
+- **Pure translation ($\omega = 0$).** Then $\mathbf{v}_{\text{cp}}^b = \mathbf{v}^b$ does not depend on $\mathbf{r}^b$, so $a$ and $b$ in Condition 2 are the same at every point on the edge. Hence $\zeta_0$ is edge-wise constant and
+  $$\alpha_0 = \varphi_0 - \zeta_0$$
+  is **constant along the entire edge** (it may still jump when one moves to another edge because $\varphi_0$ changes with $\hat{\mathbf{n}}^b$).
+
+- **Nonzero $\omega$.** Then $\mathbf{v}_{\text{cp}}^b = \mathbf{v}^b + \omega\,(-r_y^b,\, r_x^b)^\top$ **depends on** $\mathbf{r}^b$. Sliding the contact along the edge changes $\mathbf{r}^b$ linearly, so $a$, $b$, and therefore $\zeta_0$ vary; **$\alpha_0$ is no longer guaranteed to be a single value on that edge**---it sweeps an **interval** (a band) whose width grows with $|\omega|$ for typical $(\mathbf{v}^b,\omega)$ and edge length. In the small-$|\omega|$ limit the rotational contribution to $\mathbf{v}_{\text{cp}}^b$ is weak, so the edge-wise band of $\alpha_0$ becomes **narrow**---the constraint is **stricter** in the sense of being close to the $\omega=0$ case (almost constant $\alpha_0$ along the edge).
+
+Empirically, the companion script `test_matchingvelo.py` supports **`--mode alpha_scan`**: it samples the global boundary parameter $t \in [0,1)$, prints the **$t$ range per edge** (fraction of perimeter), tabulates the analytical $\alpha_0$ (and related quantities) without simulation, and summarizes **min / max / span** of $\alpha_0$ on the sample per edge. That scan confirms the above: edge-wise **ranges** tied to the chosen twist, **tighter** when $|\omega|$ is small.
+
+### Rationale for a disc-shaped differential-drive robot
+
+The diff-drive derivation assumes the robot is a **circle of radius $R_r$**: the contact point on the robot is always at distance $R_r$ from the body center along direction $\varphi = \zeta + \alpha$, and the term $\omega_r(-R_r\sin\varphi,\, R_r\cos\varphi)^\top$ is the rigid rotation of that offset. With a **non-circular** rigid footprint, both the **normal distance to the contact** and the **map from $(v_r,\omega_r)$ to world-frame patch velocity** would depend on body-fixed contact geometry and local curvature in a way that **cannot** be reduced to a single constant $R_r$ and one body-fixed angle $\alpha$ in the same closed form. The **two scalar** velocity constraints at the contact would then couple to additional shape parameters, breaking the clean **fully determined** 2$\times$2 structure of \S5 and the design picture in which each pusher is interchangeable modulo $(\mathbf{v}^b,\omega)$ and contact assignment.
+
+Using a **disc** model is therefore aligned with the methodology: it is the natural geometry in which **constant** $(v_r,\omega_r)$ with **fixed** $\alpha$ on the robot body matches the object's contact velocity over a segment---the analogue, within this AFC class, of a simple **omnidirectional** closure at the contact (holonomic robots remain strictly richer because they have three actuated velocities for two constraints).
+
 ## 6. Proof of All-Time Matching
 
 To verify that the $t = 0$ matching extends to all time, factor the rotation:
@@ -161,7 +179,7 @@ Since $\mathbf{v}_{\text{contact}}^{\text{robot}}(0) = \mathbf{v}_{\text{cp}}(0)
 
 ## 7. Numerical Verification
 
-The test script `test_matchingvelo.py` verifies these results:
+The test script `test_matchingvelo.py` verifies these results in **`plot`** mode (full propagation and figures). The same script also supports **`--mode alpha_scan`**, which only evaluates the analytical mapping from boundary parameter $t$ to $\alpha_0$ (per-edge $t$ intervals, tables, and per-edge min/max on the sample) as described in \S5.
 
 | Test case | Holonomic position error | DD position error | DD velocity error |
 |-----------|--------------------------|-------------------|-------------------|
@@ -182,4 +200,53 @@ The constant-velocity property means the planning algorithm can decompose the co
 3. Verify that $v_r$ and $\omega_r$ lie within the robot's actuator limits.
 4. If not feasible, adjust the contact assignment or waypoint in the planning phase.
 
-This provides a direct, closed-form mapping from the object motion plan to per-robot constant-velocity commands for each segment.
+When $|\omega|$ is not negligible, remember that **$\alpha_0$ is not a single constant over a long edge**---it varies with where the contact sits (\S5). A planner that treats $\alpha$ as freely placeable along an edge should respect the **admissible band** implied by $(\mathbf{v}^b,\omega)$ (e.g. via `alpha_scan` sweeps or an explicit closed-form range on line segments).
+
+This provides a direct, closed-form mapping from the object motion plan to per-robot constant-velocity commands for each segment, **provided** the robot side matches the disc diff-drive model in \S3--\S5.
+
+## 9. Flat bumper (line contact): two-endpoint reduction
+
+A **flat bumper** is a rigid line segment on the robot body with fixed endpoints $\mathbf{r}_{E1}^b$, $\mathbf{r}_{E2}^b$ (relative to the robot center). The object touches along a **straight polygonal edge** with constant outward normal $\hat{\mathbf{n}}^b$ and tangent $\hat{\mathbf{t}}^b$. The bumper is placed so its endpoints contact two object material points $\mathbf{r}_{o1}^b$, $\mathbf{r}_{o2}^b$ on that edge (typically $\mathbf{r}_{o2}^b - \mathbf{r}_{o1}^b = \ell\,\hat{\mathbf{t}}^b$ with $\ell$ the bumper span projected onto the edge).
+
+### 9.1 Holonomic robot
+
+Still **underdetermined** (3 DOF, 2 velocity constraints per point). Matching the object twist at both endpoints does **not** impose a fixed rim angle $\alpha_0$: the holonomic base can realize the same $\omega_r = \omega$ and the required translational field without the disc’s “pick $\zeta_0$ to hit one $\alpha_0$” bottleneck. Segment feasibility is therefore **much easier** than for diff-drive (see companion script `test_matchingvelo_segment.py`).
+
+### 9.2 Diff-drive: exact constraints (fixed patch, $\dot\alpha = 0$)
+
+As in \S5, require $\omega_r = \omega$ and **one** command pair $(v_r, \zeta_0)$ for the whole segment. At $t=0$, let $\mathbf{r}_{Ei}(0) = R(\zeta_0)\,\mathbf{r}_{Ei}^b$ and $\mathbf{v}_{\text{cp},i}(0)$ be the object contact velocity at $\mathbf{r}_{oi}^b$. Per endpoint $i \in \{1,2\}$:
+
+$$
+a_i := v_{\text{cp},i,x}(0) + \omega\, r_{Ei,y}(0), \qquad
+b_i := v_{\text{cp},i,y}(0) - \omega\, r_{Ei,x}(0).
+$$
+
+A single $(v_r, \zeta_0)$ must satisfy both, hence:
+
+$$
+\boxed{a_1 = a_2, \qquad b_1 = b_2.}
+$$
+
+Then $v_r \cos\zeta_0 = a_1$, $v_r \sin\zeta_0 = b_1$, and $\omega_r = \omega$ as in \S5. For $\omega \neq 0$, eliminating $\zeta_0$ from the two equalities gives a **2-vector** constraint coupling object edge geometry and bumper chord $\mathbf{w}^b := \mathbf{r}_{E1}^b - \mathbf{r}_{E2}^b$ (see `test_matchingvelo_segment.py`).
+
+**$\alpha_0$ picture (disc reduction).** Treat each endpoint as a separate disc contact with lever $|\mathbf{r}_{Ei}^b|$ and compute $\alpha_{0,i}^{\text{req}}$ from \S5 at the corresponding $\mathbf{r}_{oi}^b$. The robot design fixes $\psi_i^b = \operatorname{atan2}(r_{Ei,y}^b, r_{Ei,x}^b)$ and $\Delta\psi^b = \psi_2^b - \psi_1^b$. Feasibility requires
+
+$$
+\boxed{\alpha_{0,2}^{\text{req}} - \alpha_{0,1}^{\text{req}} = \Delta\psi^b}
+$$
+
+(at the **same** object placement along the edge) **and** the same $\zeta_0$ from both endpoints (equivalent to $a_1=a_2$, $b_1=b_2$). On a **disc**, $\zeta_0$ can be chosen after picking one contact, so one $\alpha_0^{\text{req}}$ is enough. On a **bumper**, $\Delta\psi^b$ is fixed; you cannot rotate the robot to reconcile two different required $\alpha_0$ values.
+
+### 9.3 Relation to per-edge $\alpha_0$ bands (\S5)
+
+Fix $(\mathbf{v}^b, \omega)$ and scan contact along one object edge. \S5 gives an **interval** (band) of $\alpha_0^{\text{req}}$ for a **single** disc contact. For a bumper, scan the same edge and compute bands for $\alpha_{0,1}^{\text{req}}$ and $\alpha_{0,2}^{\text{req}}$ (endpoints mapped to $\mathbf{r}_{o1}^b$, $\mathbf{r}_{o2}^b$ along the edge). A placement $t$ is feasible only if, at that $t$,
+
+$$
+\alpha_{0,2}^{\text{req}}(t) - \alpha_{0,1}^{\text{req}}(t) \approx \Delta\psi^b
+$$
+
+**and** $a_1=a_2$, $b_1=b_2$. The independent bands $[\alpha_{0,1}^{\min}, \alpha_{0,1}^{\max}]$ and $[\alpha_{0,2}^{\min}, \alpha_{0,2}^{\max}]$ are necessary but not sufficient: the difference must hold **pointwise** at the same $t$, not only as overlapping intervals. The script `test_matchingvelo_segment.py` implements **`--mode scan`** (edge-wise bands + per-$t$ yes/no) and **`--mode plot`** (pick a feasible $t$, propagate, plot).
+
+### 9.4 Pure translation on the edge
+
+When $\omega = 0$, $\mathbf{v}_{\text{cp},1}^b = \mathbf{v}_{\text{cp},2}^b = \mathbf{v}^b$, so $a_1=a_2$ and $b_1=b_2$ hold for every placement along the edge; only $\zeta_0$ and $v_r$ remain (as in the straight-line case \S5). The bumper–diff-drive constraint reduces to the **$\alpha$ difference** condition when $\omega \neq 0$.

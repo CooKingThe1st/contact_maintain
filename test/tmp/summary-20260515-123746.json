@@ -1,0 +1,4 @@
+{
+  "summary": "Swapped alpha_scan figure styling per user request: heading zeta_0 vectors are now solid arrows (emphasized, lw=1.6); robot center-to-contact R_r segments are dashed lines (de-emphasized). Legend labels updated accordingly.",
+  "current_status": "Alpha scan spatial plot emphasizes heading direction; robot footprint is secondary dashed reference."
+}

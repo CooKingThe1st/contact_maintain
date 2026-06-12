@@ -1,0 +1,4 @@
+{
+  "summary": "Answered no-code: cross-track-to-omega could be formulated from constant v_ref/omega by defining a screw reference and e_d, but current implementation only supports that path under CSV segment mode with push-start and segment data—not via plain v_ref_x/y/omega_ref alone.",
+  "current_status": "Conceptual clarification only; no code changes this turn."
+}

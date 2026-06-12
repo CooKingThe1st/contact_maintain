@@ -1,0 +1,4 @@
+{
+  "summary": "Validated user's new friction A/B: low vs high mu now differs; asymmetry between +v_ref_y (R_03 edge active) and -v_ref_y (R_02 vertex active) explained via precheck magnum roles. Friction matters for diff-drive not because alpha depends on cone but because unicycle actuation + contact-frame force transmission: holonomic Phase7Beta commands v_along*n+v_perp*t directly; diff-drive only v_r along drive_dir scaled by cos(alpha). Vertex contacts worsen slip/coupling when they become load-bearing.",
+  "current_status": "Conceptual framework: velocity-level planning is shared; diff-drive adds realizability gap and friction closes sim loop. Precheck confirms twist sign swaps which robot is active vs obstructing on rect."
+}

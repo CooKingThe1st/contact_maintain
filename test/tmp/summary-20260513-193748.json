@@ -1,0 +1,4 @@
+{
+  "summary": "Trick rule test — confirming behavior:\n\n1. Read your updated .cursor/rules/after_each_chat.mdc — it now embeds the full reply into tmp/summary-*.json so the Telegram bridge can forward it.\n2. The rule's last line ('No summaries. No confirmation. No dialogue. Just write the file.') still conflicts with also answering in chat, but per our earlier fix I'm keeping a normal chat reply AND writing the file. If you truly want chat to go silent, say the word and I'll only emit the JSON.\n3. If the bot still doesn't reply, the bridge likely isn't watching tmp/. Quick checks:\n   - Run: ls -lt tmp/ | head to confirm the file appeared.\n   - Look at the bridge code for a watcher on tmp/summary-*.json or chokidar/inotify on this folder.\n   - Make sure the bridge process is actually running and pointed at this workspace.\n",
+  "current_status": "received"
+}

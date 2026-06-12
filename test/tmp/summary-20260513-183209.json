@@ -1,0 +1,4 @@
+{
+  "summary": "Interpreted user message as garbled autopilot/handshake test; read terminals/1.txt (apt, wmctrl/xdotool, xeyes, failed powershell/curl to 9999) and scripts/test/.autopilot.json. Advised treating exposed Telegram bot token in .autopilot.json as sensitive and rotating/moving to secrets. No code edits.",
+  "current_status": "Connectivity/documentation note only; flagged secret handling for autopilot config."
+}

@@ -1,0 +1,4 @@
+{
+  "summary": "Extended test_matchingvelo.py alpha_scan mode with a single spatial figure: object centered at t=0, contact points on boundary, each robot as an R_r arrow (center→contact) colored by edge plus dashed heading tick for zeta0/alpha. Refactored into collect_alpha_scan_rows, print_alpha_scan_table, plot_alpha_scan_figure, run_alpha_scan. Saves to /tmp/matching_velo/{shape}_alpha_scan_w{omega}.png by default; --alpha-scan-no-plot to skip; --silent saves without show. Verified rect omega=0.3 generates PNG with per-edge alpha spans in legend.",
+  "current_status": "Alpha scan table + feasibility visualization complete; use --mode alpha_scan (default plot on, --save to override filename)."
+}

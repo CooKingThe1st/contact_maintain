@@ -1,0 +1,4 @@
+{
+  "summary": "User refined direction away from full MPCC (no path-param optimization); drafted alignment with pure pursuit / contour-error-to-omega and with shifting-reference pose tracking along time-parameterized screw; compared roles of contour vs lag when progression is fixed by clock or arclength; no code.",
+  "current_status": "Conceptual design refined; implementation choice deferred (pure pursuit vs e_d→ω vs shifting setpoint)."
+}

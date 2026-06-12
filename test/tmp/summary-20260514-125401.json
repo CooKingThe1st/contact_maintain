@@ -1,0 +1,4 @@
+{
+  "summary": "Added --mode alpha_scan to test_matchingvelo.py: samples global boundary t in [0,1) via np.linspace, prints per-edge t ranges from cpp.cumulative_distances/total_length, tabulates alpha_0 (and zeta0, v_r) using compute_dd_solutions without propagation or plots; options --n-t and --alpha-scan-solutions (forward/backward/both). Added edge_global_t_ranges() and run_alpha_scan(). Docstring updated. Verified rect omega=0 shows constant alpha per edge in table and zero span in per-edge summary.",
+  "current_status": "Feature implemented in contact_maintain script; optional PyBullet exit abort on some runs appears environmental, scan completes before Done."
+}

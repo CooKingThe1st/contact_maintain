@@ -1,0 +1,4 @@
+{
+  "summary": "User long-prompt branch test plus frustration that a new fallback mechanism seems ineffective; confirmed message intact on assistant path and gave generic checklist (retry conditions, split timeouts, idempotency, logging). Offered to debug specific repo file if pointed to. No code changes.",
+  "current_status": "Integration guidance only; no repository edits."
+}

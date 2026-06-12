@@ -1,0 +1,4 @@
+{
+  "summary": "Compared point (disc rim) vs line (flat bumper) contact against test_matchingvelo_report.md and relaxform report. Object-side v_cp^b unchanged. Robot side replaces R_r and alpha on circle with body-fixed r_c^b(s) on a segment; relaxed migration is s-dot not alpha-dot. Full no-slip on whole bumper implies same twist (omega_r=omega) as fixed-alpha disc case. Holonomic: still underdetermined for one-point match, easier placement but no rim freedom. Diff-drive: still 2x2 at fixed s, omega_r=omega unchanged, but lever arm tunable only over s in [-L/2,L/2], often one forward-facing solution, endpoint singularities instead of alpha=0,pi, plus distributed normal torque not in 2 eqns.",
+  "current_status": "Theoretical line-contact extension documented; codebase still uses disc bumper (ROBOT_RADIUS 0.06). No code changes this turn."
+}

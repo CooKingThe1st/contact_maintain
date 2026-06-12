@@ -1,0 +1,4 @@
+{
+  "summary": "Updated per_robot contact-force plot in test_multi_pusher_single_movement_diffdrive_liveupdate.py (and sibling diffdrive.py): skip pre-push samples via _plot_push_start_idx, clip spikes with _clip_series_percentile (1–99%), and tighten y-axis with _set_pruned_plot_ylim. Extracted shared plot helpers and refactored fig3 to use them. Column title notes [push phase, clipped] when filtering applies.",
+  "current_status": "Per-robot bumper force plot filters approach/realign outliers and clips remaining spikes; syntax verified on both multi-pusher test scripts."
+}

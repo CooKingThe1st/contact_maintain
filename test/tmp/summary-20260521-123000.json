@@ -1,0 +1,4 @@
+{
+  "summary": "Continued from friction discussion: added liveupdate CLI --object-friction, --bumper-contact-mu, --no-planar-cheat; wired through MultiPusherConstantTwistDiffdrive __init__, obj_to_generic, robot.use_planar_cheat_control, magnum preload, and config printout. Enables A/B tests that actually sweep bumper-object friction instead of editing constants silently (bumper was fixed 0.01, not printed).",
+  "current_status": "Liveupdate exposes friction and planar-cheat flags for experiments. Recommended: compare high/low bumper mu with --no-planar-cheat and log per-robot contact_force to see tangent-robot slip."
+}

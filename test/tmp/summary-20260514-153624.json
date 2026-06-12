@@ -1,0 +1,4 @@
+{
+  "summary": "Updated test_matchingvelo_report.md with two new subsections under §5: (1) alpha_0 along edges—constant per edge when omega=0, interval band when omega!=0 with width growing with |omega| and alpha_scan script reference; (2) rationale for disc-shaped diff-drive—single R_r and alpha closure vs non-circular footprint breaking the 2x2 model, tied to omnidirectional-style closure. §7 now mentions --mode alpha_scan; §8 adds planning note on admissible alpha bands and disc model assumption.",
+  "current_status": "Documentation aligned with alpha_scan findings and design rationale; no code changes this turn."
+}

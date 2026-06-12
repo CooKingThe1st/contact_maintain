@@ -1,0 +1,1 @@
+{"summary":"User asked to test the (slightly updated) after_each_chat rule; verified the rule file content, then exercised it by composing and writing this chat-end summary JSON to ./tmp without extra prompts.","current_status":"Workspace unchanged; chat-end summary rule confirmed working — summary JSON files are being generated under tmp/ on each turn."}

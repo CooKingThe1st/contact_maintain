@@ -1,0 +1,4 @@
+{
+  "summary": "User reported focus integration branch works while non-focus branch still fails; explained typical divergence causes (config, timeouts, entrypoints, shared resources, stale processes) and asked for concrete error output/path to debug. No code changes.",
+  "current_status": "Advice-only turn; awaiting logs or file paths for failing branch."
+}

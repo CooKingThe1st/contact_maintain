@@ -1,0 +1,4 @@
+{
+  "summary": "Renamed cross-track CLI to --cross-track-integrate, --cross-track-k, --cross-track-omega-max; constructor uses cross_track_*; unified ct_ref pose latched on every push start when enabled; plain runs use v_ref_body/omega_ref with T_horizon=duration; CSV uses segment T and existing gates; refresh_seg_ref_push for plain uses ct_ref_valid; reset clears ct_ref_valid; config print for cross-track outside CSV-only block.",
+  "current_status": "Implementation complete in test_multi_pusher_single_movement_diffdrive_liveupdate.py; py_compile OK."
+}

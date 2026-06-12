@@ -20,8 +20,8 @@ force above the threshold, then drives the following three-phase sequence:
                 are aligned, letting dynamics settle.
   3. PUSH     — all robots start the Phase-7 controller simultaneously.  On
                 the very first push tick each robot snaps alpha* to the actual
-                push-entry contact angle (Option B from single-pusher stop_go).
-python3 /home/docker_user/catkin_ws/src/contact_maintain/scripts/test/test_multi_pusher_single_movement_diffdrive_liveupdate.py   --object rect   --v-ref-x 0.02   --v-ref-y 0.0   --omega-ref 0.02   --duration 50   --fixed-ref --kp-position 0.1   --k-tangent 0.1   --k-couple 0.0   --k-force-comp 0.0   --kd-alpha 0.08   --kd-pos 0.2   --save-dir /tmp/multi_pusher_dd/ --record-video
+                push-entry contact angle (Option B from single-pusher stop_go). python3 /home/docker_user/catkin_ws/src/contact_maintain/scripts/test/test_multi_pusher_single_movement_diffdrive_liveupdate.py   --object rect   --v-ref-x 0.04   --v-ref-y 0.03   --omega-ref 0.05 --fixed-ref   --duration 150   --kp-position 0   --k-tangent 0.1   --k-couple 1   --k-force-comp 0.0   --kd-alpha 0.08   --kd-pos 0.2   --save-dir /tmp/multi_pusher_dd/ --record-video --obstructing-inflate-gap 0.05 --disable-actual-contact-clearance-cheat --test-transition 
+
     Push phase (Phase 7 — live-resolve variant)
 --------------------------------------------
 Each robot i independently, every control tick:
@@ -121,7 +121,7 @@ DEFAULT_OBJECT_HEIGHT = 0.08
 DEFAULT_OBJECT_FRICTION = 0.8
 
 ROBOT_RADIUS = 0.06          # disc-bumper cylinder radius (diffdrive_wheel_robot_disc_bumper.urdf)
-APPROACH_DISTANCE = 0.12      # spawn offset beyond contact point (metres)
+APPROACH_DISTANCE = 0.16      # spawn offset beyond contact point (metres)
 
 # Approach contact gate: agent.contact_force must exceed this to count as "in contact".
 APPROACH_CONTACT_GATE = 0.05  # N  (lower than SwarmHost default to catch first touch quickly)
@@ -141,6 +141,8 @@ class RobotHistory:
     robot_angular_velocities: List[float] = field(default_factory=list)
     intended_positions: List[np.ndarray] = field(default_factory=list)
     position_errors: List[np.ndarray] = field(default_factory=list)
+    couple_target_positions: List[np.ndarray] = field(default_factory=list)
+    couple_position_errors: List[np.ndarray] = field(default_factory=list)
     intended_contact_point_velocities: List[np.ndarray] = field(default_factory=list)
     contact_point_velocities: List[np.ndarray] = field(default_factory=list)        # object-side actual CP velocity
     robot_contact_point_velocities: List[np.ndarray] = field(default_factory=list)  # robot-side actual CP velocity
@@ -175,6 +177,8 @@ class ObjectHistory:
     orientations: List[float] = field(default_factory=list)
     velocities: List[np.ndarray] = field(default_factory=list)
     angular_velocities: List[float] = field(default_factory=list)
+    desired_v_refs_body: List[np.ndarray] = field(default_factory=list)
+    desired_omegas: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +366,62 @@ def _smooth_live_segment_reference(
     # branch-locked, but keeping this stable avoids accidental later flips.
     smoothed["branch_sign"] = float(prev_ref.get("branch_sign", raw_ref.get("branch_sign", 1.0)))
     return smoothed
+
+
+def _plot_push_start_idx(times: List[float], t_push_start: Optional[float]) -> int:
+    """First history index at push phase (skips approach/realign contact spikes)."""
+    if not times or t_push_start is None:
+        return 0
+    return max(0, int(np.searchsorted(np.asarray(times, dtype=float), float(t_push_start))))
+
+
+def _clip_series_percentile(
+    data: np.ndarray,
+    lower_percentile: float = 1.0,
+    upper_percentile: float = 99.0,
+) -> np.ndarray:
+    """Clip finite samples to percentiles for clearer diagnostic plots."""
+    arr = np.asarray(data, dtype=float).reshape(-1)
+    out = arr.copy()
+    mask = np.isfinite(out)
+    if not np.any(mask):
+        return out
+    valid = out[mask]
+    if valid.size < 2:
+        return out
+    lo, hi = np.percentile(valid, [lower_percentile, upper_percentile])
+    out[mask] = np.clip(valid, lo, hi)
+    return out
+
+
+def _set_pruned_plot_ylim(
+    ax,
+    series_list,
+    q_low: float = 2.0,
+    q_high: float = 98.0,
+) -> None:
+    """Percentile y-limits so rare spikes do not hide steady-state behavior."""
+    finite_chunks = []
+    for series in series_list:
+        arr = np.asarray(series, dtype=float).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            finite_chunks.append(arr)
+    if not finite_chunks:
+        return
+    vals = np.concatenate(finite_chunks)
+    if vals.size < 4:
+        return
+    lo, hi = np.percentile(vals, [q_low, q_high])
+    lo = min(float(lo), 0.0)
+    hi = max(float(hi), 0.0)
+    span = hi - lo
+    if span <= 1e-9:
+        pad = max(abs(hi), 1.0) * 0.05
+        ax.set_ylim(lo - pad, hi + pad)
+        return
+    margin = 0.15 * span
+    ax.set_ylim(lo - margin, hi + margin)
 
 
 def _compute_phase7_command(
@@ -640,7 +700,7 @@ class MultiPusherConstantTwistDiffdrive:
         kp_realign_heading: float = 3.5,
         use_live_resolve: bool = True,
         obstructing_pusher_speed_scale: float = 1.1,
-        obstructing_passive_ratio: float = 0.25,
+        obstructing_passive_ratio: float = 0.1,
         obstructing_inflate_gap: float = 0.02,
         couple_obstructing_only: bool = True,
         use_actual_contact_clearance_cheat: bool = True,
@@ -827,6 +887,56 @@ class MultiPusherConstantTwistDiffdrive:
         omega = float(va[2])
         return pos2d, z, theta, vel2d, omega
 
+    def _update_contact_geometry_from_robot_pose(
+        self,
+        i: int,
+        obj_pos: np.ndarray,
+        obj_theta: float,
+        robot_pos2: np.ndarray,
+        max_boundary_shift_m: float,
+    ) -> float:
+        """Project the landed robot pose back to the boundary and update CP geometry.
+
+        This is intentionally bounded: the approach phase may land a few cm away
+        from the nominal t_param after a transition, but a large projection jump
+        would silently reassign the robot to another side/corner.
+        """
+        c_th, s_th = np.cos(obj_theta), np.sin(obj_theta)
+        R_obj_T = np.array([[c_th, s_th], [-s_th, c_th]], dtype=float)
+        robot_body = R_obj_T @ (robot_pos2 - obj_pos)
+        projected = self._parameterization.point_to_parameter(robot_body)
+
+        old_t = float(self.t_params[i])
+        raw_t = float(projected["parameter"]) % 1.0
+        raw_delta_t = ((raw_t - old_t + 0.5) % 1.0) - 0.5
+        max_delta_t = max(0.0, float(max_boundary_shift_m)) / max(
+            float(self._parameterization.total_length),
+            1e-9,
+        )
+        delta_t = float(np.clip(raw_delta_t, -max_delta_t, max_delta_t))
+        new_t = (old_t + delta_t) % 1.0
+
+        info = self._parameterization.get_contact_info(new_t)
+        cp_b = np.array(info["point"], dtype=float)
+        n_out_b = np.array(info["normal_outward"], dtype=float)
+        _, seg_idx, _ = self._parameterization.parameter_to_point(new_t)
+
+        self.t_params[i] = new_t
+        self._cp_body[i] = cp_b
+        self._n_out_body[i] = n_out_b
+        self._seg_p1_body[i] = np.array(
+            self._parameterization.boundary_coords[seg_idx],
+            dtype=float,
+        )
+        self._seg_p2_body[i] = np.array(
+            self._parameterization.boundary_coords[seg_idx + 1],
+            dtype=float,
+        )
+        self._desired_cp_speed[i] = float(np.linalg.norm(
+            _compute_body_cp_velocity(cp_b, self.v_ref_body, self.omega_ref)
+        ))
+        return abs(delta_t) * float(self._parameterization.total_length)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(
@@ -839,6 +949,16 @@ class MultiPusherConstantTwistDiffdrive:
         record_video: bool = False,
         align_heading_tol_rad: float = np.deg2rad(2.0),
         stop_go_sleep_after_realign_s: float = 0.5,
+        test_transition: bool = False,
+        transition_teleport_robots: bool = False,
+        stage_position_tol: float = 0.02,
+        stage_heading_tol_rad: float = np.deg2rad(5.0),
+        kp_stage_position: float = 1.5,
+        kp_stage_heading: float = 3.0,
+        kd_stage_heading: float = 0.8,
+        max_stage_omega: float = 0.4,
+        update_contact_on_realign: bool = True,
+        contact_update_max_distance: float = 0.06,
     ) -> Dict:
         """Run the simulation.
 
@@ -854,7 +974,11 @@ class MultiPusherConstantTwistDiffdrive:
         names = self._robot_names()
 
         # ── Phase-tracking flags ───────────────────────────────────────────────
-        # APPROACH → (all in contact) → REALIGN → (all aligned) → HOLD → PUSH
+        # STAGE → APPROACH → (all in contact) → REALIGN → HOLD → PUSH
+        # Initial spawn starts at STAGE already; transitions must drive there.
+        stage_complete = [False] * self.n_robots
+        stage_announced = False
+        all_staged = False
         approach_complete = [False] * self.n_robots
         realign_announced = False          # printed once when all approach done
         realign_complete = [False] * self.n_robots
@@ -866,12 +990,66 @@ class MultiPusherConstantTwistDiffdrive:
         z_push_start: Optional[float] = None
         self._t_push_start = None   # reset each run()
         self._live_seg_refs = [None] * self.n_robots
+        push_start_times: List[float] = []
+        transition_done = False
+        transition_time = 0.5 * float(duration)
 
         # Per-robot state for the derivative terms and fixed-ref alpha* snap.
         e_alpha_prev_list = [0.0] * self.n_robots
         e_pos_prev_list   = [0.0] * self.n_robots  # for position D term
         e_tangent_prev_list = [0.0] * self.n_robots
         alpha_snapped = [False] * self.n_robots   # only used when use_live_resolve=False
+
+        def _teleport_robots_to_current_approach_pose(obj_pos_now: np.ndarray, obj_theta_now: float) -> None:
+            """Simulation-only transition cheat: respawn robots near current contacts."""
+            c_now, s_now = np.cos(obj_theta_now), np.sin(obj_theta_now)
+            R_now = np.array([[c_now, -s_now], [s_now, c_now]], dtype=float)
+            for i, name in enumerate(names):
+                robot = self.robots[name]
+                cp_b = self._cp_body[i]
+                n_out_b = self._n_out_body[i]
+                n_in_b = -n_out_b
+                spawn_xy = R_now @ (cp_b + APPROACH_DISTANCE * n_out_b) + obj_pos_now
+                n_in_world = R_now @ n_in_b
+                heading = float(np.arctan2(n_in_world[1], n_in_world[0]))
+                if hasattr(robot, "reset"):
+                    robot.reset(position=(float(spawn_xy[0]), float(spawn_xy[1])), orientation=heading)
+                else:
+                    robot.command_velocity(np.array([0.0, 0.0]))
+            print("[transition] teleported robots to current contact + normal approach offset")
+
+        def _reset_startup_barriers(reason: str) -> None:
+            """Return the local scheduler to APPROACH -> REALIGN -> HOLD."""
+            nonlocal stage_complete, stage_announced, all_staged
+            nonlocal approach_complete, realign_announced, realign_complete
+            nonlocal all_in_contact, all_realigned, pre_push_hold_until_t
+            nonlocal push_started, z_push_start
+            nonlocal e_alpha_prev_list, e_pos_prev_list, e_tangent_prev_list, alpha_snapped
+
+            stage_complete = [False] * self.n_robots
+            stage_announced = False
+            all_staged = False
+            approach_complete = [False] * self.n_robots
+            realign_announced = False
+            realign_complete = [False] * self.n_robots
+            all_in_contact = False
+            all_realigned = False
+            pre_push_hold_until_t = None
+            push_started = False
+            z_push_start = None
+            self._seg_refs = [None] * self.n_robots
+            self._live_seg_refs = [None] * self.n_robots
+            self._obstructing_pushers = [False] * self.n_robots
+            self._normal_ratio_precheck = [0.0] * self.n_robots
+            e_alpha_prev_list = [0.0] * self.n_robots
+            e_pos_prev_list = [0.0] * self.n_robots
+            e_tangent_prev_list = [0.0] * self.n_robots
+            alpha_snapped = [False] * self.n_robots
+            for robot in self.robots.values():
+                robot.command_velocity(np.array([0.0, 0.0]))
+            self.host.assign_targets({name: self.t_params[i] for i, name in enumerate(names)})
+            print(f"\n{'='*60}")
+            print(f"[transition] {reason}: stopped push and reset APPROACH/REALIGN barriers")
 
         # Video
         video_log_id = -1
@@ -896,26 +1074,79 @@ class MultiPusherConstantTwistDiffdrive:
                     "angular_velocity": obj_omega,
                 }
 
+                if test_transition and (not transition_done) and t >= transition_time:
+                    old_v_ref = self.v_ref_body.copy()
+                    old_omega_ref = float(self.omega_ref)
+                    self.v_ref_body = np.array(
+                        [-old_v_ref[1], old_v_ref[0]],
+                        dtype=float,
+                    )
+                    self.omega_ref = -old_omega_ref
+                    self._desired_cp_speed = [
+                        float(np.linalg.norm(_compute_body_cp_velocity(cp_b, self.v_ref_body, self.omega_ref)))
+                        for cp_b in self._cp_body
+                    ]
+                    transition_done = True
+                    if transition_teleport_robots:
+                        _teleport_robots_to_current_approach_pose(obj_pos, obj_theta)
+                    _reset_startup_barriers(
+                        "desired twist changed "
+                        f"v=({old_v_ref[0]:+.4f}, {old_v_ref[1]:+.4f}) -> "
+                        f"({self.v_ref_body[0]:+.4f}, {self.v_ref_body[1]:+.4f}) m/s, "
+                        f"omega={old_omega_ref:+.4f} -> {self.omega_ref:+.4f} rad/s"
+                    )
+
                 # ── Swarm update: manages approach state machine + agent goals ──
                 # This calls agent.update_contact_state() for each robot, keeping
                 # agent.contact_force / agent.in_contact fresh.
                 self.host.update(1.0 / CTRL_FREQ, obj_state_dict)
 
-                # ── Check our own approach completion flags ─────────────────────
-                for i, name in enumerate(names):
-                    if not approach_complete[i]:
-                        if self.agents[name].contact_force > APPROACH_CONTACT_GATE:
-                            approach_complete[i] = True
-                            print(
-                                f"[{name}] contact detected "
-                                f"(F={self.agents[name].contact_force:.3f} N, t={t:.2f}s) — "
-                                f"waiting for remaining robots..."
-                            )
+                all_staged = all(stage_complete)
+                if all_staged and not stage_announced:
+                    stage_announced = True
+                    print(
+                        f"\n[stage] ALL {self.n_robots} ROBOTS AT APPROACH STAGING POSES "
+                        f"(t={t:.2f}s) — starting contact approach"
+                    )
 
-                all_in_contact = all(approach_complete)
+                # Approach completion is only valid after staging.  During STAGE
+                # a robot may still brush the object while clearing to its
+                # approach pose; that must not open the realign barrier.
+                if all_staged:
+                    for i, name in enumerate(names):
+                        if not approach_complete[i]:
+                            if self.agents[name].contact_force > APPROACH_CONTACT_GATE:
+                                approach_complete[i] = True
+                                print(
+                                    f"[{name}] contact detected "
+                                    f"(F={self.agents[name].contact_force:.3f} N, t={t:.2f}s) — "
+                                    f"waiting for remaining robots..."
+                                )
+
+                all_in_contact = all_staged and all(approach_complete)
 
                 # ── Barrier 1: all in contact → announce realign ───────────────
                 if all_in_contact and not realign_announced:
+                    if update_contact_on_realign and contact_update_max_distance > 0.0:
+                        shifts = []
+                        for i, name in enumerate(names):
+                            robot_pos3, _, _ = self.robots[name].get_state()
+                            robot_pos2 = np.asarray(robot_pos3, dtype=float)[:2]
+                            shift_m = self._update_contact_geometry_from_robot_pose(
+                                i=i,
+                                obj_pos=obj_pos,
+                                obj_theta=obj_theta,
+                                robot_pos2=robot_pos2,
+                                max_boundary_shift_m=float(contact_update_max_distance),
+                            )
+                            shifts.append(shift_m)
+                        self.host.assign_targets({
+                            name: self.t_params[i] for i, name in enumerate(names)
+                        })
+                        print(
+                            "[contact-update] snapped realign geometry to landed robot poses "
+                            f"(bounded shifts m: {[round(s, 4) for s in shifts]})"
+                        )
                     realign_announced = True
                     print(f"\n{'='*60}")
                     print(
@@ -947,10 +1178,13 @@ class MultiPusherConstantTwistDiffdrive:
                     push_started = True
                     t_push_start = t
                     z_push_start = float(obj_z)
-                    self._t_push_start = t
+                    push_start_times.append(float(t))
+                    if self._t_push_start is None:
+                        self._t_push_start = t
                     print(f"\n{'='*60}")
                     print(
                         f"ALL {self.n_robots} ROBOTS — PUSH PHASE START (t={t:.2f}s)"
+                        f" [segment {len(push_start_times)}]"
                     )
 
                 # ── Rotation matrix for this control tick ──────────────────────
@@ -1000,6 +1234,7 @@ class MultiPusherConstantTwistDiffdrive:
                     n_out_w = R_obj @ n_out_b
                     n_in_w = -n_out_w
                     intended_pos = cp_world + ROBOT_RADIUS * n_out_w
+                    stage_pos = cp_world + float(APPROACH_DISTANCE) * n_out_w
                     couple_target_pos = intended_pos
                     if self._obstructing_pushers[i] and self.obstructing_inflate_gap > 0.0:
                         # Coupling-only virtual geometry: for obstructing robots,
@@ -1040,6 +1275,7 @@ class MultiPusherConstantTwistDiffdrive:
                         "cp_b": cp_b,
                         "cp_world": cp_world,
                         "intended_pos": intended_pos,
+                        "stage_pos": stage_pos,
                         "couple_target_pos": couple_target_pos,
                         "robot_pos2": robot_pos2,
                         "robot_vel2": robot_vel2,
@@ -1128,6 +1364,7 @@ class MultiPusherConstantTwistDiffdrive:
                     cp_b = data["cp_b"]
                     cp_world = data["cp_world"]
                     intended_pos = data["intended_pos"]
+                    stage_pos = data["stage_pos"]
                     robot_pos2 = data["robot_pos2"]
                     robot_vel2 = data["robot_vel2"]
                     robot_omega_actual = float(data["robot_omega"])
@@ -1145,8 +1382,80 @@ class MultiPusherConstantTwistDiffdrive:
                     object_omega_actual = float(data["object_omega"])
                     omega_eff_i = float(data["omega_eff"])
 
-                    # ── APPROACH → REALIGN → HOLD → PUSH ──────────────────────
-                    if not all_in_contact:
+                    # ── STAGE → APPROACH → REALIGN → HOLD → PUSH ──────────────
+                    if not all_staged:
+                        # ── STAGE — move to contact + outward approach offset ──
+                        stage_err = stage_pos - robot_pos2
+                        stage_dist = float(np.linalg.norm(stage_err))
+                        e_inward_heading = _wrap_angle(phi - robot_heading)
+
+                        if not stage_complete[i]:
+                            if stage_dist > stage_position_tol:
+                                # Translation subphase: face and drive to the
+                                # staging point.  Do not also chase inward
+                                # heading here; switching headings near the
+                                # target makes the robot orbit the stage point.
+                                stage_heading_target = float(np.arctan2(stage_err[1], stage_err[0]))
+                                e_stage_heading = _wrap_angle(stage_heading_target - robot_heading)
+                                v_r = float(np.clip(
+                                    kp_stage_position * stage_dist * np.cos(e_stage_heading),
+                                    -self.max_forward_speed,
+                                    self.max_forward_speed,
+                                ))
+                                # Avoid driving hard sideways when heading is poor.
+                                if abs(e_stage_heading) > np.deg2rad(75.0):
+                                    v_r = 0.0
+                                omega_r = float(np.clip(
+                                    kp_stage_heading * e_stage_heading
+                                    - kd_stage_heading * robot_omega_actual,
+                                    -max_stage_omega,
+                                    max_stage_omega,
+                                ))
+                            else:
+                                # Alignment subphase: hold the staging point and
+                                # rotate in place to face the contact normal.
+                                v_r = 0.0
+                                e_stage_heading = e_inward_heading
+                                omega_r = float(np.clip(
+                                    kp_stage_heading * e_inward_heading
+                                    - kd_stage_heading * robot_omega_actual,
+                                    -max_stage_omega,
+                                    max_stage_omega,
+                                ))
+
+                            if (
+                                stage_dist <= stage_position_tol
+                                and abs(e_inward_heading) <= stage_heading_tol_rad
+                            ):
+                                stage_complete[i] = True
+                                print(
+                                    f"[{name}] stage complete "
+                                    f"(dist={stage_dist:.3f} m, "
+                                    f"|heading|={abs(e_inward_heading):.3f} rad)"
+                                )
+                        else:
+                            v_r = 0.0
+                            omega_r = 0.0
+                            e_stage_heading = 0.0
+
+                        dbg = {
+                            "vr_ff": 0.0, "v_base": 0.0, "v_speed_p": 0.0,
+                            "v_pos_d": 0.0, "v_couple": 0.0, "v_comp": 0.0,
+                            "v_relax": 0.0,
+                            "omega_ff": 0.0, "omega_alpha_p": 0.0,
+                            "omega_alpha_d": 0.0, "omega_tangent": 0.0,
+                            "e_alpha": e_inward_heading, "e_pos": stage_dist,
+                            "e_normal": 0.0, "e_tangent": 0.0,
+                        }
+
+                        if debug_vel and k_ctrl % debug_every == 0:
+                            print(
+                                f"[{name} t={t:.2f}s STAGE] "
+                                f"dist={stage_dist:.3f} e_head={e_stage_heading:+.3f} "
+                                f"v_r={v_r:+.3f} omega_r={omega_r:+.3f}"
+                            )
+
+                    elif not all_in_contact:
                         # ── APPROACH — RobotAgent handles it ───────────────────
                         other_positions = [
                             np.asarray(self.robots[n2].get_state()[0], dtype=float)[:2]
@@ -1443,6 +1752,8 @@ class MultiPusherConstantTwistDiffdrive:
                     hist.robot_angular_velocities.append(float(robot_omega_actual))
                     hist.intended_positions.append(intended_pos.copy())
                     hist.position_errors.append(position_error.copy())
+                    hist.couple_target_positions.append(data["couple_target_pos"].copy())
+                    hist.couple_position_errors.append(data["couple_position_error"].copy())
                     hist.intended_contact_point_velocities.append(v_cp_ref_w.copy())
                     hist.contact_point_velocities.append(cp_velocity.copy())
                     hist.robot_contact_point_velocities.append(robot_cp_velocity.copy())
@@ -1472,6 +1783,8 @@ class MultiPusherConstantTwistDiffdrive:
                 self.object_history.orientations.append(float(obj_theta))
                 self.object_history.velocities.append(obj_vel.copy())
                 self.object_history.angular_velocities.append(float(obj_omega))
+                self.object_history.desired_v_refs_body.append(self.v_ref_body.copy())
+                self.object_history.desired_omegas.append(float(self.omega_ref))
 
             pyb.stepSimulation()
             if gui:
@@ -1494,6 +1807,9 @@ class MultiPusherConstantTwistDiffdrive:
 
         return {
             "push_started_at_s": t_push_start,
+            "push_start_times_s": push_start_times,
+            "transition_enabled": bool(test_transition),
+            "transition_done": bool(transition_done),
             "push_duration_s": push_duration,
             "mean_position_errors_m": mean_pos_errs,
         }
@@ -1617,7 +1933,14 @@ class MultiPusherConstantTwistDiffdrive:
             fontsize=10,
         )
 
-        col_titles = ["Position error (cm)", "Contact force (N)", "Alpha error (deg)", "v_r cmd (m/s)"]
+        push_start_idx = _plot_push_start_idx(
+            self.robot_histories[0].times if self.robot_histories else [],
+            self._t_push_start,
+        )
+        force_col_title = "Contact force (N)"
+        if push_start_idx > 0:
+            force_col_title += " [push phase, clipped]"
+        col_titles = ["Position error (cm)", force_col_title, "Alpha error (deg)", "v_r cmd (m/s)"]
         for j, title in enumerate(col_titles):
             axes[0][j].set_title(title, fontsize=9)
 
@@ -1626,18 +1949,27 @@ class MultiPusherConstantTwistDiffdrive:
                 continue
             t_arr = np.array(hist.times)
             pos_err_cm = np.array([np.linalg.norm(e) for e in hist.position_errors]) * 100.0
-            contact_f = np.array(hist.contact_forces)
+            if hist.couple_position_errors:
+                couple_err_cm = np.array([np.linalg.norm(e) for e in hist.couple_position_errors]) * 100.0
+            else:
+                couple_err_cm = pos_err_cm
+            contact_f_raw = np.asarray(hist.contact_forces, dtype=float)[push_start_idx:]
+            t_force = t_arr[push_start_idx:]
+            contact_f = _clip_series_percentile(contact_f_raw)
             alpha_err_deg = np.degrees(np.array(hist.alpha_errors))
             v_r_arr = np.array(hist.v_r_history)
 
-            axes[i][0].plot(t_arr, pos_err_cm, lw=1.0)
+            axes[i][0].plot(t_arr, pos_err_cm, lw=1.0, label="contact target")
+            axes[i][0].plot(t_arr, couple_err_cm, lw=1.0, ls="--", label="couple/inflated target")
             axes[i][0].set_ylabel(f"{name}\n(cm)", fontsize=8)
+            axes[i][0].legend(fontsize=7, loc="upper right")
             axes[i][0].grid(True, alpha=0.3)
 
-            axes[i][1].plot(t_arr, contact_f, color="tab:red", lw=1.0)
+            axes[i][1].plot(t_force, contact_f, color="tab:red", lw=1.0)
             axes[i][1].axhline(0.5, ls="--", color="gray", lw=0.8, label="0.5 N gate")
             axes[i][1].set_ylabel("(N)", fontsize=8)
             axes[i][1].grid(True, alpha=0.3)
+            _set_pruned_plot_ylim(axes[i][1], [contact_f], q_low=5.0, q_high=95.0)
 
             axes[i][2].plot(t_arr, alpha_err_deg, color="tab:green", lw=1.0)
             axes[i][2].axhline(0.0, ls="--", color="gray", lw=0.8)
@@ -1682,36 +2014,10 @@ class MultiPusherConstantTwistDiffdrive:
             f"ω_r = ω_ff + kp_α·e_α + kd_α·ė_α + gate·(k_t·e_t + kd_t·ė_t)/R",
             fontsize=9,
         )
-        # Only plot from push-start to avoid the approach/realign outliers.
-        push_start_idx = 0
-        if self.robot_histories[0].times and self._t_push_start is not None:
-            t_arr_full = np.array(self.robot_histories[0].times)
-            idx = np.searchsorted(t_arr_full, self._t_push_start)
-            push_start_idx = max(0, int(idx))
-
-        def _set_pruned_ylim(ax, series_list, q_low: float = 2.0, q_high: float = 98.0) -> None:
-            """Use percentile y-limits so rare spikes do not hide steady behavior."""
-            finite_chunks = []
-            for series in series_list:
-                arr = np.asarray(series, dtype=float).reshape(-1)
-                arr = arr[np.isfinite(arr)]
-                if arr.size:
-                    finite_chunks.append(arr)
-            if not finite_chunks:
-                return
-            vals = np.concatenate(finite_chunks)
-            if vals.size < 4:
-                return
-            lo, hi = np.percentile(vals, [q_low, q_high])
-            lo = min(float(lo), 0.0)
-            hi = max(float(hi), 0.0)
-            span = hi - lo
-            if span <= 1e-9:
-                pad = max(abs(hi), 1.0) * 0.05
-                ax.set_ylim(lo - pad, hi + pad)
-                return
-            margin = 0.15 * span
-            ax.set_ylim(lo - margin, hi + margin)
+        push_start_idx = _plot_push_start_idx(
+            self.robot_histories[0].times if self.robot_histories else [],
+            self._t_push_start,
+        )
 
         for i, (name, hist) in enumerate(zip(names, self.robot_histories)):
             if not hist.times:
@@ -1736,7 +2042,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_v.set_ylabel(f"{name}\n(m/s)", fontsize=8)
             ax_v.legend(fontsize=7, loc="upper right")
             ax_v.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_v, [
+            _set_pruned_plot_ylim(ax_v, [
                 _slice(hist.v_ff_history),
                 _slice(hist.v_base_history),
                 _slice(hist.v_speed_p_history),
@@ -1760,7 +2066,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_w.set_ylabel("(rad/s)", fontsize=8)
             ax_w.legend(fontsize=7, loc="upper right")
             ax_w.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_w, [
+            _set_pruned_plot_ylim(ax_w, [
                 _slice(hist.omega_ff_history),
                 _slice(hist.omega_alpha_p_history),
                 _slice(hist.omega_alpha_d_history),
@@ -1792,7 +2098,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_match.set_ylabel("(m/s)", fontsize=8)
             ax_match.legend(fontsize=6, loc="upper right", ncol=2)
             ax_match.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_match, [
+            _set_pruned_plot_ylim(ax_match, [
                 robot_v[:, 0] if len(robot_v) else [],
                 robot_v[:, 1] if len(robot_v) else [],
                 cp_ref_v[:, 0] if len(cp_ref_v) else [],
@@ -1820,7 +2126,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_omega_match.set_ylabel("(rad/s)", fontsize=8)
             ax_omega_match.legend(fontsize=7, loc="upper right")
             ax_omega_match.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_omega_match, [intended_omega, object_omega, robot_omega, omega_cmd])
+            _set_pruned_plot_ylim(ax_omega_match, [intended_omega, object_omega, robot_omega, omega_cmd])
             if i == 0:
                 ax_omega_match.set_title("omega match (pruned y)", fontsize=9)
 
@@ -1875,58 +2181,82 @@ class MultiPusherConstantTwistDiffdrive:
         v_arr = np.array(self.object_history.velocities)         # (N, 2) world-frame
         om_arr = np.array(self.object_history.angular_velocities)
         theta_arr = np.array(self.object_history.orientations)
+        if self.object_history.desired_v_refs_body:
+            v_ref_body_arr = np.array(self.object_history.desired_v_refs_body)
+        else:
+            v_ref_body_arr = np.repeat(self.v_ref_body.reshape(1, 2), len(t_arr), axis=0)
+        if self.object_history.desired_omegas:
+            omega_ref_arr = np.array(self.object_history.desired_omegas)
+        else:
+            omega_ref_arr = np.repeat(float(self.omega_ref), len(t_arr))
 
         # Rotate v_ref_body into world frame at each tick for the reference line.
         c_t = np.cos(theta_arr)
         s_t = np.sin(theta_arr)
-        vx_ref = c_t * self.v_ref_body[0] - s_t * self.v_ref_body[1]
-        vy_ref = s_t * self.v_ref_body[0] + c_t * self.v_ref_body[1]
+        vx_ref = c_t * v_ref_body_arr[:, 0] - s_t * v_ref_body_arr[:, 1]
+        vy_ref = s_t * v_ref_body_arr[:, 0] + c_t * v_ref_body_arr[:, 1]
 
         # Rotate actual world velocity into the object body frame.  The reference
         # is constant in this local frame, so drift is easier to see here.
         vx_body = c_t * v_arr[:, 0] + s_t * v_arr[:, 1]
         vy_body = -s_t * v_arr[:, 0] + c_t * v_arr[:, 1]
         speed_body = np.linalg.norm(np.column_stack([vx_body, vy_body]), axis=1)
-        speed_ref = float(np.linalg.norm(self.v_ref_body))
+        speed_ref = np.linalg.norm(v_ref_body_arr, axis=1)
 
         fig2, axes2 = plt.subplots(2, 3, figsize=(14, 6))
-        fig2.suptitle("Object velocity: actual vs desired reference", fontsize=10)
+        fig2.suptitle("Object velocity: actual vs desired reference (pruned y-limits)", fontsize=10)
 
         axes2[0][0].plot(t_arr, v_arr[:, 0], lw=1.0, label="actual vx")
         axes2[0][0].plot(t_arr, vx_ref, "--", lw=1.0, label="ref vx")
         axes2[0][0].set_title("vx (world)")
         axes2[0][0].legend(fontsize=7)
         axes2[0][0].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][0], [v_arr[:, 0], vx_ref], q_low=1.0, q_high=99.0)
 
         axes2[0][1].plot(t_arr, v_arr[:, 1], lw=1.0, label="actual vy")
         axes2[0][1].plot(t_arr, vy_ref, "--", lw=1.0, label="ref vy")
         axes2[0][1].set_title("vy (world)")
         axes2[0][1].legend(fontsize=7)
         axes2[0][1].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][1], [v_arr[:, 1], vy_ref], q_low=1.0, q_high=99.0)
 
         axes2[0][2].plot(t_arr, om_arr, lw=1.0, label="actual omega")
-        axes2[0][2].axhline(self.omega_ref, ls="--", lw=1.0, label=f"ref {self.omega_ref:+.3f}")
+        axes2[0][2].plot(t_arr, omega_ref_arr, "--", lw=1.0, label="ref omega")
         axes2[0][2].set_title("omega (rad/s)")
         axes2[0][2].legend(fontsize=7)
         axes2[0][2].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][2], [om_arr, omega_ref_arr], q_low=1.0, q_high=99.0)
 
         axes2[1][0].plot(t_arr, vx_body, lw=1.0, label="actual vx body")
-        axes2[1][0].axhline(self.v_ref_body[0], ls="--", lw=1.0, label=f"ref {self.v_ref_body[0]:+.3f}")
+        axes2[1][0].plot(t_arr, v_ref_body_arr[:, 0], "--", lw=1.0, label="ref vx body")
         axes2[1][0].set_title("vx (object body)")
         axes2[1][0].legend(fontsize=7)
         axes2[1][0].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(
+            axes2[1][0],
+            [vx_body, v_ref_body_arr[:, 0]],
+            q_low=1.0,
+            q_high=99.0,
+        )
 
         axes2[1][1].plot(t_arr, vy_body, lw=1.0, label="actual vy body")
-        axes2[1][1].axhline(self.v_ref_body[1], ls="--", lw=1.0, label=f"ref {self.v_ref_body[1]:+.3f}")
+        axes2[1][1].plot(t_arr, v_ref_body_arr[:, 1], "--", lw=1.0, label="ref vy body")
         axes2[1][1].set_title("vy (object body)")
         axes2[1][1].legend(fontsize=7)
         axes2[1][1].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(
+            axes2[1][1],
+            [vy_body, v_ref_body_arr[:, 1]],
+            q_low=1.0,
+            q_high=99.0,
+        )
 
         axes2[1][2].plot(t_arr, speed_body, lw=1.0, label="actual |v_body|")
-        axes2[1][2].axhline(speed_ref, ls="--", lw=1.0, label=f"ref {speed_ref:.3f}")
+        axes2[1][2].plot(t_arr, speed_ref, "--", lw=1.0, label="ref |v_body|")
         axes2[1][2].set_title("speed magnitude (body)")
         axes2[1][2].legend(fontsize=7)
         axes2[1][2].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[1][2], [speed_body, speed_ref], q_low=1.0, q_high=99.0)
 
         plt.tight_layout()
         if save_dir:
@@ -2030,6 +2360,63 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--test-transition",
+        action="store_true",
+        help=(
+            "Special transition test: push the requested object twist for half "
+            "the duration, stop, switch to perpendicular body-frame translation "
+            "(-vy, vx) and reversed omega, then rerun approach/realign/push."
+        ),
+    )
+    parser.add_argument(
+        "--transition-teleport-robots",
+        action="store_true",
+        help=(
+            "Simulation-only transition cheat: at the twist switch, reset each "
+            "robot to the current contact point plus the original normal approach "
+            "offset before rerunning approach/realign."
+        ),
+    )
+    parser.add_argument(
+        "--stage-position-tol", type=float, default=0.02,
+        help="Tolerance (m) for the pre-approach staging pose. Default: 0.02",
+    )
+    parser.add_argument(
+        "--stage-heading-tol-deg", type=float, default=5.0,
+        help="Heading tolerance (deg) for the pre-approach staging pose. Default: 5.0",
+    )
+    parser.add_argument(
+        "--kp-stage-position", type=float, default=1.5,
+        help="Diff-drive staging position gain before contact approach. Default: 1.5",
+    )
+    parser.add_argument(
+        "--kp-stage-heading", type=float, default=3.0,
+        help="Diff-drive staging heading gain before contact approach. Default: 3.0",
+    )
+    parser.add_argument(
+        "--kd-stage-heading", type=float, default=0.8,
+        help="Angular damping gain for staging heading control. Default: 0.8",
+    )
+    parser.add_argument(
+        "--max-stage-omega", type=float, default=0.4,
+        help="Stage-only angular speed cap (rad/s) to avoid transition spin chatter. Default: 0.4",
+    )
+    parser.add_argument(
+        "--disable-contact-geometry-update",
+        action="store_true",
+        help=(
+            "Disable bounded contact-point refresh at the all-contact -> realign "
+            "barrier. By default, realign uses the actual landed contact point."
+        ),
+    )
+    parser.add_argument(
+        "--contact-update-max-distance", type=float, default=0.06,
+        help=(
+            "Maximum boundary-distance shift (m) when refreshing landed contact "
+            "geometry before realign. Default: 0.06"
+        ),
+    )
+    parser.add_argument(
         "--kd-pos", type=float, default=0.0,
         help=(
             "Derivative gain on normal contact gap (normal damper, -D·q̇ term). "
@@ -2073,20 +2460,20 @@ def main() -> None:
         help="Hard cap (rad/s) on tangential-slip omega correction. Default: 0.4",
     )
     parser.add_argument(
-        "--obstructing-pusher-speed-scale", type=float, default=1.1,
+        "--obstructing-pusher-speed-scale", type=float, default=1.0,
         help=(
             "Diagnostic cheat applied only during PUSH: multiply the signed "
             "forward speed of precomputed obstructing pushers by this factor. "
             "Obstructing pushers are contacts with normal_ratio < "
-            "-abs(--obstructing-passive-ratio). Default: 1.1"
+            "-abs(--obstructing-passive-ratio). Default: 1.0"
         ),
     )
     parser.add_argument(
-        "--obstructing-passive-ratio", type=float, default=0.25,
+        "--obstructing-passive-ratio", type=float, default=0.1,
         help=(
             "Normalized normal-ratio threshold for obstructing pusher detection. "
             "normal_ratio = cos(true_alpha); robots below -abs(value) are scaled. "
-            "Default: 0.25"
+            "Default: 0.1"
         ),
     )
     parser.add_argument(
@@ -2451,6 +2838,13 @@ def main() -> None:
     print(f"  t_params  : {[round(t, 4) for t in t_params]}")
     print(f"  v_ref_body: ({args.v_ref_x:.4f}, {args.v_ref_y:.4f}) m/s")
     print(f"  omega_ref : {args.omega_ref:.4f} rad/s")
+    if args.test_transition:
+        print(
+            f"  transition: enabled at t={0.5 * args.duration:.2f}s -> "
+            f"v_ref_body=({-args.v_ref_y:.4f}, {args.v_ref_x:.4f}) m/s, "
+            f"omega_ref={-args.omega_ref:.4f} rad/s  "
+            f"teleport={args.transition_teleport_robots}"
+        )
     print(f"  |v_cp_body| per robot: {[round(s, 4) for s in test._desired_cp_speed]}")
     print(f"  ref mode  : {ref_mode_str}")
     print(f"  branch lock: {not args.no_branch_lock}  (live-resolve only)")
@@ -2464,6 +2858,18 @@ def main() -> None:
     print(
         f"  normal    : k_n={args.kp_position:.3f}  kd_n={args.kd_pos:.3f}  "
         f"cap={args.max_normal_speed:.3f} m/s"
+    )
+    print(
+        f"  staging   : pos_tol={args.stage_position_tol:.3f} m  "
+        f"head_tol={args.stage_heading_tol_deg:.2f} deg  "
+        f"kp_pos={args.kp_stage_position:.3f}  "
+        f"kp_head={args.kp_stage_heading:.3f}  "
+        f"kd_head={args.kd_stage_heading:.3f}  "
+        f"max_omega={args.max_stage_omega:.3f}"
+    )
+    print(
+        f"  contact update: {not args.disable_contact_geometry_update}  "
+        f"max_shift={args.contact_update_max_distance:.3f} m"
     )
     print(
         f"  tangent   : k_t={args.k_tangent:.3f}  "
@@ -2521,6 +2927,16 @@ def main() -> None:
         record_video=args.record_video,
         align_heading_tol_rad=np.deg2rad(args.align_heading_tol_deg),
         stop_go_sleep_after_realign_s=float(args.stop_go_pre_push_hold_s),
+        test_transition=bool(args.test_transition),
+        transition_teleport_robots=bool(args.transition_teleport_robots),
+        stage_position_tol=float(args.stage_position_tol),
+        stage_heading_tol_rad=np.deg2rad(args.stage_heading_tol_deg),
+        kp_stage_position=float(args.kp_stage_position),
+        kp_stage_heading=float(args.kp_stage_heading),
+        kd_stage_heading=float(args.kd_stage_heading),
+        max_stage_omega=float(args.max_stage_omega),
+        update_contact_on_realign=not args.disable_contact_geometry_update,
+        contact_update_max_distance=float(args.contact_update_max_distance),
     )
     print(f"\nResults: {results}")
 

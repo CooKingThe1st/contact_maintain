@@ -1,0 +1,4 @@
+{
+  "summary": "Confirmed user framing: holonomic avoids strict alpha_0 via 3 DOF and same-twist matching; diff-drive with full bumper is stricter. Wrote exact constraints: per-endpoint a_i,b_i from test_matchingvelo form; realizability requires a_1=a_2, b_1=b_2 (same v_r,zeta_0, omega_r=omega) and alpha_0,2^req - alpha_0,1^req = psi_2^b - psi_1^b (fixed robot). For omega!=0 gave vector constraint R(theta_0)*l*t^b + R(zeta_0)*w^b = 0. Contrasted with disc where zeta_0 can absorb single-contact alpha_0.",
+  "current_status": "Two-endpoint diff-drive feasibility conditions documented; no new scripts yet. User may want alpha_scan-style bumper feasibility tool next."
+}

@@ -4,7 +4,7 @@ Diff-drive Magnum Four test: zigzag or sine XY via HybridPath + PathFollowingCon
 with per-segment retouch, robot self-rotate, object rotate to end-anchored mid_theta,
 second retouch + robot align, then push (velocity-matching compatible).
 
-1) Magnum Four contacts, spawn diff-drive wheel robots, Phase7BetaVerDecouple when pushing.
+1) Magnum Four contacts, spawn diff-drive wheel_physics robots (liveupdate-aligned PyBullet + planar cheat control).
 2) Segment phases from diffdrive_path_control; object twist from PathFollowing during PUSH only.
 
 Usage:
@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -61,6 +62,7 @@ from contact_maintain.holonomic_path_control import (
 from contact_maintain.diffdrive_path_control import (
     DdThetaMode,
     DiffDriveSegmentPhase,
+    SegmentPrimitivePlan,
     build_segment_primitive_plans,
     build_vertex_thetas_for_hybrid_path,
     compute_dd_solutions_forward_backward,
@@ -68,13 +70,21 @@ from contact_maintain.diffdrive_path_control import (
     outward_normal_world,
     phi0_inward_from_outward_normal,
     orientation_pid_omega_simple,
+    robot_heading_goal_for_push_forward,
     robot_heading_goal_co_rotate,
     robot_rotate_command_diffdrive,
+    solve_constant_body_twist_from_SE2,
+    wrap_angle,
     zeta_push_for_robot,
 )
 
 # Magnum Four solver (legacy)
 from contact_optimizer_utils import find_the_magnum_four_v3
+from test_multi_pusher_single_movement_diffdrive_liveupdate import (
+    _compute_phase7_command as _compute_live_dd_command,
+    _init_segment_reference as _init_live_dd_segment_reference,
+    _wrap_angle,
+)
 
 
 TIMESTEP = 1.0 / 240.0
@@ -85,9 +95,13 @@ PID_DECIMATION = 5  # Update ObjectVelocityPIDController every 5 Phase 7 control
 
 # Object height: taller for wheel robots to avoid multi-contact issues
 DEFAULT_OBJECT_HEIGHT_WHEEL = 0.08   # For wheel robots (taller to avoid multi-contact)
-DEFAULT_OBJECT_FRICTION = 0.3
+DEFAULT_GROUND_FRICTION = 0.5
+DEFAULT_WHEEL_LATERAL_FRICTION = 0.01
+DEFAULT_CASTER_LATERAL_FRICTION = 0.01
+DEFAULT_OBJECT_FRICTION = 0.8
+DEFAULT_BUMPER_CONTACT_MU = 0.8  # bumper-object friction; matches liveupdate create_robot(contact_mu=...)
 ROBOT_RADIUS = 0.06  # Robot radius for position offset calculation
-APPROACH_DISTANCE = ROBOT_RADIUS + 0.06  # Distance from contact point to spawn robot (for faster testing)
+APPROACH_DISTANCE = 0.16  # Match liveupdate spawn offset beyond contact point
 
 
 @dataclass
@@ -114,6 +128,28 @@ class Phase7History:
     desired_contact_point_speeds: List[float] = field(default_factory=list)
     wheel_velocities: List[np.ndarray] = field(default_factory=list)  # Actual wheel velocities from PyBullet
     wheel_cmd_velocities: List[np.ndarray] = field(default_factory=list)  # Commanded wheel velocities (if available)
+
+
+@dataclass
+class LiveDiffDriveRobotState:
+    """Per-robot state for the liveupdate-style diff-drive controller."""
+
+    t_param: float
+    cp_body: np.ndarray
+    n_out_body: np.ndarray
+    history: Phase7History = field(default_factory=Phase7History)
+    seg_ref: Optional[Dict[str, float]] = None
+    live_seg_ref: Optional[Dict[str, float]] = None
+    e_alpha_prev: float = 0.0
+    e_pos_prev: float = 0.0
+    e_tangent_prev: float = 0.0
+    alpha_snapped: bool = False
+    obstructing: bool = False
+    normal_ratio: float = 0.0
+    stage_complete: bool = False
+    approach_complete: bool = False
+    realign_complete: bool = False
+    push_heading_lock: Optional[float] = None
 
 
 class WaypointController:
@@ -694,26 +730,22 @@ class Phase7BetaVerDecouple:
         return np.array([vel_cmd_xy[0], vel_cmd_xy[1], omega])
 
 
-def setup_pybullet(gui: bool = True):
-    
+def setup_pybullet(gui: bool = True, ground_friction: float = DEFAULT_GROUND_FRICTION):
+    """Match test_multi_pusher_single_movement_diffdrive_liveupdate.setup_pybullet ordering."""
     if gui:
-        client_id = pyb.connect(pyb.GUI, options="--width=1280 --height=720")
+        pyb.connect(pyb.GUI, options="--width=1280 --height=720")
     else:
-        client_id = pyb.connect(pyb.DIRECT)
+        pyb.connect(pyb.DIRECT)
 
     pyb.setGravity(0, 0, -9.81)
     pyb.setTimeStep(TIMESTEP)
     pyb.setRealTimeSimulation(0)
-    
-    # IMPORTANT: Set search paths BEFORE loading URDFs
     pyb.setAdditionalSearchPath(pybullet_data.getDataPath())
-    ground = pyb.loadURDF("plane.urdf", [0, 0, 0])
-    # Add urdf directory for OBJ files
+    ground = pyb.loadURDF("plane.urdf")
+    pyb.changeDynamics(ground, -1, lateralFriction=float(ground_friction))
+
     urdf_dir = Path(pkg_path) / "urdf"
     pyb.setAdditionalSearchPath(str(urdf_dir))
-    
-
-    pyb.changeDynamics(ground, -1, lateralFriction=DEFAULT_OBJECT_FRICTION)
     
     if gui:
         # Configure camera
@@ -831,6 +863,164 @@ def get_object_state(object_uid):
         "velocity": np.array([vel_lin[0], vel_lin[1]]),
         "angular_velocity": vel_ang[2],
     }
+
+
+def _rotation_matrix(theta: float) -> np.ndarray:
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]], dtype=float)
+
+
+def _project_robot_to_boundary_update(
+    state: LiveDiffDriveRobotState,
+    parameterization: ContactPointParameterization,
+    obj_pos: np.ndarray,
+    obj_theta: float,
+    robot_pos2: np.ndarray,
+    max_boundary_shift_m: float,
+) -> float:
+    """Refresh a robot's contact point from its landed pose, with bounded t shift."""
+    R_t = _rotation_matrix(obj_theta).T
+    robot_body = R_t @ (robot_pos2 - obj_pos)
+    projected = parameterization.point_to_parameter(robot_body)
+
+    old_t = float(state.t_param)
+    raw_t = float(projected["parameter"]) % 1.0
+    raw_delta_t = ((raw_t - old_t + 0.5) % 1.0) - 0.5
+    max_delta_t = max(0.0, float(max_boundary_shift_m)) / max(
+        float(parameterization.total_length),
+        1e-9,
+    )
+    delta_t = float(np.clip(raw_delta_t, -max_delta_t, max_delta_t))
+    new_t = (old_t + delta_t) % 1.0
+
+    info = parameterization.get_contact_info(new_t)
+    state.t_param = new_t
+    state.cp_body = np.asarray(info["point"], dtype=float).reshape(2)
+    state.n_out_body = np.asarray(info["normal_outward"], dtype=float).reshape(2)
+    state.seg_ref = None
+    state.live_seg_ref = None
+    state.alpha_snapped = False
+    return abs(delta_t) * float(parameterization.total_length)
+
+
+def _reset_live_dd_barriers(
+    live_states: Dict[str, LiveDiffDriveRobotState],
+    robot_agents: Dict[str, RobotAgent],
+    host: SwarmHost,
+    reason: str,
+) -> None:
+    """Reset the liveupdate-style staging/approach/realign gates for a new segment."""
+    target_map = {}
+    for name, state in live_states.items():
+        state.stage_complete = False
+        state.approach_complete = False
+        state.realign_complete = False
+        state.seg_ref = None
+        state.live_seg_ref = None
+        state.e_alpha_prev = 0.0
+        state.e_pos_prev = 0.0
+        state.e_tangent_prev = 0.0
+        state.alpha_snapped = False
+        state.obstructing = False
+        state.normal_ratio = 0.0
+        state.push_heading_lock = None
+        target_map[name] = float(state.t_param)
+        if name in robot_agents:
+            robot_agents[name].robot.command_velocity(np.array([0.0, 0.0], dtype=float))
+            robot_agents[name].set_goal("approach", float(state.t_param))
+            host.robot_states[name] = RobotState.APPROACHING
+    host.assign_targets(target_map)
+    print(f"\n[live-dd] reset contact pipeline: {reason}")
+
+
+def _build_segment_plans_from_csv(
+    csv_path: Path,
+    cp_body_ref: np.ndarray,
+    n_body_ref: np.ndarray,
+    robot_radius: float,
+    v_speed: float,
+) -> List[SegmentPrimitivePlan]:
+    """Build constant-twist segment primitives from consecutive object poses in CSV."""
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV segment file not found: {csv_path}")
+
+    rows: List[Dict[str, float]] = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"x", "y", "theta"}
+        missing = required.difference(set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(
+                f"CSV must include columns {sorted(required)}; missing {sorted(missing)}"
+            )
+        for i, row in enumerate(reader, start=2):
+            try:
+                rows.append(
+                    {
+                        "x": float(row["x"]),
+                        "y": float(row["y"]),
+                        "theta": float(row["theta"]),
+                    }
+                )
+            except Exception as exc:
+                raise ValueError(f"Invalid CSV numeric value at line {i}: {exc}") from exc
+
+    if len(rows) < 2:
+        raise ValueError("CSV needs at least 2 pose rows to create segments")
+
+    plans: List[SegmentPrimitivePlan] = []
+    s_running = 0.0
+    for idx in range(len(rows) - 1):
+        r0 = rows[idx]
+        r1 = rows[idx + 1]
+        p0 = np.array([r0["x"], r0["y"]], dtype=float)
+        p1 = np.array([r1["x"], r1["y"]], dtype=float)
+        th0 = float(r0["theta"])
+        th1 = float(r1["theta"])
+
+        Rinv = _rotation_matrix(-th0)
+        delta_w = p1 - p0
+        local = Rinv @ delta_w
+        dx, dy = float(local[0]), float(local[1])
+        th_end_local = wrap_angle(th1 - th0)
+
+        # Solve constant body twist at fixed speed magnitude.
+        # Segment duration T is whatever the primitive inverse yields.
+        v_body, omega, T = solve_constant_body_twist_from_SE2(
+            dx, dy, th_end_local, v_speed=v_speed
+        )
+        mid_theta = wrap_angle(th1 - omega * T)
+        zeta_push = robot_heading_goal_for_push_forward(
+            th0, v_body, omega, cp_body_ref, n_body_ref, robot_radius
+        )
+
+        ds = float(np.linalg.norm(delta_w))
+        s0 = float(s_running)
+        s1 = float(s_running + ds)
+        s_running = s1
+
+        plans.append(
+            SegmentPrimitivePlan(
+                segment_idx=idx,
+                s_start=s0,
+                s_end=s1,
+                p_start=p0.copy(),
+                p_end=p1.copy(),
+                theta_start_world=th0,
+                theta_end_world=th1,
+                dx_local=dx,
+                dy_local=dy,
+                theta_end_local=th_end_local,
+                v_body=np.asarray(v_body, dtype=float).copy(),
+                omega=float(omega),
+                T=float(T),
+                v_speed=float(v_speed),
+                mid_theta_world=float(mid_theta),
+                zeta_push_forward=float(zeta_push),
+            )
+        )
+
+    return plans
 
 
 def get_object_as_obstacle(generic_object, object_position, object_orientation):
@@ -1664,8 +1854,22 @@ def main():
         choices=["diffdrive"],
         help="Diff-drive wheel robots only (this test harness).",
     )
-    parser.add_argument("--model", "-m", default="wheel", choices=["wheel"],
-                        help="Robot model (wheel only)")
+    parser.add_argument(
+        "--bumper-contact-mu",
+        type=float,
+        default=DEFAULT_BUMPER_CONTACT_MU,
+        help="Bumper-object lateral friction (create_robot contact_mu). Default: 0.8 (liveupdate).",
+    )
+    parser.add_argument("--ground-friction", type=float, default=DEFAULT_GROUND_FRICTION,
+                        help="Ground plane lateral friction. Default: 0.5 (liveupdate).")
+    parser.add_argument("--wheel-friction", type=float, default=DEFAULT_WHEEL_LATERAL_FRICTION,
+                        help="Wheel lateral friction for wheel_physics robot. Default: 0.01")
+    parser.add_argument("--caster-friction", type=float, default=DEFAULT_CASTER_LATERAL_FRICTION,
+                        help="Caster lateral friction for wheel_physics robot. Default: 0.01")
+    parser.add_argument("--object-friction", type=float, default=DEFAULT_OBJECT_FRICTION,
+                        help="Object lateral friction. Default: 0.8 (liveupdate).")
+    parser.add_argument("--approach-distance", type=float, default=APPROACH_DISTANCE,
+                        help="Spawn offset beyond contact point (m). Default: 0.16 (liveupdate).")
     parser.add_argument("--magnum-verbose", action="store_true", help="Verbose Magnum Four search logs")
     parser.add_argument("--magnum-visualize", action="store_true", help="Visualize Magnum Four search (matplotlib)")
     parser.add_argument("--save-dir", type=str, default=None,
@@ -1687,6 +1891,22 @@ def main():
         default="hybrid",
         choices=["hybrid"],
         help="HybridPath + PathFollowing only (pure pursuit deferred; use test_magnum_holonomic_control.py).",
+    )
+    parser.add_argument(
+        "--segment-source",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "csv"],
+        help=(
+            "hybrid: build segments from HybridPath + theta-mode; "
+            "csv: build segments from consecutive CSV object states."
+        ),
+    )
+    parser.add_argument(
+        "--segment-csv",
+        type=str,
+        default=None,
+        help="CSV with columns x,y,theta[,t]. Required when --segment-source csv (t is ignored).",
     )
 
     parser.add_argument(
@@ -1794,8 +2014,66 @@ def main():
         action="store_false",
         help="Disable heading lock and use raw Phase7 heading behavior during PUSH.",
     )
+    parser.add_argument("--fixed-ref", action="store_true",
+                        help="Solve diff-drive segment reference once after realign instead of live-resolving during push.")
+    parser.add_argument("--kp-alpha", type=float, default=0.5,
+                        help="Live diff-drive alpha proportional gain. Default: 0.5")
+    parser.add_argument("--kd-alpha", type=float, default=0.08,
+                        help="Live diff-drive alpha damping gain. Default: 0.08")
+    parser.add_argument("--kp-position", type=float, default=0.0,
+                        help="Normal-gap position gain. Default: 0.0")
+    parser.add_argument("--kd-pos", type=float, default=0.2,
+                        help="Normal-gap damping gain. Default: 0.2")
+    parser.add_argument("--k-tangent", type=float, default=0.1,
+                        help="Tangential slip-to-omega gain. Default: 0.1")
+    parser.add_argument("--kd-tangent", type=float, default=0.0,
+                        help="Tangential slip damping gain. Default: 0.0")
+    parser.add_argument("--tangent-authority-deadband", type=float, default=0.25,
+                        help="Normal-ratio deadband for tangential authority gate. Default: 0.25")
+    parser.add_argument("--tangent-error-deadband", type=float, default=0.0,
+                        help="Tangential position-error deadband in metres. Default: 0.0")
+    parser.add_argument("--k-couple", type=float, default=1.0,
+                        help="Normal-gap pressure-sharing gain. Default: 1.0")
+    parser.add_argument("--max-couple-speed", type=float, default=0.05,
+                        help="Clamp for coupling contribution to v_r. Default: 0.05")
+    parser.add_argument("--max-normal-speed", type=float, default=0.08,
+                        help="Clamp for normal-gap velocity correction. Default: 0.08")
+    parser.add_argument("--max-tangent-omega", type=float, default=0.4,
+                        help="Clamp for tangential omega correction. Default: 0.4")
+    parser.add_argument("--contact-gap-deadband", type=float, default=0.002,
+                        help="Deadband for normal contact/coupling gap. Default: 0.002")
+    parser.add_argument("--obstructing-pusher-speed-scale", type=float, default=1.0,
+                        help="Scale v_r for detected obstructing pushers during PUSH. Default: 1.0")
+    parser.add_argument("--obstructing-passive-ratio", type=float, default=0.25,
+                        help="normal_ratio threshold for obstructing pusher detection. Default: 0.25")
+    parser.add_argument("--obstructing-inflate-gap", type=float, default=0.05,
+                        help="Virtual outward gap for obstructing coupling target. Default: 0.05")
+    parser.add_argument("--couple-all-robots", action="store_true",
+                        help="Apply k_couple to all robots instead of only obstructing pushers.")
+    parser.add_argument("--stage-position-tol", type=float, default=0.02,
+                        help="Tolerance for pre-approach staging pose. Default: 0.02")
+    parser.add_argument("--stage-heading-tol-deg", type=float, default=5.0,
+                        help="Heading tolerance at staging pose. Default: 5 deg")
+    parser.add_argument("--kp-stage-position", type=float, default=1.5,
+                        help="Staging position gain. Default: 1.5")
+    parser.add_argument("--kp-stage-heading", type=float, default=3.0,
+                        help="Staging heading gain. Default: 3.0")
+    parser.add_argument("--kd-stage-heading", type=float, default=0.8,
+                        help="Staging angular damping gain. Default: 0.8")
+    parser.add_argument("--max-stage-omega", type=float, default=0.4,
+                        help="Staging omega cap. Default: 0.4")
+    parser.add_argument("--align-heading-tol-deg", type=float, default=2.0,
+                        help="Realign heading tolerance. Default: 2 deg")
+    parser.add_argument("--stop-go-pre-push-hold-s", type=float, default=0.5,
+                        help="Hold after all robots realign before push resumes. Default: 0.5")
+    parser.add_argument("--disable-contact-geometry-update", action="store_true",
+                        help="Disable bounded contact-point refresh before realign.")
+    parser.add_argument("--contact-update-max-distance", type=float, default=0.06,
+                        help="Max boundary shift for contact refresh. Default: 0.06 m")
 
     args = parser.parse_args()
+    if args.segment_source == "csv" and not args.segment_csv:
+        parser.error("--segment-csv is required when --segment-source csv")
 
     
     # If loading histories, handle it separately
@@ -1865,7 +2143,7 @@ def main():
     sys.path.insert(0, str(Path(pkg_path) / "src" / "legacy"))
 
 
-    setup_pybullet(gui=not args.no_gui)
+    setup_pybullet(gui=not args.no_gui, ground_friction=float(args.ground_friction))
 
     selected_name = args.object
     
@@ -1895,10 +2173,10 @@ def main():
     generic_object, object_uid = obj_to_generic(
         obj_path=obj_file,
         shape_name=selected_name,
-        position=(0, 0, 0.2),
+        position=(0.0, 0.0, DEFAULT_OBJECT_HEIGHT_WHEEL),
         orientation=0.0,
         mass=1.0,
-        lateral_friction=DEFAULT_OBJECT_FRICTION,
+        lateral_friction=float(args.object_friction),
         blind_test=True,
     )
     contact_point_parameterization = ContactPointParameterization(generic_object)
@@ -1996,7 +2274,7 @@ def main():
         
         # Calculate spawn position: contact_point + approach_distance * normal_outward
         # Object is at origin (0, 0, 0), so body frame = world frame initially
-        spawn_position_body = contact_point_body + APPROACH_DISTANCE * normal_outward
+        spawn_position_body = contact_point_body + float(args.approach_distance) * normal_outward
         robot_x = float(spawn_position_body[0])
         robot_y = float(spawn_position_body[1])
         
@@ -2004,12 +2282,25 @@ def main():
         robot_heading = float(np.arctan2(normal_inward[1], normal_inward[0]))
 
         robot = create_robot(
-            kinematics=args.kinematics,
-            model=args.model,
+            kinematics="diffdrive",
+            model="wheel_physics",
             position=(robot_x, robot_y),
             orientation=robot_heading,
+            contact_mu=float(args.bumper_contact_mu),
             name=name,
         )
+        if hasattr(robot, "set_wheel_friction"):
+            try:
+                robot.set_wheel_friction(float(args.wheel_friction))
+            except Exception:
+                pass
+        if hasattr(robot, "set_caster_friction"):
+            try:
+                robot.set_caster_friction(float(args.caster_friction))
+            except Exception:
+                pass
+        # Same as liveupdate: planar cheat drives motion; wheels spin for parity.
+        robot.use_planar_cheat_control = True
         robots[name] = robot
         print(f"Spawned {name} at ({robot_x:.3f}, {robot_y:.3f}) with heading {robot_heading:.3f} rad, "
               f"target t_param={target_t_param:.4f}")
@@ -2027,7 +2318,7 @@ def main():
         robot_agents[name] = agent
 
     # HybridPath + PathFollowing + diff-drive segment primitive plans
-    phase7_controllers = {}
+    phase7_controllers: Dict[str, LiveDiffDriveRobotState] = {}
     object_velocity_pid = None
     waypoint_controller = None
     path_following_controller = None
@@ -2042,7 +2333,7 @@ def main():
         "segment_tangent": DdThetaMode.SEGMENT_TANGENT,
     }[args.theta_mode]
 
-    run_tag = f"{args.xy_path}_{args.planner}_{args.theta_mode}"
+    run_tag = f"{args.segment_source}_{args.xy_path}_{args.planner}_{args.theta_mode}"
 
     obj_state_init = get_object_state(object_uid)
     start_xy = np.asarray(obj_state_init["position"], dtype=float)
@@ -2052,61 +2343,6 @@ def main():
     v_user_max = 0.1
     look_ahead_hybrid = 0  # stop at segment joins (contact recovery window)
 
-    if args.xy_path == "zigzag":
-        x0, x1 = args.zigzag_x0, args.zigzag_x1
-        y_c = 0.0
-        y_a = args.zigzag_y_amplitude
-        nseg = args.zigzag_segments
-
-        holonomic_hybrid_path = build_zigzag_hybrid_path_at_start(
-            start_xy, (x0, x1), y_c, y_a, nseg
-        )
-        path_following_controller = PathFollowingController(
-            holonomic_hybrid_path,
-            a_max=a_max,
-            a_lat_max=a_lat_max,
-            v_user_max=v_user_max,
-            look_ahead=look_ahead_hybrid,
-            use_tracking=False,
-        )
-
-        sv = cumulative_vertex_s(holonomic_hybrid_path)
-        s_milestones = [float(x) for x in sv]
-        theta_milestones = zigzag_vertex_thetas(nseg, x0, x1, y_c, y_a)
-
-    elif args.xy_path == "sine":
-        x0, x1 = args.sine_x0, args.sine_x1
-        A = args.sine_amplitude
-        wx = args.sine_omega_x
-
-        holonomic_hybrid_path = build_sine_hybrid_path_at_start(
-            start_xy, (x0, x1), A, wx, polyline_samples=96, clearance=0.0
-        )
-        path_following_controller = PathFollowingController(
-            holonomic_hybrid_path,
-            a_max=a_max,
-            a_lat_max=a_lat_max,
-            v_user_max=v_user_max,
-            look_ahead=look_ahead_hybrid,
-            use_tracking=False,
-        )
-
-        num_wp = 12
-        xs = np.linspace(x0, x1, num_wp)
-        px, py = sine_polyline(x0, x1, A, wx, num_wp)
-        dx = float(start_xy[0]) - px[0]
-        dy = float(start_xy[1]) - py[0]
-        px, py = translate_polyline(px, py, dx, dy)
-        s_milestones = []
-        theta_milestones = []
-        hp_ref = holonomic_hybrid_path
-        for i in range(len(px)):
-            pos = np.array([px[i], py[i]], dtype=float)
-            th = float(np.arctan2(A * wx * np.cos(wx * xs[i]), 1.0))
-            theta_milestones.append(th)
-            if hp_ref is not None:
-                s_milestones.append(nearest_s_on_hybrid_path(hp_ref, pos))
-
     centroid_xy = np.array(
         [generic_object.geometry.centroid.x, generic_object.geometry.centroid.y],
         dtype=float,
@@ -2114,50 +2350,109 @@ def main():
     ref_info = contact_point_parameterization.get_contact_info(float(t_params[0]))
     cp_body_ref = np.asarray(ref_info["point"], dtype=float).reshape(2) - centroid_xy
     n_body_ref = np.asarray(ref_info["normal_outward"], dtype=float).reshape(2)
-    vertex_thetas_dd = build_vertex_thetas_for_hybrid_path(
-        holonomic_hybrid_path,
-        dd_theta_mode,
-        fixed_theta=args.fixed_theta,
-        zigzag_num_segments=args.zigzag_segments if args.xy_path == "zigzag" else None,
-        zigzag_x0=args.zigzag_x0,
-        zigzag_x1=args.zigzag_x1,
-    )
-    dd_segment_plans = build_segment_primitive_plans(
-        holonomic_hybrid_path,
-        vertex_thetas_dd,
-        cp_body_ref,
-        n_body_ref,
-        ROBOT_RADIUS,
-        v_user_max,
-    )
+    if args.segment_source == "hybrid":
+        if args.xy_path == "zigzag":
+            x0, x1 = args.zigzag_x0, args.zigzag_x1
+            y_c = 0.0
+            y_a = args.zigzag_y_amplitude
+            nseg = args.zigzag_segments
+
+            holonomic_hybrid_path = build_zigzag_hybrid_path_at_start(
+                start_xy, (x0, x1), y_c, y_a, nseg
+            )
+            path_following_controller = PathFollowingController(
+                holonomic_hybrid_path,
+                a_max=a_max,
+                a_lat_max=a_lat_max,
+                v_user_max=v_user_max,
+                look_ahead=look_ahead_hybrid,
+                use_tracking=False,
+            )
+
+            sv = cumulative_vertex_s(holonomic_hybrid_path)
+            s_milestones = [float(x) for x in sv]
+            theta_milestones = zigzag_vertex_thetas(nseg, x0, x1, y_c, y_a)
+
+        elif args.xy_path == "sine":
+            x0, x1 = args.sine_x0, args.sine_x1
+            A = args.sine_amplitude
+            wx = args.sine_omega_x
+
+            holonomic_hybrid_path = build_sine_hybrid_path_at_start(
+                start_xy, (x0, x1), A, wx, polyline_samples=96, clearance=0.0
+            )
+            path_following_controller = PathFollowingController(
+                holonomic_hybrid_path,
+                a_max=a_max,
+                a_lat_max=a_lat_max,
+                v_user_max=v_user_max,
+                look_ahead=look_ahead_hybrid,
+                use_tracking=False,
+            )
+
+            num_wp = 12
+            xs = np.linspace(x0, x1, num_wp)
+            px, py = sine_polyline(x0, x1, A, wx, num_wp)
+            dx = float(start_xy[0]) - px[0]
+            dy = float(start_xy[1]) - py[0]
+            px, py = translate_polyline(px, py, dx, dy)
+            s_milestones = []
+            theta_milestones = []
+            hp_ref = holonomic_hybrid_path
+            for i in range(len(px)):
+                pos = np.array([px[i], py[i]], dtype=float)
+                th = float(np.arctan2(A * wx * np.cos(wx * xs[i]), 1.0))
+                theta_milestones.append(th)
+                if hp_ref is not None:
+                    s_milestones.append(nearest_s_on_hybrid_path(hp_ref, pos))
+
+        vertex_thetas_dd = build_vertex_thetas_for_hybrid_path(
+            holonomic_hybrid_path,
+            dd_theta_mode,
+            fixed_theta=args.fixed_theta,
+            zigzag_num_segments=args.zigzag_segments if args.xy_path == "zigzag" else None,
+            zigzag_x0=args.zigzag_x0,
+            zigzag_x1=args.zigzag_x1,
+        )
+        dd_segment_plans = build_segment_primitive_plans(
+            holonomic_hybrid_path,
+            vertex_thetas_dd,
+            cp_body_ref,
+            n_body_ref,
+            ROBOT_RADIUS,
+            v_user_max,
+        )
+    else:
+        csv_path = Path(args.segment_csv).expanduser().resolve()
+        dd_segment_plans = _build_segment_plans_from_csv(
+            csv_path=csv_path,
+            cp_body_ref=cp_body_ref,
+            n_body_ref=n_body_ref,
+            robot_radius=ROBOT_RADIUS,
+            v_speed=v_user_max,
+        )
 
     print(
-        f"\nDiff-drive experiment: xy_path={args.xy_path} planner={args.planner} "
+        f"\nDiff-drive experiment: segment_source={args.segment_source} xy_path={args.xy_path} planner={args.planner} "
         f"theta_mode={args.theta_mode} tag={run_tag}\n"
-        f"  start_xy={start_xy}  hybrid_L={holonomic_hybrid_path.total_length}  "
+        f"  start_xy={start_xy}  hybrid_L={holonomic_hybrid_path.total_length if holonomic_hybrid_path is not None else 'n/a'}  "
         f"n_segments={len(dd_segment_plans)}\n"
     )
 
-    # Phase 7 controllers will be created in the control loop with dynamic desired velocities
-    # from the PID controller
+    # Liveupdate-style diff-drive controller state.  Magnum keeps the path
+    # generator, but robot push commands are no longer holonomic Phase7 commands
+    # projected onto a diff-drive chassis.
     for name, agent in robot_agents.items():
             # Get the target t_param for this robot
             robot_idx = list(robot_agents.keys()).index(name)
             target_t_param = t_params[robot_idx]
-            
-            # Create Phase 7 controller for this robot (desired velocities will be updated in loop)
-            # Initial desired velocities (will be updated by PID controller)
-            initial_desired_obj_velocity = np.array([0.0, 0.0])
-            initial_desired_obj_omega = 0.0
-            phase7_controllers[name] = Phase7BetaVerDecouple(
-                robot_uid=robots[name].uid,
-                object_uid=object_uid,
-                generic_object=generic_object,
-                t_param=target_t_param,
-                desired_object_velocity=initial_desired_obj_velocity,
-                desired_object_angular_velocity=initial_desired_obj_omega,
+            info = contact_point_parameterization.get_contact_info(float(target_t_param))
+            phase7_controllers[name] = LiveDiffDriveRobotState(
+                t_param=float(target_t_param),
+                cp_body=np.asarray(info["point"], dtype=float).reshape(2),
+                n_out_body=np.asarray(info["normal_outward"], dtype=float).reshape(2),
             )
-            print(f"Created Phase 7 controller for {name} with t_param={target_t_param:.4f}")
+            print(f"Created live diff-drive controller for {name} with t_param={target_t_param:.4f}")
 
     # Only quick startup is supported: APPROACHING (rotate then creep) with
     # set_goal('approach') — see SwarmHost.assign_targets when startup_mode='quick'.
@@ -2165,6 +2460,8 @@ def main():
         robot_agents=robot_agents,
         object_uid=object_uid,
         generic_object=generic_object,
+        position_threshold=0.15,
+        contact_force_threshold=0.5,
         startup_mode="quick",
     )
     print("Startup mode: quick (direct approach only; see SwarmHost + RobotAgent goal_type='approach')")
@@ -2173,6 +2470,12 @@ def main():
     target_map = {name: t_params[i] for i, name in enumerate(robots.keys())}
     print(f"Assigned targets: { {k: round(v, 4) for k, v in target_map.items()} }")
     host.assign_targets(target_map)
+    _reset_live_dd_barriers(
+        phase7_controllers,
+        robot_agents,
+        host,
+        "initial startup",
+    )
 
     robot_contact_body: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
     for name in robot_agents:
@@ -2213,10 +2516,67 @@ def main():
     hybrid_retouch_resume_guard = False
     dd_robot_cmd_override_persistent: Dict[str, np.ndarray] = {}
     dd_push_heading_lock: Dict[str, float] = {}
+    dd_csv_segment_push_t0: Optional[float] = None
+    live_all_staged = False
+    live_all_in_contact = False
+    live_all_realigned = False
+    live_realign_announced = False
+    live_pre_push_hold_until_t: Optional[float] = None
+    live_push_ready = False
+    live_contact_updated_for_segment = False
+    current_desired_obj_velocity = np.array([0.0, 0.0], dtype=float)
+    current_desired_obj_omega = 0.0
     ROBOT_HEADING_TOL = 0.12
     OBJ_HEADING_TOL = 0.08
     OBJ_ROTATE_SKIP_TOL = float(args.obj_rotate_skip_tol)
     ROBOT_ROTATE_TIMEOUT_S = 25.0
+
+    def reset_live_segment_pipeline(reason: str) -> None:
+        nonlocal live_all_staged, live_all_in_contact, live_all_realigned
+        nonlocal live_realign_announced, live_pre_push_hold_until_t
+        nonlocal live_push_ready, live_contact_updated_for_segment
+        live_all_staged = False
+        live_all_in_contact = False
+        live_all_realigned = False
+        live_realign_announced = False
+        live_pre_push_hold_until_t = None
+        live_push_ready = False
+        live_contact_updated_for_segment = False
+        dd_robot_cmd_override_persistent.clear()
+        dd_push_heading_lock.clear()
+        _reset_live_dd_barriers(phase7_controllers, robot_agents, host, reason)
+
+    def preview_path_velocity_for_realign() -> np.ndarray:
+        """Look slightly into the current path segment without advancing progress."""
+        if path_following_controller is None:
+            return np.array([0.0, 0.0, 0.0], dtype=float)
+        saved = {
+            "elapsed_time": path_following_controller.elapsed_time,
+            "current_segment_idx": path_following_controller.current_segment_idx,
+            "time_in_segment": path_following_controller.time_in_segment,
+            "current_s": path_following_controller.current_s,
+            "completed": path_following_controller.completed,
+        }
+        try:
+            cmd = path_following_controller.compute_velocity(dt=0.5)
+            return np.asarray(cmd, dtype=float).reshape(3)
+        finally:
+            path_following_controller.elapsed_time = saved["elapsed_time"]
+            path_following_controller.current_segment_idx = saved["current_segment_idx"]
+            path_following_controller.time_in_segment = saved["time_in_segment"]
+            path_following_controller.current_s = saved["current_s"]
+            path_following_controller.completed = saved["completed"]
+
+    def freeze_reference_progress() -> float:
+        """Hold hybrid path time state, or synthetic arc-length when CSV mode (no PathFollowing)."""
+        if path_following_controller is not None:
+            path_following_controller.compute_velocity(dt=None)
+            return float(path_following_controller.get_current_s())
+        if not dd_segment_plans:
+            return 0.0
+        if dd_next_segment_idx >= len(dd_segment_plans):
+            return float(dd_segment_plans[-1].s_end)
+        return float(dd_segment_plans[dd_next_segment_idx].s_start)
 
     for _ in range(n_steps):
         obj_state = get_object_state(object_uid)
@@ -2226,23 +2586,26 @@ def main():
 
             pid_cycle_count += 1
             if pid_cycle_count % PID_DECIMATION == 0:
-                has_ref = path_following_controller is not None
+                has_ref = (path_following_controller is not None) or (len(dd_segment_plans) > 0)
                 if has_ref:
-                    all_pushing = all(agent.goal_type == "push" for agent in robot_agents.values())
+                    all_pushing = live_push_ready
 
                     if not holonomic_motion_started and all_pushing:
                         holonomic_motion_started = True
-                        path_following_controller.reset()
+                        if path_following_controller is not None:
+                            path_following_controller.reset()
                         dd_next_segment_idx = 0
-                        dd_phase = DiffDriveSegmentPhase.RETOUCH_A
+                        dd_csv_segment_push_t0 = t if args.segment_source == "csv" else None
+                        # The initial live-dd pipeline has already staged,
+                        # approached, refreshed contact geometry, and realigned.
+                        # Start the path push directly; only later path
+                        # boundaries trigger a fresh reset/retouch pipeline.
+                        dd_phase = DiffDriveSegmentPhase.PUSH
                         dd_phase_t0 = t
                         hybrid_retouch_consumed_boundaries = set()
                         hybrid_retouch_resume_guard = False
-                        for rname in robot_agents:
-                            host.robot_states[rname] = RobotState.APPROACHING
-                            robot_agents[rname].set_goal("approach", target_map[rname])
                         print(f"\n{'='*60}")
-                        print("ALL ROBOTS IN PUSHING MODE — DIFF-DRIVE SEGMENT PIPELINE (start RETOUCH_A)")
+                        print("ALL ROBOTS LIVE-DD READY — DIFF-DRIVE PATH PUSH START")
                         print(f"  tag={run_tag}  t={t:.2f}s")
                         print(f"{'='*60}\n")
 
@@ -2250,7 +2613,15 @@ def main():
                         dt_pid = (1.0 / CTRL_FREQ) * PID_DECIMATION
                         vx = vy = 0.0
                         w_path = 0.0
-                        current_s = path_following_controller.get_current_s()
+                        if path_following_controller is not None:
+                            current_s = float(path_following_controller.get_current_s())
+                        elif args.segment_source == "csv" and len(dd_segment_plans) > 0:
+                            if dd_next_segment_idx < len(dd_segment_plans):
+                                current_s = float(dd_segment_plans[dd_next_segment_idx].s_start)
+                            else:
+                                current_s = float(dd_segment_plans[-1].s_end)
+                        else:
+                            current_s = 0.0
                         dd_robot_cmd_override_persistent.clear()
 
                         desired_obj_velocity = np.array([0.0, 0.0])
@@ -2260,9 +2631,16 @@ def main():
                             min(dd_next_segment_idx, len(dd_segment_plans) - 1)
                         ]
 
-                        if dd_phase == DiffDriveSegmentPhase.RETOUCH_A or dd_phase == DiffDriveSegmentPhase.RETOUCH_B:
-                            path_following_controller.compute_velocity(dt=None)
-                            current_s = path_following_controller.get_current_s()
+                        if not live_push_ready:
+                            # A path boundary has requested a fresh live-dd
+                            # contact pipeline.  Freeze path progress until the
+                            # robots finish STAGE -> APPROACH -> REALIGN -> HOLD.
+                            current_s = freeze_reference_progress()
+                            desired_obj_velocity = np.array([0.0, 0.0])
+                            desired_obj_omega = 0.0
+
+                        elif dd_phase == DiffDriveSegmentPhase.RETOUCH_A or dd_phase == DiffDriveSegmentPhase.RETOUCH_B:
+                            current_s = freeze_reference_progress()
                             all_in_c = all(a.in_contact for a in robot_agents.values())
                             soft_end = dd_phase_t0 + args.hybrid_retouch_duration
                             hard_end = soft_end + args.hybrid_retouch_timeout
@@ -2331,8 +2709,7 @@ def main():
                                     )
 
                         elif dd_phase == DiffDriveSegmentPhase.ROBOT_ROTATE_A:
-                            path_following_controller.compute_velocity(dt=None)
-                            current_s = path_following_controller.get_current_s()
+                            current_s = freeze_reference_progress()
                             th_obj = float(obj_state["orientation"])
                             for name, agent in robot_agents.items():
                                 cp_b, n_b = robot_contact_body[name]
@@ -2358,8 +2735,7 @@ def main():
                                 )
 
                         elif dd_phase == DiffDriveSegmentPhase.OBJECT_ROTATE:
-                            path_following_controller.compute_velocity(dt=None)
-                            current_s = path_following_controller.get_current_s()
+                            current_s = freeze_reference_progress()
                             desired_obj_omega = orientation_pid_omega_simple(
                                 float(obj_state["orientation"]),
                                 float(plan_rot.mid_theta_world),
@@ -2413,9 +2789,9 @@ def main():
                                 )
                                 dd_phase = DiffDriveSegmentPhase.RETOUCH_B
                                 dd_phase_t0 = t
-                                for rname in robot_agents:
-                                    host.robot_states[rname] = RobotState.APPROACHING
-                                    robot_agents[rname].set_goal("approach", target_map[rname])
+                                reset_live_segment_pipeline(
+                                    f"object rotate complete before segment {dd_next_segment_idx}"
+                                )
                                 print(
                                     f"[dd] OBJECT_ROTATE done ({exit_reason}) "
                                     f"mid_theta={plan_rot.mid_theta_world:.4f} "
@@ -2424,8 +2800,7 @@ def main():
                                 )
 
                         elif dd_phase == DiffDriveSegmentPhase.ROBOT_ROTATE_B:
-                            path_following_controller.compute_velocity(dt=None)
-                            current_s = path_following_controller.get_current_s()
+                            current_s = freeze_reference_progress()
                             plan_b = dd_segment_plans[
                                 min(dd_next_segment_idx, len(dd_segment_plans) - 1)
                             ]
@@ -2446,6 +2821,8 @@ def main():
                                 t - dd_phase_t0 > ROBOT_ROTATE_TIMEOUT_S
                             ):
                                 dd_phase = DiffDriveSegmentPhase.PUSH
+                                if args.segment_source == "csv":
+                                    dd_csv_segment_push_t0 = t
                                 hybrid_retouch_resume_guard = True
                                 for name, agent in robot_agents.items():
                                     cp_b, n_b = robot_contact_body[name]
@@ -2458,7 +2835,46 @@ def main():
                                 )
 
                         elif dd_phase == DiffDriveSegmentPhase.PUSH:
-                            if hybrid_retouch_resume_guard:
+                            if args.segment_source == "csv":
+                                if dd_next_segment_idx >= len(dd_segment_plans):
+                                    vx = vy = w_path = 0.0
+                                    current_s = float(len(dd_segment_plans))
+                                else:
+                                    plan_push = dd_segment_plans[dd_next_segment_idx]
+                                    if hybrid_retouch_resume_guard:
+                                        hybrid_retouch_resume_guard = False
+                                        vx = vy = w_path = 0.0
+                                        current_s = float(plan_push.s_start)
+                                        if dd_csv_segment_push_t0 is None:
+                                            dd_csv_segment_push_t0 = t
+                                    else:
+                                        if dd_csv_segment_push_t0 is None:
+                                            dd_csv_segment_push_t0 = t
+                                        seg_elapsed = float(t - dd_csv_segment_push_t0)
+                                        if seg_elapsed >= float(plan_push.T):
+                                            dd_next_segment_idx += 1
+                                            if dd_next_segment_idx < len(dd_segment_plans):
+                                                reset_live_segment_pipeline(
+                                                    f"csv segment {dd_next_segment_idx - 1}->{dd_next_segment_idx}"
+                                                )
+                                                dd_phase = DiffDriveSegmentPhase.PUSH
+                                                dd_phase_t0 = t
+                                                dd_csv_segment_push_t0 = None
+                                                print(
+                                                    f"[dd] csv boundary {dd_next_segment_idx - 1}->{dd_next_segment_idx} "
+                                                    f"at t={t:.2f}s -> RETOUCH_A"
+                                                )
+                                            vx = vy = w_path = 0.0
+                                            current_s = float(plan_push.s_end)
+                                        else:
+                                            R_now = _rotation_matrix(float(obj_state["orientation"]))
+                                            v_world = R_now @ np.asarray(plan_push.v_body, dtype=float).reshape(2)
+                                            vx = float(v_world[0])
+                                            vy = float(v_world[1])
+                                            w_path = float(plan_push.omega)
+                                            alpha = min(1.0, max(0.0, seg_elapsed / max(float(plan_push.T), 1e-9)))
+                                            current_s = float(plan_push.s_start + alpha * (plan_push.s_end - plan_push.s_start))
+                            elif hybrid_retouch_resume_guard:
                                 hybrid_retouch_resume_guard = False
                                 path_following_controller.compute_velocity(dt=None)
                                 vx = vy = w_path = 0.0
@@ -2474,11 +2890,11 @@ def main():
                                         path_following_controller._update_state_from_time()
                                         hybrid_retouch_consumed_boundaries.add(boundary_key)
                                         dd_next_segment_idx = int(seg_after)
-                                        dd_phase = DiffDriveSegmentPhase.RETOUCH_A
+                                        dd_phase = DiffDriveSegmentPhase.PUSH
                                         dd_phase_t0 = t
-                                        for rname in robot_agents:
-                                            host.robot_states[rname] = RobotState.APPROACHING
-                                            robot_agents[rname].set_goal("approach", target_map[rname])
+                                        reset_live_segment_pipeline(
+                                            f"path boundary {seg_before}->{seg_after}"
+                                        )
                                         print(
                                             f"[dd] boundary {seg_before}->{seg_after} at t={t:.2f}s "
                                             f"-> RETOUCH_A (next seg {dd_next_segment_idx})"
@@ -2496,30 +2912,105 @@ def main():
                             desired_obj_velocity = np.array([vx, vy])
                             desired_obj_omega = w_path
 
-                        done = path_following_controller.is_completed()
+                        done = (
+                            path_following_controller.is_completed()
+                            if path_following_controller is not None
+                            else dd_next_segment_idx >= len(dd_segment_plans)
+                        )
                         if done:
                             desired_obj_velocity = np.array([0.0, 0.0])
                             desired_obj_omega = 0.0
 
                         if pid_cycle_count % (PID_DECIMATION * 100) == 0:
-                            prog = path_following_controller.get_progress_fraction() * 100
+                            if path_following_controller is not None:
+                                prog = path_following_controller.get_progress_fraction() * 100
+                            else:
+                                prog = 100.0 * min(
+                                    1.0,
+                                    float(dd_next_segment_idx) / max(float(len(dd_segment_plans)), 1.0),
+                                )
                             print(
                                 f"[DiffDrive] phase={dd_phase.name} s={current_s:.3f}m prog~{prog:.0f}% "
                                 f"v=({desired_obj_velocity[0]:.3f},{desired_obj_velocity[1]:.3f}) "
                                 f"w={desired_obj_omega:.3f}"
                             )
 
-                        for controller in phase7_controllers.values():
-                            controller.desired_object_velocity = desired_obj_velocity
-                            controller.desired_object_angular_velocity = desired_obj_omega
+                        current_desired_obj_velocity = np.array(desired_obj_velocity, dtype=float)
+                        current_desired_obj_omega = float(desired_obj_omega)
                     else:
-                        for controller in phase7_controllers.values():
-                            controller.desired_object_velocity = np.array([0.0, 0.0])
-                            controller.desired_object_angular_velocity = 0.0
+                        current_desired_obj_velocity = np.array([0.0, 0.0], dtype=float)
+                        current_desired_obj_omega = 0.0
                 else:
-                    for controller in phase7_controllers.values():
-                        controller.desired_object_velocity = np.array([0.0, 0.0])
-                        controller.desired_object_angular_velocity = 0.0
+                    current_desired_obj_velocity = np.array([0.0, 0.0], dtype=float)
+                    current_desired_obj_omega = 0.0
+
+            live_all_staged = all(s.stage_complete for s in phase7_controllers.values())
+            if live_all_staged:
+                for name, agent in robot_agents.items():
+                    state = phase7_controllers[name]
+                    if not state.approach_complete and agent.contact_force > 0.05:
+                        state.approach_complete = True
+                        print(
+                            f"[{name}] live-dd contact detected "
+                            f"(F={agent.contact_force:.3f} N, t={t:.2f}s)"
+                        )
+            live_all_in_contact = live_all_staged and all(
+                s.approach_complete for s in phase7_controllers.values()
+            )
+            if (
+                live_all_in_contact
+                and not live_contact_updated_for_segment
+                and not args.disable_contact_geometry_update
+            ):
+                shifts = []
+                for name, agent in robot_agents.items():
+                    robot_pos3, _, _ = agent.robot.get_state()
+                    shift = _project_robot_to_boundary_update(
+                        phase7_controllers[name],
+                        contact_point_parameterization,
+                        np.asarray(obj_state["position"], dtype=float),
+                        float(obj_state["orientation"]),
+                        np.asarray(robot_pos3, dtype=float)[:2],
+                        float(args.contact_update_max_distance),
+                    )
+                    target_map[name] = phase7_controllers[name].t_param
+                    shifts.append(shift)
+                host.assign_targets(target_map)
+                live_contact_updated_for_segment = True
+                print(
+                    "[live-dd] contact geometry refreshed before realign "
+                    f"(bounded shifts m: {[round(s, 4) for s in shifts]})"
+                )
+            elif live_all_in_contact:
+                live_contact_updated_for_segment = True
+
+            if live_all_in_contact and not live_realign_announced:
+                live_realign_announced = True
+                print(f"\n[live-dd] all robots in contact -> REALIGN (t={t:.2f}s)")
+
+            live_all_realigned = live_all_in_contact and all(
+                s.realign_complete for s in phase7_controllers.values()
+            )
+            if (
+                live_all_realigned
+                and live_pre_push_hold_until_t is None
+                and not live_push_ready
+            ):
+                live_pre_push_hold_until_t = t + float(args.stop_go_pre_push_hold_s)
+                print(
+                    f"[live-dd] all robots realigned -> hold "
+                    f"{args.stop_go_pre_push_hold_s:.2f}s"
+                )
+            if (
+                live_pre_push_hold_until_t is not None
+                and not live_push_ready
+                and t >= live_pre_push_hold_until_t
+            ):
+                live_push_ready = True
+                for name, agent in robot_agents.items():
+                    agent.set_goal("push", float(phase7_controllers[name].t_param))
+                    host.robot_states[name] = RobotState.PUSHING
+                print(f"[live-dd] PUSH enabled at t={t:.2f}s")
 
             for name, agent in robot_agents.items():
                 other_positions = [
@@ -2527,72 +3018,247 @@ def main():
                     for other_name in robot_agents.keys()
                     if other_name != name
                 ]
+                agent.update_contact_state()
+                state = phase7_controllers[name]
+                robot_pos3, robot_heading, robot_vel_state = agent.robot.get_state()
+                robot_pos2 = np.asarray(robot_pos3, dtype=float)[:2]
+                robot_vel_state = np.asarray(robot_vel_state, dtype=float).reshape(-1)
+                robot_vel2 = robot_vel_state[:2] if robot_vel_state.size >= 2 else np.zeros(2)
+                robot_omega = float(robot_vel_state[2]) if robot_vel_state.size >= 3 else 0.0
 
-                # Diff-drive: in-place robot heading alignment (override Phase7)
-                if (
-                    agent.goal_type == "push"
-                    and name in phase7_controllers
-                    and name in dd_robot_cmd_override_persistent
-                ):
-                    agent.update_contact_state()
-                    cmd_dd = dd_robot_cmd_override_persistent[name]
-                    agent.robot.command_velocity(
-                        np.array([float(cmd_dd[0]), float(cmd_dd[1])], dtype=float)
-                    )
-                    continue
+                obj_pos = np.asarray(obj_state["position"], dtype=float)
+                obj_theta = float(obj_state["orientation"])
+                obj_vel = np.asarray(obj_state["velocity"], dtype=float)
+                obj_omega = float(obj_state["angular_velocity"])
+                R_obj = _rotation_matrix(obj_theta)
+                cp_world = R_obj @ state.cp_body + obj_pos
+                n_out_w = R_obj @ state.n_out_body
+                n_in_w = -n_out_w
+                tangent_w = np.array([-n_in_w[1], n_in_w[0]], dtype=float)
+                intended_pos = cp_world + ROBOT_RADIUS * n_out_w
+                stage_pos = cp_world + APPROACH_DISTANCE * n_out_w
+                couple_target_pos = intended_pos
+                if state.obstructing and float(args.obstructing_inflate_gap) > 0.0:
+                    couple_target_pos = intended_pos + float(args.obstructing_inflate_gap) * n_out_w
 
-                # Use Phase 7 controller if in pushing mode
-                if agent.goal_type == "push" and name in phase7_controllers:
-                    # Use Phase 7 controller instead of agent's internal controller
-                    # Update contact state from RobotAgent (uses correct link index)
-                    agent.update_contact_state()
-                    robot_pos, robot_heading, _ = agent.robot.get_state()
-                    controller = phase7_controllers[name]
-                    record_history = (args.save_dir is not None)
-                    cmd = controller.compute_velocity(
-                        robot_pos=robot_pos,
-                        robot_heading=robot_heading,
-                        object_pos=obj_state["position"],
-                        object_orientation=obj_state["orientation"],
-                        object_velocity=obj_state["velocity"],
-                        object_angular_velocity=obj_state["angular_velocity"],
-                        contact_force=agent.contact_force,
-                        in_contact=agent.in_contact,
-                        t=t,
-                        record_history=record_history,
-                        robot=agent.robot,  # Pass robot object to get actual wheel velocities
-                    )
-                    if (
-                        args.push_heading_lock
-                        and dd_phase == DiffDriveSegmentPhase.PUSH
-                        and name in dd_push_heading_lock
+                position_error = intended_pos - robot_pos2
+                couple_position_error = couple_target_pos - robot_pos2
+                phi = float(np.arctan2(n_in_w[1], n_in_w[0]))
+                current_alpha = _wrap_angle(phi - float(robot_heading))
+                r_cp = cp_world - obj_pos
+                cp_velocity = obj_vel + obj_omega * np.array([-r_cp[1], r_cp[0]], dtype=float)
+
+                desired_v_world = current_desired_obj_velocity
+                desired_omega = current_desired_obj_omega
+                if (not live_push_ready):
+                    if path_following_controller is not None:
+                        preview = preview_path_velocity_for_realign()
+                        desired_v_world = np.array([float(preview[0]), float(preview[1])], dtype=float)
+                        desired_omega = float(preview[2])
+                    elif dd_next_segment_idx < len(dd_segment_plans):
+                        plan_preview = dd_segment_plans[dd_next_segment_idx]
+                        v_preview = _rotation_matrix(obj_theta) @ np.asarray(plan_preview.v_body, dtype=float).reshape(2)
+                        desired_v_world = np.array([float(v_preview[0]), float(v_preview[1])], dtype=float)
+                        desired_omega = float(plan_preview.omega)
+                v_cp_ref_w = desired_v_world + desired_omega * np.array(
+                    [-r_cp[1], r_cp[0]],
+                    dtype=float,
+                )
+
+                if not live_all_staged:
+                    stage_err = stage_pos - robot_pos2
+                    stage_dist = float(np.linalg.norm(stage_err))
+                    e_inward_heading = _wrap_angle(phi - float(robot_heading))
+                    if not state.stage_complete:
+                        if stage_dist > float(args.stage_position_tol):
+                            stage_heading_target = float(np.arctan2(stage_err[1], stage_err[0]))
+                            e_stage_heading = _wrap_angle(stage_heading_target - float(robot_heading))
+                            v_r = float(np.clip(
+                                float(args.kp_stage_position) * stage_dist * np.cos(e_stage_heading),
+                                -0.5,
+                                0.5,
+                            ))
+                            if abs(e_stage_heading) > np.deg2rad(75.0):
+                                v_r = 0.0
+                            omega_r = float(np.clip(
+                                float(args.kp_stage_heading) * e_stage_heading
+                                - float(args.kd_stage_heading) * robot_omega,
+                                -float(args.max_stage_omega),
+                                float(args.max_stage_omega),
+                            ))
+                        else:
+                            v_r = 0.0
+                            omega_r = float(np.clip(
+                                float(args.kp_stage_heading) * e_inward_heading
+                                - float(args.kd_stage_heading) * robot_omega,
+                                -float(args.max_stage_omega),
+                                float(args.max_stage_omega),
+                            ))
+                        if (
+                            stage_dist <= float(args.stage_position_tol)
+                            and abs(e_inward_heading) <= np.deg2rad(float(args.stage_heading_tol_deg))
+                        ):
+                            state.stage_complete = True
+                            print(f"[{name}] live-dd stage complete at t={t:.2f}s")
+                    else:
+                        v_r = 0.0
+                        omega_r = 0.0
+                elif not live_all_in_contact:
+                    cmd_holo = agent.compute_velocity(obj_state, other_positions)
+                    v_r = float(cmd_holo[0] * np.cos(robot_heading) + cmd_holo[1] * np.sin(robot_heading))
+                    omega_r = float(cmd_holo[2])
+                elif not live_push_ready:
+                    if state.seg_ref is None:
+                        seg_ref = _init_live_dd_segment_reference(
+                            phi0=phi,
+                            v_cp_ref_world=v_cp_ref_w,
+                            omega_ref=desired_omega,
+                            robot_heading=float(robot_heading),
+                        )
+                        state.seg_ref = seg_ref
+                        zeta0 = float(seg_ref["zeta0"])
+                        vr_ff = float(seg_ref["vr_ff"])
+                        move_dir = np.sign(vr_ff) * np.array([np.cos(zeta0), np.sin(zeta0)])
+                        state.normal_ratio = (
+                            float(np.dot(n_in_w, move_dir)) if abs(vr_ff) > 1e-12 else 0.0
+                        )
+                        state.obstructing = state.normal_ratio < -abs(float(args.obstructing_passive_ratio))
+                        print(
+                            f"[{name}] live-dd seg_ref: vr_ff={vr_ff:+.4f} "
+                            f"omega_ff={seg_ref['omega_ff']:+.4f} "
+                            f"normal_ratio={state.normal_ratio:+.3f} "
+                            f"role={'obstructing' if state.obstructing else 'normal'}"
+                        )
+                    e_zeta = _wrap_angle(float(state.seg_ref["zeta0"]) - float(robot_heading))
+                    if not state.realign_complete:
+                        v_r = 0.0
+                        omega_r = float(np.clip(3.5 * e_zeta, -1.2, 1.2))
+                        if abs(e_zeta) <= np.deg2rad(float(args.align_heading_tol_deg)):
+                            state.realign_complete = True
+                            print(f"[{name}] live-dd realign complete at t={t:.2f}s")
+                    else:
+                        v_r = 0.0
+                        omega_r = 0.0
+                else:
+                    if args.fixed_ref:
+                        seg_ref_push = state.seg_ref
+                    else:
+                        prev_ref = state.live_seg_ref or state.seg_ref
+                        locked_branch = float(prev_ref.get("branch_sign", 1.0)) if prev_ref else None
+                        seg_ref_push = _init_live_dd_segment_reference(
+                            phi0=phi,
+                            v_cp_ref_world=v_cp_ref_w,
+                            omega_ref=desired_omega,
+                            robot_heading=float(robot_heading),
+                            branch_sign=locked_branch,
+                        )
+                        state.live_seg_ref = seg_ref_push
+                    if seg_ref_push is None:
+                        seg_ref_push = _init_live_dd_segment_reference(
+                            phi0=phi,
+                            v_cp_ref_world=v_cp_ref_w,
+                            omega_ref=desired_omega,
+                            robot_heading=float(robot_heading),
+                        )
+                        state.seg_ref = seg_ref_push
+                    if args.fixed_ref and not state.alpha_snapped:
+                        state.seg_ref["alpha_star"] = current_alpha
+                        state.alpha_snapped = True
+
+                    drive_dir = np.array([np.cos(robot_heading), np.sin(robot_heading)], dtype=float)
+                    inward_drive_projection = float(np.dot(n_in_w, drive_dir))
+                    normal_gap = float(np.dot(couple_position_error, n_in_w))
+                    neighbour_gaps = []
+                    names_order = list(robot_agents.keys())
+                    idx_name = names_order.index(name)
+                    for nb_idx in ((idx_name - 1) % len(names_order), (idx_name + 1) % len(names_order)):
+                        nb_state = phase7_controllers[names_order[nb_idx]]
+                        nb_robot_pos3, _, _ = robot_agents[names_order[nb_idx]].robot.get_state()
+                        nb_cp = R_obj @ nb_state.cp_body + obj_pos
+                        nb_n_out = R_obj @ nb_state.n_out_body
+                        nb_target = nb_cp + ROBOT_RADIUS * nb_n_out
+                        if nb_state.obstructing and float(args.obstructing_inflate_gap) > 0.0:
+                            nb_target = nb_target + float(args.obstructing_inflate_gap) * nb_n_out
+                        nb_n_in = -nb_n_out
+                        neighbour_gaps.append(float(np.dot(nb_target - np.asarray(nb_robot_pos3)[:2], nb_n_in)))
+                    v_couple = 0.0
+                    if float(args.k_couple) != 0.0 and (
+                        args.couple_all_robots or state.obstructing
                     ):
-                        lock_err = np.arctan2(
-                            np.sin(dd_push_heading_lock[name] - robot_heading),
-                            np.cos(dd_push_heading_lock[name] - robot_heading),
+                        normal_bias = float(args.k_couple) * (
+                            normal_gap - 0.5 * float(sum(neighbour_gaps))
                         )
-                        omega_lock = float(np.clip(
-                            float(args.push_heading_lock_kp) * lock_err,
-                            -float(args.push_heading_lock_omega_max),
-                            float(args.push_heading_lock_omega_max),
+                        couple_raw = normal_bias * inward_drive_projection
+                        if (
+                            normal_gap <= float(args.contact_gap_deadband)
+                            and couple_raw * inward_drive_projection > 0.0
+                        ):
+                            couple_raw = 0.0
+                        v_couple = float(np.clip(
+                            couple_raw,
+                            -float(args.max_couple_speed),
+                            float(args.max_couple_speed),
                         ))
-                        cmd = np.array([float(cmd[0]), float(cmd[1]), omega_lock], dtype=float)
-                else:
-                    # Use normal agent controller (navigation, approach)
-                    obstacles = None
-                    if agent.goal_type == "navigate":
-                        obstacles = get_object_as_obstacle(
-                            generic_object, obj_state["position"], obj_state["orientation"]
-                        )
 
-                    cmd = agent.compute_velocity(obj_state, other_positions, obstacles=obstacles)
+                    robot_cp_lever = cp_world - robot_pos2
+                    robot_cp_velocity = robot_vel2 + robot_omega * np.array(
+                        [-robot_cp_lever[1], robot_cp_lever[0]],
+                        dtype=float,
+                    )
+                    v_r, omega_r, dbg = _compute_live_dd_command(
+                        seg_ref=seg_ref_push,
+                        robot_heading=float(robot_heading),
+                        position_error=position_error,
+                        current_alpha=current_alpha,
+                        n_in_world=n_in_w,
+                        tangent_world=tangent_w,
+                        k_normal=float(args.kp_position),
+                        k_tangent=float(args.k_tangent),
+                        kp_alpha=float(args.kp_alpha),
+                        max_v_r=0.5,
+                        max_omega_r=1.2,
+                        kd_alpha=float(args.kd_alpha),
+                        e_alpha_prev=state.e_alpha_prev,
+                        kd_normal=float(args.kd_pos),
+                        e_normal_prev=state.e_pos_prev,
+                        kd_tangent=float(args.kd_tangent),
+                        e_tangent_prev=state.e_tangent_prev,
+                        tangent_authority_deadband=float(args.tangent_authority_deadband),
+                        tangent_error_deadband=float(args.tangent_error_deadband),
+                        max_normal_speed=float(args.max_normal_speed),
+                        max_tangent_omega=float(args.max_tangent_omega),
+                        dt=1.0 / CTRL_FREQ,
+                    )
+                    state.e_alpha_prev = float(dbg["e_alpha"])
+                    state.e_pos_prev = float(dbg["e_pos"])
+                    state.e_tangent_prev = float(dbg["e_tangent"])
+                    v_r = float(v_r + v_couple)
+                    if state.obstructing and float(args.obstructing_pusher_speed_scale) != 1.0:
+                        v_r = float(v_r * float(args.obstructing_pusher_speed_scale))
 
-                if args.kinematics == "diffdrive" and len(cmd) == 3:
-                    pos, heading, _ = agent.robot.get_state()
-                    v_forward = cmd[0] * np.cos(heading) + cmd[1] * np.sin(heading)
-                    agent.robot.command_velocity(np.array([v_forward, cmd[2]]))
-                else:
-                    agent.robot.command_velocity(cmd)
+                agent.robot.command_velocity(np.array([float(v_r), float(omega_r)], dtype=float))
+
+                if args.save_dir is not None:
+                    hist = state.history
+                    hist.times.append(float(t))
+                    hist.robot_positions.append(robot_pos2.copy())
+                    hist.robot_headings.append(float(robot_heading))
+                    hist.robot_velocities.append(np.array([float(v_r), 0.0, float(omega_r)], dtype=float))
+                    hist.intended_positions.append(intended_pos.copy())
+                    hist.position_errors.append(position_error.copy())
+                    hist.desired_headings.append(float(phi))
+                    hist.heading_errors.append(float(current_alpha))
+                    hist.contact_point_positions.append(cp_world.copy())
+                    hist.contact_point_velocities.append(cp_velocity.copy())
+                    hist.object_positions.append(obj_pos.copy())
+                    hist.object_velocities.append(obj_vel.copy())
+                    hist.object_angular_velocities.append(float(obj_omega))
+                    hist.contact_forces.append(float(agent.contact_force))
+                    hist.in_contact.append(bool(agent.in_contact))
+                    hist.v_base_history.append(float(v_r))
+                    hist.v_ff_history.append(float(np.linalg.norm(v_cp_ref_w)))
+                    hist.v_pi_history.append(0.0)
+                    hist.desired_contact_point_speeds.append(float(np.linalg.norm(v_cp_ref_w)))
 
                 # Wheel velocity sanity: record *post-command* actual wheel velocities so it aligns
                 # with what was just commanded. (The Phase7 controller records inside compute_velocity,
@@ -2668,7 +3334,9 @@ def main():
 
         print(f"Saved plots and histories to {save_path}")
 
-    pyb.disconnect()
+    # PyBullet DIRECT/GUI teardown can abort in this environment after all
+    # outputs are written.  Match the liveupdate test and skip interpreter-side
+    # teardown so successful runs do not end with exit code 134.
 
     # Verify video file was created (after disconnect, PyBullet should have finalized it)
     if video_log_id is not None and video_path is not None:
@@ -2684,6 +3352,9 @@ def main():
             print(f"✗ Warning: Video file not found at {video_path}")
 
     print("Done.")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

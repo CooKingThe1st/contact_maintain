@@ -1,0 +1,4 @@
+{
+  "summary": "User stress-tested with a long noisy prompt about 1000ms timeouts and reliability; explained that delivery depends on client/network timeouts not character-per-second rules, full message received including trailing Continue marker, no code.",
+  "current_status": "Branch/integration testing narrative; repository unchanged."
+}

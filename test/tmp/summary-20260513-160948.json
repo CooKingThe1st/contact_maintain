@@ -1,0 +1,4 @@
+{
+  "summary": "Read diffdrive_path_control.py at user request (Cursor remote test); explained module purpose (diff-drive push/co-motion with HybridPath), enums, constant body-twist SE(2) solver, contact velocity and forward/backward robot heading goals, segment plans, vertex heading construction, and simple orientation/rotate helpers. No code changes.",
+  "current_status": "Documentation-only turn; repository code untouched."
+}

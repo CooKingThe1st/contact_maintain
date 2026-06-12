@@ -1,0 +1,4 @@
+{
+  "summary": "User sent 'continue'; added a short priority-ordered action list (object ω servo and live_object_servo_scale first, then tangent/α scheduling, T/pose policy, handoffs, polish) aligned with omega_eff→solve→Phase7 signal flow. No code changes.",
+  "current_status": "Recommendations complete; optional follow-up would be concrete defaults or log metrics implementation if requested."
+}

@@ -21,8 +21,18 @@ force above the threshold, then drives the following three-phase sequence:
   3. PUSH     — all robots start the Phase-7 controller simultaneously.  On
                 the very first push tick each robot snaps alpha* to the actual
                 push-entry contact angle (Option B from single-pusher stop_go).
-python3 /home/docker_user/catkin_ws/src/contact_maintain/scripts/test/test_multi_pusher_single_movement_diffdrive_liveupdate.py   --object rect   --v-ref-x 0.02   --v-ref-y 0.0   --omega-ref 0.02   --duration 50   --fixed-ref --kp-position 0.1   --k-tangent 0.1   --k-couple 0.0   --k-force-comp 0.0   --kd-alpha 0.08   --kd-pos 0.2   --save-dir /tmp/multi_pusher_dd/ --record-video
+
+    Optional ``--cross-track-integrate`` adds a bounded ω trim from lateral error
+    to the nominal constant-twist screw from each push-start pose (CSV segment
+    or plain ``--duration`` horizon).
+
     Push phase (Phase 7 — live-resolve variant)
+
+    python3 /home/docker_user/catkin_ws/src/contact_maintain/scripts/test/test_multi_pusher_single_movement_diffdrive_liveupdate.py   --object rect --v-ref-x 0 --v-ref-y 0.2 --omega 0.2  --fixed-ref   --duration 80   --kp-p
+    osition 0   --k-tangent 0.1   --k-couple 0.01   --k-force-comp 0.0   --kd-alpha 0.08   --kd-pos 0
+    .2   --save-dir /tmp/multi_pusher_dd/ --record-video --obstructing-inflate-gap 0.02 --disable-act
+    ual-contact-clearance-cheat --cross-track-integrate --cross-track-k -2 --cross-track-omega-max 0.2 --transition-teleport-robots --test-transition
+
 --------------------------------------------
 Each robot i independently, every control tick:
   1. Re-solves (vr_ff_i, zeta0_i, alpha*_i) from the CURRENT contact geometry
@@ -32,7 +42,10 @@ Each robot i independently, every control tick:
   2. Runs _compute_phase7_command with the fresh seg_ref AND a PD alpha term:
        omega_r = omega_ff + kp_alpha*e_alpha + kd_alpha*(de_alpha/dt)
      The derivative term damps multi-robot coupling oscillations.
-The object moves from real contact-force physics — no kinematic cheat.
+The object moves from real contact-force physics (not kinematically driven).
+Robots default to planar-joint velocity cheat; use --no-planar-cheat for
+wheel/bumper-limited actuation. Contact friction: --object-friction,
+--bumper-contact-mu (both affect bumper-object slip).
 
 TODO (Problem 2 — redundant contacts / non-contributing robots)
 ---------------------------------------------------------------
@@ -71,6 +84,7 @@ Example invocations
 """
 
 import argparse
+import csv
 import json
 import os
 import subprocess
@@ -78,7 +92,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -102,6 +116,7 @@ from contact_maintain.object_bridge import obj_to_generic
 from contact_maintain.robot_agent import RobotAgent
 from contact_maintain.swarm import SwarmHost, SwarmState, RobotState
 from contact_optimizer_utils import find_the_magnum_four_v3
+from contact_maintain.diffdrive_path_control import solve_constant_body_twist_from_SE2
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +133,10 @@ DEFAULT_CASTER_LATERAL_FRICTION = 0.01
 
 DEFAULT_OBJECT_SHAPE = "rect"
 DEFAULT_OBJECT_HEIGHT = 0.08
-DEFAULT_OBJECT_FRICTION = 0.8
+DEFAULT_OBJECT_FRICTION = 0.2
 
 ROBOT_RADIUS = 0.06          # disc-bumper cylinder radius (diffdrive_wheel_robot_disc_bumper.urdf)
-APPROACH_DISTANCE = 0.12      # spawn offset beyond contact point (metres)
+APPROACH_DISTANCE = 0.16      # spawn offset beyond contact point (metres)
 
 # Approach contact gate: agent.contact_force must exceed this to count as "in contact".
 APPROACH_CONTACT_GATE = 0.05  # N  (lower than SwarmHost default to catch first touch quickly)
@@ -141,6 +156,8 @@ class RobotHistory:
     robot_angular_velocities: List[float] = field(default_factory=list)
     intended_positions: List[np.ndarray] = field(default_factory=list)
     position_errors: List[np.ndarray] = field(default_factory=list)
+    couple_target_positions: List[np.ndarray] = field(default_factory=list)
+    couple_position_errors: List[np.ndarray] = field(default_factory=list)
     intended_contact_point_velocities: List[np.ndarray] = field(default_factory=list)
     contact_point_velocities: List[np.ndarray] = field(default_factory=list)        # object-side actual CP velocity
     robot_contact_point_velocities: List[np.ndarray] = field(default_factory=list)  # robot-side actual CP velocity
@@ -175,6 +192,8 @@ class ObjectHistory:
     orientations: List[float] = field(default_factory=list)
     velocities: List[np.ndarray] = field(default_factory=list)
     angular_velocities: List[float] = field(default_factory=list)
+    desired_v_refs_body: List[np.ndarray] = field(default_factory=list)
+    desired_omegas: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +257,144 @@ def stop_video_recording(log_id: int, video_path: Path) -> None:
 def _wrap_angle(x: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return float(np.arctan2(np.sin(x), np.cos(x)))
+
+
+def _load_csv_twist_segments(
+    csv_path: Path, v_speed: float
+) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    """Consecutive world poses (x,y,theta) -> constant body-twist segments at fixed ||v_body||.
+
+    Each segment is one solve from ``solve_constant_body_twist_from_SE2`` (same as magnum CSV).
+    Optional column ``t`` is ignored.
+
+    Geometric note
+    --------------
+    Rows are **waypoints** in world frame. Each segment moves from pose (p_i, θ_i) to
+    (p_{i+1}, θ_{i+1}) with one **constant body twist** for the solver duration ``T``.
+    That motion is an SE(2) screw: path is a **straight line** in world iff ω=0; if
+    ω≠0 it is generally a **circular arc**, not the straight chord from p_i to p_{i+1}.
+    A polyline through the CSV xy points is therefore *not* the same as the commanded
+    reference path unless every segment happens to be pure translation.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    rows: List[Dict[str, float]] = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"x", "y", "theta"}
+        missing = required.difference(set(reader.fieldnames or []))
+        if missing:
+            raise ValueError(
+                f"CSV must include columns {sorted(required)}; missing {sorted(missing)}"
+            )
+        for i, row in enumerate(reader, start=2):
+            try:
+                rows.append(
+                    {
+                        "x": float(str(row["x"]).strip()),
+                        "y": float(str(row["y"]).strip()),
+                        "theta": float(str(row["theta"]).strip()),
+                    }
+                )
+            except Exception as exc:
+                raise ValueError(f"Invalid CSV numeric value at line {i}: {exc}") from exc
+    if len(rows) < 2:
+        raise ValueError("CSV needs at least 2 pose rows for segments")
+
+    waypoints = np.array([[r["x"], r["y"], r["theta"]] for r in rows], dtype=float)
+
+    segments: List[Dict[str, Any]] = []
+    for idx in range(len(rows) - 1):
+        p0 = np.array([rows[idx]["x"], rows[idx]["y"]], dtype=float)
+        p1 = np.array([rows[idx + 1]["x"], rows[idx + 1]["y"]], dtype=float)
+        th0 = float(rows[idx]["theta"])
+        th1 = float(rows[idx + 1]["theta"])
+        c, s = np.cos(th0), np.sin(th0)
+        Rinv = np.array([[c, s], [-s, c]], dtype=float)
+        local = Rinv @ (p1 - p0)
+        dx, dy = float(local[0]), float(local[1])
+        th_end_local = _wrap_angle(th1 - th0)
+        v_body, omega, T = solve_constant_body_twist_from_SE2(
+            dx, dy, th_end_local, v_speed=float(v_speed)
+        )
+        segments.append(
+            {
+                "segment_idx": idx,
+                "v_body": np.asarray(v_body, dtype=float).reshape(2).copy(),
+                "omega": float(omega),
+                "T": float(T),
+            }
+        )
+    return segments, waypoints
+
+
+def _sample_constant_twist_world_com_path(
+    p0: np.ndarray,
+    th0: float,
+    v_body: np.ndarray,
+    omega: float,
+    T: float,
+    n: int = 96,
+) -> np.ndarray:
+    """World-frame CoM polyline sampling exact constant body twist over [0, T]."""
+    p0 = np.asarray(p0, dtype=float).reshape(2)
+    vb = np.asarray(v_body, dtype=float).reshape(2)
+    w = float(omega)
+    T = float(T)
+    n = int(max(2, n))
+    dt = T / float(n - 1)
+    pts = np.zeros((n, 2), dtype=float)
+    p = p0.copy()
+    th = float(th0)
+    pts[0] = p
+    for k in range(1, n):
+        c, s = np.cos(th), np.sin(th)
+        R = np.array([[c, -s], [s, c]], dtype=float)
+        p = p + (R @ vb) * dt
+        th = th + w * dt
+        pts[k] = p
+    return pts
+
+
+def _signed_cross_track_to_screw_path_m(
+    q_xy: np.ndarray,
+    p0_xy: np.ndarray,
+    th0: float,
+    v_body: np.ndarray,
+    omega: float,
+    T: float,
+    *,
+    n_samples: int = 128,
+) -> float:
+    """Signed lateral error (m) from q to closest point on sampled screw polyline.
+
+    Sign: ``(t × (q - p_proj))_z`` with *t* the unit tangent along the segment at the
+    closest edge (right-handed; positive means *q* lies to the left of forward *t*).
+    """
+    pts = _sample_constant_twist_world_com_path(
+        p0_xy, th0, v_body, omega, T, n=int(max(8, n_samples))
+    )
+    q = np.asarray(q_xy, dtype=float).reshape(2)
+    best_d = float("inf")
+    best_signed = 0.0
+    for k in range(int(pts.shape[0]) - 1):
+        a = np.asarray(pts[k], dtype=float).reshape(2)
+        b = np.asarray(pts[k + 1], dtype=float).reshape(2)
+        ab = b - a
+        lab2 = float(np.dot(ab, ab))
+        if lab2 < 1e-18:
+            continue
+        s = float(np.dot(q - a, ab) / lab2)
+        s = float(np.clip(s, 0.0, 1.0))
+        proj = a + s * ab
+        dvec = q - proj
+        t = ab / max(np.sqrt(lab2), 1e-12)
+        signed = float(t[0] * dvec[1] - t[1] * dvec[0])
+        dist = float(np.linalg.norm(dvec))
+        if dist < best_d - 1e-9:
+            best_d = dist
+            best_signed = signed
+    return float(best_signed)
 
 
 def _lowpass_angle(prev: float, new: float, alpha: float) -> float:
@@ -362,6 +519,62 @@ def _smooth_live_segment_reference(
     # branch-locked, but keeping this stable avoids accidental later flips.
     smoothed["branch_sign"] = float(prev_ref.get("branch_sign", raw_ref.get("branch_sign", 1.0)))
     return smoothed
+
+
+def _plot_push_start_idx(times: List[float], t_push_start: Optional[float]) -> int:
+    """First history index at push phase (skips approach/realign contact spikes)."""
+    if not times or t_push_start is None:
+        return 0
+    return max(0, int(np.searchsorted(np.asarray(times, dtype=float), float(t_push_start))))
+
+
+def _clip_series_percentile(
+    data: np.ndarray,
+    lower_percentile: float = 1.0,
+    upper_percentile: float = 99.0,
+) -> np.ndarray:
+    """Clip finite samples to percentiles for clearer diagnostic plots."""
+    arr = np.asarray(data, dtype=float).reshape(-1)
+    out = arr.copy()
+    mask = np.isfinite(out)
+    if not np.any(mask):
+        return out
+    valid = out[mask]
+    if valid.size < 2:
+        return out
+    lo, hi = np.percentile(valid, [lower_percentile, upper_percentile])
+    out[mask] = np.clip(valid, lo, hi)
+    return out
+
+
+def _set_pruned_plot_ylim(
+    ax,
+    series_list,
+    q_low: float = 2.0,
+    q_high: float = 98.0,
+) -> None:
+    """Percentile y-limits so rare spikes do not hide steady-state behavior."""
+    finite_chunks = []
+    for series in series_list:
+        arr = np.asarray(series, dtype=float).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size:
+            finite_chunks.append(arr)
+    if not finite_chunks:
+        return
+    vals = np.concatenate(finite_chunks)
+    if vals.size < 4:
+        return
+    lo, hi = np.percentile(vals, [q_low, q_high])
+    lo = min(float(lo), 0.0)
+    hi = max(float(hi), 0.0)
+    span = hi - lo
+    if span <= 1e-9:
+        pad = max(abs(hi), 1.0) * 0.05
+        ax.set_ylim(lo - pad, hi + pad)
+        return
+    margin = 0.15 * span
+    ax.set_ylim(lo - margin, hi + margin)
 
 
 def _compute_phase7_command(
@@ -598,9 +811,11 @@ class MultiPusherConstantTwistDiffdrive:
         object_name: str = DEFAULT_OBJECT_SHAPE,
         *,
         approach_distance: float = APPROACH_DISTANCE,
-        bumper_contact_mu: float = 0.8,
+        object_lateral_friction: float = DEFAULT_OBJECT_FRICTION,
+        bumper_contact_mu: float = 0.01,
         wheel_lateral_friction: float = DEFAULT_WHEEL_LATERAL_FRICTION,
         caster_lateral_friction: float = DEFAULT_CASTER_LATERAL_FRICTION,
+        use_planar_cheat_control: bool = True,
         kp_alpha: float = 0.5,
         kd_alpha: float = 0.0,
         kp_position: float = 1.0,
@@ -640,16 +855,38 @@ class MultiPusherConstantTwistDiffdrive:
         kp_realign_heading: float = 3.5,
         use_live_resolve: bool = True,
         obstructing_pusher_speed_scale: float = 1.1,
-        obstructing_passive_ratio: float = 0.25,
+        obstructing_passive_ratio: float = 0.1,
         obstructing_inflate_gap: float = 0.02,
         couple_obstructing_only: bool = True,
         use_actual_contact_clearance_cheat: bool = True,
+        csv_segments: Optional[List[Dict[str, Any]]] = None,
+        csv_waypoints_world: Optional[np.ndarray] = None,
+        csv_segment_v_speed: float = 0.1,
+        csv_replan_each_push: bool = False,
+        cross_track_integrate: bool = False,
+        cross_track_k: float = 4.0,
+        cross_track_omega_max: float = 0.25,
     ):
         self.n_robots = len(t_params)
         assert self.n_robots >= 1, "Need at least one t_param."
         self.t_params = [float(t) for t in t_params]
         self.v_ref_body = np.asarray(v_ref_body, dtype=float).reshape(2)
         self.omega_ref = float(omega_ref)
+        self.csv_segments: Optional[List[Dict[str, Any]]] = (
+            list(csv_segments) if csv_segments is not None else None
+        )
+        if csv_waypoints_world is None:
+            self.csv_waypoints_world = None
+        else:
+            wa = np.asarray(csv_waypoints_world, dtype=float)
+            self.csv_waypoints_world = (
+                wa.reshape(-1, 3).copy() if wa.size else None
+            )
+        self.csv_segment_v_speed = float(csv_segment_v_speed)
+        self.csv_replan_each_push = bool(csv_replan_each_push)
+        self.cross_track_integrate = bool(cross_track_integrate)
+        self.cross_track_k = float(cross_track_k)
+        self.cross_track_omega_max = float(cross_track_omega_max)
 
         self.kp_alpha = float(kp_alpha)
         self.kd_alpha = float(kd_alpha)
@@ -694,6 +931,9 @@ class MultiPusherConstantTwistDiffdrive:
         self.obstructing_inflate_gap = float(obstructing_inflate_gap)
         self.couple_obstructing_only = bool(couple_obstructing_only)
         self.use_actual_contact_clearance_cheat = bool(use_actual_contact_clearance_cheat)
+        self.object_lateral_friction = float(object_lateral_friction)
+        self.bumper_contact_mu = float(bumper_contact_mu)
+        self.use_planar_cheat_control = bool(use_planar_cheat_control)
         self._obstructing_pushers: List[bool] = [False] * self.n_robots
         self._normal_ratio_precheck: List[float] = [0.0] * self.n_robots
 
@@ -715,7 +955,7 @@ class MultiPusherConstantTwistDiffdrive:
             position=(0.0, 0.0, DEFAULT_OBJECT_HEIGHT),
             orientation=0.0,
             mass=1.0,
-            lateral_friction=DEFAULT_OBJECT_FRICTION,
+            lateral_friction=self.object_lateral_friction,
             blind_test=True,
         )
 
@@ -773,12 +1013,12 @@ class MultiPusherConstantTwistDiffdrive:
                 model="wheel_physics",
                 position=(float(spawn_xy[0]), float(spawn_xy[1])),
                 orientation=heading,
-                contact_mu=float(bumper_contact_mu),
+                contact_mu=self.bumper_contact_mu,
                 name=name,
             )
             robot.set_wheel_friction(float(wheel_lateral_friction))
             robot.set_caster_friction(float(caster_lateral_friction))
-            robot.use_planar_cheat_control = True
+            robot.use_planar_cheat_control = self.use_planar_cheat_control
 
             self.robots[name] = robot
             self.robot_histories.append(RobotHistory())
@@ -810,6 +1050,86 @@ class MultiPusherConstantTwistDiffdrive:
 
         self.object_history = ObjectHistory()
         self._t_push_start: Optional[float] = None   # updated by run(); used by plot_results()
+        self._csv_segment_plot_log: List[Dict[str, Any]] = []
+
+    def _replan_csv_segment_inplace(self, seg_idx: int, obj_pos: np.ndarray, obj_theta: float) -> None:
+        """Re-solve constant twist from measured world pose to CSV waypoint ``seg_idx + 1``.
+
+        Mutates ``self.csv_segments[seg_idx]`` (``v_body``, ``omega``, ``T``).
+        """
+        if self.csv_waypoints_world is None or self.csv_segments is None:
+            return
+        if seg_idx < 0 or seg_idx >= len(self.csv_segments):
+            return
+        w = self.csv_waypoints_world
+        p0 = np.asarray(obj_pos, dtype=float).reshape(2)
+        th0 = float(obj_theta)
+        p1 = w[seg_idx + 1, :2]
+        th1 = float(w[seg_idx + 1, 2])
+        c, s = np.cos(th0), np.sin(th0)
+        Rinv = np.array([[c, s], [-s, c]], dtype=float)
+        local = Rinv @ (p1 - p0)
+        dx, dy = float(local[0]), float(local[1])
+        th_end_local = _wrap_angle(th1 - th0)
+        v_body, omega, T = solve_constant_body_twist_from_SE2(
+            dx, dy, th_end_local, v_speed=float(self.csv_segment_v_speed)
+        )
+        seg = self.csv_segments[seg_idx]
+        seg["v_body"] = np.asarray(v_body, dtype=float).reshape(2).copy()
+        seg["omega"] = float(omega)
+        seg["T"] = float(T)
+
+    def _append_csv_segment_completion_log(
+        self,
+        seg_idx_completed: int,
+        t_sim: float,
+        obj_pos: np.ndarray,
+        obj_theta: float,
+        solver_T: float,
+        log_list: List[Dict[str, Any]],
+        *,
+        push_start_xy: np.ndarray,
+        push_start_theta: float,
+        push_duration_s: float,
+        stop_reason: str,
+        v_body: np.ndarray,
+        omega_exec: float,
+        time_gate_s: Optional[float] = None,
+    ) -> None:
+        """Record segment end; fields support CSV trajectory overlay (measured push starts)."""
+        if self.csv_waypoints_world is None:
+            return
+        w = self.csv_waypoints_world
+        tgt = w[seg_idx_completed + 1]
+        pos_err = float(np.linalg.norm(np.asarray(obj_pos, dtype=float).reshape(2) - tgt[:2]))
+        yaw_err = float(abs(_wrap_angle(float(obj_theta) - float(tgt[2]))))
+        vb = np.asarray(v_body, dtype=float).reshape(2)
+        tg = float(time_gate_s) if time_gate_s is not None else float(solver_T)
+        entry = {
+            "segment_completed": int(seg_idx_completed),
+            "t_s": float(t_sim),
+            "solver_T_s": float(solver_T),
+            "time_gate_s": tg,
+            "push_start_xy_m": [float(push_start_xy[0]), float(push_start_xy[1])],
+            "push_start_theta_rad": float(push_start_theta),
+            "push_duration_s": float(push_duration_s),
+            "stop_reason": str(stop_reason),
+            "v_body": [float(vb[0]), float(vb[1])],
+            "omega": float(omega_exec),
+            "target_xy_m": [float(tgt[0]), float(tgt[1])],
+            "target_theta_rad": float(tgt[2]),
+            "actual_xy_m": [float(obj_pos[0]), float(obj_pos[1])],
+            "actual_theta_rad": float(obj_theta),
+            "pos_err_m": pos_err,
+            "yaw_err_rad": yaw_err,
+        }
+        log_list.append(entry)
+        print(
+            f"[segment-csv] end of segment {seg_idx_completed} ({stop_reason}): "
+            f"||Δpos||={pos_err:.4f} m  |Δθ|={np.degrees(yaw_err):.2f}° "
+            f"(CSV waypoint row {seg_idx_completed + 2})  "
+            f"push_s={push_duration_s:.3f}  solver_T={solver_T:.4f}s  T_gate={tg:.4f}s"
+        )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -827,6 +1147,56 @@ class MultiPusherConstantTwistDiffdrive:
         omega = float(va[2])
         return pos2d, z, theta, vel2d, omega
 
+    def _update_contact_geometry_from_robot_pose(
+        self,
+        i: int,
+        obj_pos: np.ndarray,
+        obj_theta: float,
+        robot_pos2: np.ndarray,
+        max_boundary_shift_m: float,
+    ) -> float:
+        """Project the landed robot pose back to the boundary and update CP geometry.
+
+        This is intentionally bounded: the approach phase may land a few cm away
+        from the nominal t_param after a transition, but a large projection jump
+        would silently reassign the robot to another side/corner.
+        """
+        c_th, s_th = np.cos(obj_theta), np.sin(obj_theta)
+        R_obj_T = np.array([[c_th, s_th], [-s_th, c_th]], dtype=float)
+        robot_body = R_obj_T @ (robot_pos2 - obj_pos)
+        projected = self._parameterization.point_to_parameter(robot_body)
+
+        old_t = float(self.t_params[i])
+        raw_t = float(projected["parameter"]) % 1.0
+        raw_delta_t = ((raw_t - old_t + 0.5) % 1.0) - 0.5
+        max_delta_t = max(0.0, float(max_boundary_shift_m)) / max(
+            float(self._parameterization.total_length),
+            1e-9,
+        )
+        delta_t = float(np.clip(raw_delta_t, -max_delta_t, max_delta_t))
+        new_t = (old_t + delta_t) % 1.0
+
+        info = self._parameterization.get_contact_info(new_t)
+        cp_b = np.array(info["point"], dtype=float)
+        n_out_b = np.array(info["normal_outward"], dtype=float)
+        _, seg_idx, _ = self._parameterization.parameter_to_point(new_t)
+
+        self.t_params[i] = new_t
+        self._cp_body[i] = cp_b
+        self._n_out_body[i] = n_out_b
+        self._seg_p1_body[i] = np.array(
+            self._parameterization.boundary_coords[seg_idx],
+            dtype=float,
+        )
+        self._seg_p2_body[i] = np.array(
+            self._parameterization.boundary_coords[seg_idx + 1],
+            dtype=float,
+        )
+        self._desired_cp_speed[i] = float(np.linalg.norm(
+            _compute_body_cp_velocity(cp_b, self.v_ref_body, self.omega_ref)
+        ))
+        return abs(delta_t) * float(self._parameterization.total_length)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(
@@ -839,6 +1209,25 @@ class MultiPusherConstantTwistDiffdrive:
         record_video: bool = False,
         align_heading_tol_rad: float = np.deg2rad(2.0),
         stop_go_sleep_after_realign_s: float = 0.5,
+        test_transition: bool = False,
+        transition_teleport_robots: bool = False,
+        stage_position_tol: float = 0.02,
+        stage_heading_tol_rad: float = np.deg2rad(5.0),
+        kp_stage_position: float = 1.5,
+        kp_stage_heading: float = 3.0,
+        kd_stage_heading: float = 0.8,
+        max_stage_omega: float = 0.4,
+        update_contact_on_realign: bool = True,
+        contact_update_max_distance: float = 0.06,
+        csv_segment_time_only: bool = True,
+        csv_segment_pos_tol_m: float = 0.045,
+        csv_segment_yaw_tol_rad: float = np.deg2rad(10.0),
+        csv_segment_vel_tol_m_s: float = 0.03,
+        csv_segment_omega_tol_rad_s: float = 0.15,
+        csv_segment_require_low_speed: bool = True,
+        csv_segment_timeout_factor: float = 6.0,
+        csv_segment_timeout_min_s: float = 5.0,
+        csv_segment_time_scale: float = 1.0,
     ) -> Dict:
         """Run the simulation.
 
@@ -854,7 +1243,11 @@ class MultiPusherConstantTwistDiffdrive:
         names = self._robot_names()
 
         # ── Phase-tracking flags ───────────────────────────────────────────────
-        # APPROACH → (all in contact) → REALIGN → (all aligned) → HOLD → PUSH
+        # STAGE → APPROACH → (all in contact) → REALIGN → HOLD → PUSH
+        # Initial spawn starts at STAGE already; transitions must drive there.
+        stage_complete = [False] * self.n_robots
+        stage_announced = False
+        all_staged = False
         approach_complete = [False] * self.n_robots
         realign_announced = False          # printed once when all approach done
         realign_complete = [False] * self.n_robots
@@ -866,12 +1259,79 @@ class MultiPusherConstantTwistDiffdrive:
         z_push_start: Optional[float] = None
         self._t_push_start = None   # reset each run()
         self._live_seg_refs = [None] * self.n_robots
+        push_start_times: List[float] = []
+        transition_done = False
+        transition_time = 0.5 * float(duration)
+        csv_use = bool(self.csv_segments)
+        csv_seg_idx = 0
+        csv_segment_push_start_t: Optional[float] = None
+        csv_exit_after_final = False
+        csv_segment_end_log: List[Dict[str, Any]] = []
+        csv_push_start_xy = np.zeros(2, dtype=float)
+        csv_push_start_theta = 0.0
+        csv_push_start_valid = False
+        ct_ref_xy = np.zeros(2, dtype=float)
+        ct_ref_theta = 0.0
+        ct_ref_valid = False
 
         # Per-robot state for the derivative terms and fixed-ref alpha* snap.
         e_alpha_prev_list = [0.0] * self.n_robots
         e_pos_prev_list   = [0.0] * self.n_robots  # for position D term
         e_tangent_prev_list = [0.0] * self.n_robots
         alpha_snapped = [False] * self.n_robots   # only used when use_live_resolve=False
+
+        def _teleport_robots_to_current_approach_pose(obj_pos_now: np.ndarray, obj_theta_now: float) -> None:
+            """Simulation-only transition cheat: respawn robots near current contacts."""
+            c_now, s_now = np.cos(obj_theta_now), np.sin(obj_theta_now)
+            R_now = np.array([[c_now, -s_now], [s_now, c_now]], dtype=float)
+            for i, name in enumerate(names):
+                robot = self.robots[name]
+                cp_b = self._cp_body[i]
+                n_out_b = self._n_out_body[i]
+                n_in_b = -n_out_b
+                spawn_xy = R_now @ (cp_b + APPROACH_DISTANCE * n_out_b) + obj_pos_now
+                n_in_world = R_now @ n_in_b
+                heading = float(np.arctan2(n_in_world[1], n_in_world[0]))
+                if hasattr(robot, "reset"):
+                    robot.reset(position=(float(spawn_xy[0]), float(spawn_xy[1])), orientation=heading)
+                else:
+                    robot.command_velocity(np.array([0.0, 0.0]))
+            print("[transition] teleported robots to current contact + normal approach offset")
+
+        def _reset_startup_barriers(reason: str) -> None:
+            """Return the local scheduler to APPROACH -> REALIGN -> HOLD."""
+            nonlocal stage_complete, stage_announced, all_staged
+            nonlocal approach_complete, realign_announced, realign_complete
+            nonlocal all_in_contact, all_realigned, pre_push_hold_until_t
+            nonlocal push_started, z_push_start
+            nonlocal e_alpha_prev_list, e_pos_prev_list, e_tangent_prev_list, alpha_snapped
+            nonlocal ct_ref_valid
+
+            stage_complete = [False] * self.n_robots
+            stage_announced = False
+            all_staged = False
+            approach_complete = [False] * self.n_robots
+            realign_announced = False
+            realign_complete = [False] * self.n_robots
+            all_in_contact = False
+            all_realigned = False
+            pre_push_hold_until_t = None
+            push_started = False
+            z_push_start = None
+            self._seg_refs = [None] * self.n_robots
+            self._live_seg_refs = [None] * self.n_robots
+            self._obstructing_pushers = [False] * self.n_robots
+            self._normal_ratio_precheck = [0.0] * self.n_robots
+            e_alpha_prev_list = [0.0] * self.n_robots
+            e_pos_prev_list = [0.0] * self.n_robots
+            e_tangent_prev_list = [0.0] * self.n_robots
+            alpha_snapped = [False] * self.n_robots
+            ct_ref_valid = False
+            for robot in self.robots.values():
+                robot.command_velocity(np.array([0.0, 0.0]))
+            self.host.assign_targets({name: self.t_params[i] for i, name in enumerate(names)})
+            print(f"\n{'='*60}")
+            print(f"[transition] {reason}: stopped push and reset APPROACH/REALIGN barriers")
 
         # Video
         video_log_id = -1
@@ -896,26 +1356,206 @@ class MultiPusherConstantTwistDiffdrive:
                     "angular_velocity": obj_omega,
                 }
 
+                if (
+                    test_transition
+                    and (not csv_use)
+                    and (not transition_done)
+                    and t >= transition_time
+                ):
+                    old_v_ref = self.v_ref_body.copy()
+                    old_omega_ref = float(self.omega_ref)
+                    self.v_ref_body = np.array(
+                        [-old_v_ref[1], old_v_ref[0]],
+                        dtype=float,
+                    )
+                    self.omega_ref = -old_omega_ref
+                    self._desired_cp_speed = [
+                        float(np.linalg.norm(_compute_body_cp_velocity(cp_b, self.v_ref_body, self.omega_ref)))
+                        for cp_b in self._cp_body
+                    ]
+                    transition_done = True
+                    if transition_teleport_robots:
+                        _teleport_robots_to_current_approach_pose(obj_pos, obj_theta)
+                    _reset_startup_barriers(
+                        "desired twist changed "
+                        f"v=({old_v_ref[0]:+.4f}, {old_v_ref[1]:+.4f}) -> "
+                        f"({self.v_ref_body[0]:+.4f}, {self.v_ref_body[1]:+.4f}) m/s, "
+                        f"omega={old_omega_ref:+.4f} -> {self.omega_ref:+.4f} rad/s"
+                    )
+
+                if (
+                    csv_use
+                    and push_started
+                    and csv_segment_push_start_t is not None
+                    and self.csv_segments is not None
+                    and self.csv_waypoints_world is not None
+                ):
+                    seg = self.csv_segments[csv_seg_idx]
+                    tgt_row = self.csv_waypoints_world[csv_seg_idx + 1]
+                    dt_seg = float(t - csv_segment_push_start_t)
+                    T_sol = float(seg["T"])
+                    T_gate = T_sol * float(csv_segment_time_scale)
+                    T_cap = max(
+                        float(csv_segment_timeout_factor) * T_gate,
+                        float(csv_segment_timeout_min_s),
+                    )
+                    pos_err_gate = float(
+                        np.linalg.norm(obj_pos - np.asarray(tgt_row[:2], dtype=float))
+                    )
+                    yaw_err_gate = float(
+                        abs(_wrap_angle(float(obj_theta) - float(tgt_row[2])))
+                    )
+                    vel_norm = float(np.linalg.norm(obj_vel))
+
+                    seg_done = False
+                    stop_reason = ""
+                    if csv_segment_time_only:
+                        if dt_seg >= T_gate - 1e-9:
+                            seg_done = True
+                            stop_reason = "time_open_loop"
+                    elif dt_seg >= T_cap:
+                        seg_done = True
+                        stop_reason = "timeout"
+                    else:
+                        pose_ok = (
+                            pos_err_gate <= float(csv_segment_pos_tol_m)
+                            and yaw_err_gate <= float(csv_segment_yaw_tol_rad)
+                        )
+                        if csv_segment_require_low_speed:
+                            pose_ok = pose_ok and (
+                                vel_norm <= float(csv_segment_vel_tol_m_s)
+                                and abs(float(obj_omega))
+                                <= float(csv_segment_omega_tol_rad_s)
+                            )
+                        if pose_ok:
+                            seg_done = True
+                            stop_reason = "pose"
+
+                    if seg_done:
+                        if not csv_push_start_valid:
+                            csv_push_start_xy = np.asarray(obj_pos, dtype=float).reshape(2).copy()
+                            csv_push_start_theta = float(obj_theta)
+                        v_body_snap = np.asarray(seg["v_body"], dtype=float).reshape(2).copy()
+                        omega_snap = float(seg["omega"])
+                        self._append_csv_segment_completion_log(
+                            csv_seg_idx,
+                            t,
+                            obj_pos,
+                            obj_theta,
+                            T_sol,
+                            csv_segment_end_log,
+                            push_start_xy=csv_push_start_xy,
+                            push_start_theta=csv_push_start_theta,
+                            push_duration_s=dt_seg,
+                            stop_reason=stop_reason,
+                            v_body=v_body_snap,
+                            omega_exec=omega_snap,
+                            time_gate_s=T_gate,
+                        )
+                        csv_push_start_valid = False
+                        if csv_seg_idx + 1 < len(self.csv_segments):
+                            prev_idx = csv_seg_idx
+                            csv_seg_idx += 1
+                            if self.csv_replan_each_push:
+                                self._replan_csv_segment_inplace(
+                                    csv_seg_idx, obj_pos, obj_theta
+                                )
+                            nxt = self.csv_segments[csv_seg_idx]
+                            self.v_ref_body = np.asarray(
+                                nxt["v_body"], dtype=float
+                            ).reshape(2).copy()
+                            self.omega_ref = float(nxt["omega"])
+                            self._desired_cp_speed = [
+                                float(
+                                    np.linalg.norm(
+                                        _compute_body_cp_velocity(
+                                            cp_b, self.v_ref_body, self.omega_ref
+                                        )
+                                    )
+                                )
+                                for cp_b in self._cp_body
+                            ]
+                            if transition_teleport_robots:
+                                _teleport_robots_to_current_approach_pose(obj_pos, obj_theta)
+                            _reset_startup_barriers(
+                                f"CSV segment {prev_idx} -> {csv_seg_idx} "
+                                f"({stop_reason}): "
+                                f"v=({self.v_ref_body[0]:+.4f}, {self.v_ref_body[1]:+.4f}) m/s, "
+                                f"omega={self.omega_ref:+.4f} rad/s "
+                                f"(solver T_nom={T_sol:.3f}s)"
+                            )
+                            csv_segment_push_start_t = None
+                        else:
+                            self.v_ref_body = np.array([0.0, 0.0], dtype=float)
+                            self.omega_ref = 0.0
+                            self._desired_cp_speed = [
+                                float(
+                                    np.linalg.norm(
+                                        _compute_body_cp_velocity(
+                                            cp_b, self.v_ref_body, self.omega_ref
+                                        )
+                                    )
+                                )
+                                for cp_b in self._cp_body
+                            ]
+                            csv_segment_push_start_t = None
+                            csv_exit_after_final = True
+                            print(
+                                f"\n[segment-csv] final segment {csv_seg_idx} complete "
+                                f"({stop_reason}) — zeroing reference; ending run."
+                            )
+
                 # ── Swarm update: manages approach state machine + agent goals ──
                 # This calls agent.update_contact_state() for each robot, keeping
                 # agent.contact_force / agent.in_contact fresh.
                 self.host.update(1.0 / CTRL_FREQ, obj_state_dict)
 
-                # ── Check our own approach completion flags ─────────────────────
-                for i, name in enumerate(names):
-                    if not approach_complete[i]:
-                        if self.agents[name].contact_force > APPROACH_CONTACT_GATE:
-                            approach_complete[i] = True
-                            print(
-                                f"[{name}] contact detected "
-                                f"(F={self.agents[name].contact_force:.3f} N, t={t:.2f}s) — "
-                                f"waiting for remaining robots..."
-                            )
+                all_staged = all(stage_complete)
+                if all_staged and not stage_announced:
+                    stage_announced = True
+                    print(
+                        f"\n[stage] ALL {self.n_robots} ROBOTS AT APPROACH STAGING POSES "
+                        f"(t={t:.2f}s) — starting contact approach"
+                    )
 
-                all_in_contact = all(approach_complete)
+                # Approach completion is only valid after staging.  During STAGE
+                # a robot may still brush the object while clearing to its
+                # approach pose; that must not open the realign barrier.
+                if all_staged:
+                    for i, name in enumerate(names):
+                        if not approach_complete[i]:
+                            if self.agents[name].contact_force > APPROACH_CONTACT_GATE:
+                                approach_complete[i] = True
+                                print(
+                                    f"[{name}] contact detected "
+                                    f"(F={self.agents[name].contact_force:.3f} N, t={t:.2f}s) — "
+                                    f"waiting for remaining robots..."
+                                )
+
+                all_in_contact = all_staged and all(approach_complete)
 
                 # ── Barrier 1: all in contact → announce realign ───────────────
                 if all_in_contact and not realign_announced:
+                    if update_contact_on_realign and contact_update_max_distance > 0.0:
+                        shifts = []
+                        for i, name in enumerate(names):
+                            robot_pos3, _, _ = self.robots[name].get_state()
+                            robot_pos2 = np.asarray(robot_pos3, dtype=float)[:2]
+                            shift_m = self._update_contact_geometry_from_robot_pose(
+                                i=i,
+                                obj_pos=obj_pos,
+                                obj_theta=obj_theta,
+                                robot_pos2=robot_pos2,
+                                max_boundary_shift_m=float(contact_update_max_distance),
+                            )
+                            shifts.append(shift_m)
+                        self.host.assign_targets({
+                            name: self.t_params[i] for i, name in enumerate(names)
+                        })
+                        print(
+                            "[contact-update] snapped realign geometry to landed robot poses "
+                            f"(bounded shifts m: {[round(s, 4) for s in shifts]})"
+                        )
                     realign_announced = True
                     print(f"\n{'='*60}")
                     print(
@@ -947,11 +1587,51 @@ class MultiPusherConstantTwistDiffdrive:
                     push_started = True
                     t_push_start = t
                     z_push_start = float(obj_z)
-                    self._t_push_start = t
+                    push_start_times.append(float(t))
+                    if self._t_push_start is None:
+                        self._t_push_start = t
                     print(f"\n{'='*60}")
                     print(
                         f"ALL {self.n_robots} ROBOTS — PUSH PHASE START (t={t:.2f}s)"
+                        f" [segment {len(push_start_times)}]"
                     )
+                    if csv_use:
+                        csv_segment_push_start_t = t
+                        if (
+                            self.csv_replan_each_push
+                            and self.csv_segments is not None
+                            and len(push_start_times) == 1
+                        ):
+                            self._replan_csv_segment_inplace(
+                                0, obj_pos, obj_theta
+                            )
+                            seg_now = self.csv_segments[0]
+                            self.v_ref_body = np.asarray(
+                                seg_now["v_body"], dtype=float
+                            ).reshape(2).copy()
+                            self.omega_ref = float(seg_now["omega"])
+                            self._desired_cp_speed = [
+                                float(
+                                    np.linalg.norm(
+                                        _compute_body_cp_velocity(
+                                            cp_b, self.v_ref_body, self.omega_ref
+                                        )
+                                    )
+                                )
+                                for cp_b in self._cp_body
+                            ]
+                            print(
+                                f"[segment-csv] replanned leg 0 from measured pose before push → "
+                                f"v=({self.v_ref_body[0]:+.4f}, {self.v_ref_body[1]:+.4f}) m/s  "
+                                f"ω={self.omega_ref:+.4f} rad/s  T={float(seg_now['T']):.4f}s"
+                            )
+                        csv_push_start_xy = np.asarray(obj_pos, dtype=float).reshape(2).copy()
+                        csv_push_start_theta = float(obj_theta)
+                        csv_push_start_valid = True
+                    if self.cross_track_integrate:
+                        ct_ref_xy = np.asarray(obj_pos, dtype=float).reshape(2).copy()
+                        ct_ref_theta = float(obj_theta)
+                        ct_ref_valid = True
 
                 # ── Rotation matrix for this control tick ──────────────────────
                 c_th, s_th = np.cos(obj_theta), np.sin(obj_theta)
@@ -966,6 +1646,53 @@ class MultiPusherConstantTwistDiffdrive:
                 # equations as the backbone instead of adding a scalar speed term
                 # directly to each robot's v_r.
                 v_ref_world = R_obj @ self.v_ref_body
+                omega_cross_trim = 0.0
+                if push_started and self.cross_track_integrate:
+                    if (
+                        csv_use
+                        and self.csv_segments is not None
+                        and csv_push_start_valid
+                        and csv_segment_push_start_t is not None
+                    ):
+                        seg_ct = self.csv_segments[csv_seg_idx]
+                        vb_ct = np.asarray(seg_ct["v_body"], dtype=float).reshape(2)
+                        om_ct = float(seg_ct["omega"])
+                        T_ct = float(seg_ct["T"])
+                        e_d_m = _signed_cross_track_to_screw_path_m(
+                            obj_pos,
+                            ct_ref_xy,
+                            float(ct_ref_theta),
+                            vb_ct,
+                            om_ct,
+                            T_ct,
+                        )
+                        omega_cross_trim = float(
+                            np.clip(
+                                self.cross_track_k * e_d_m,
+                                -self.cross_track_omega_max,
+                                self.cross_track_omega_max,
+                            )
+                        )
+                    elif not csv_use and ct_ref_valid:
+                        vb_ct = np.asarray(self.v_ref_body, dtype=float).reshape(2)
+                        om_ct = float(self.omega_ref)
+                        T_ct = float(max(duration, 1e-3))
+                        e_d_m = _signed_cross_track_to_screw_path_m(
+                            obj_pos,
+                            ct_ref_xy,
+                            float(ct_ref_theta),
+                            vb_ct,
+                            om_ct,
+                            T_ct,
+                        )
+                        omega_cross_trim = float(
+                            np.clip(
+                                self.cross_track_k * e_d_m,
+                                -self.cross_track_omega_max,
+                                self.cross_track_omega_max,
+                            )
+                        )
+                omega_path_ref = float(self.omega_ref) + float(omega_cross_trim)
                 if push_started:
                     servo_scale = self.live_object_servo_scale if self.use_live_resolve else 1.0
                     v_obj_corr = servo_scale * self.kp_obj_speed * (v_ref_world - obj_vel)
@@ -973,12 +1700,12 @@ class MultiPusherConstantTwistDiffdrive:
                     if self.max_object_v_correction > 0.0 and corr_norm > self.max_object_v_correction:
                         v_obj_corr = v_obj_corr * (self.max_object_v_correction / max(corr_norm, 1e-9))
                     omega_obj_corr = float(np.clip(
-                        servo_scale * self.kp_object_omega * (self.omega_ref - obj_omega),
+                        servo_scale * self.kp_object_omega * (omega_path_ref - obj_omega),
                         -self.max_object_omega_correction,
                         self.max_object_omega_correction,
                     ))
                     v_eff_world = v_ref_world + v_obj_corr
-                    omega_eff = float(self.omega_ref + omega_obj_corr)
+                    omega_eff = float(omega_path_ref + omega_obj_corr)
                 else:
                     v_obj_corr = np.zeros(2, dtype=float)
                     omega_obj_corr = 0.0
@@ -1000,6 +1727,7 @@ class MultiPusherConstantTwistDiffdrive:
                     n_out_w = R_obj @ n_out_b
                     n_in_w = -n_out_w
                     intended_pos = cp_world + ROBOT_RADIUS * n_out_w
+                    stage_pos = cp_world + float(APPROACH_DISTANCE) * n_out_w
                     couple_target_pos = intended_pos
                     if self._obstructing_pushers[i] and self.obstructing_inflate_gap > 0.0:
                         # Coupling-only virtual geometry: for obstructing robots,
@@ -1040,6 +1768,7 @@ class MultiPusherConstantTwistDiffdrive:
                         "cp_b": cp_b,
                         "cp_world": cp_world,
                         "intended_pos": intended_pos,
+                        "stage_pos": stage_pos,
                         "couple_target_pos": couple_target_pos,
                         "robot_pos2": robot_pos2,
                         "robot_vel2": robot_vel2,
@@ -1060,6 +1789,8 @@ class MultiPusherConstantTwistDiffdrive:
                         "object_omega": float(obj_omega),
                         "omega_eff": omega_eff,
                     })
+
+                push_segment_alpha_ref: List[Optional[float]] = [None] * self.n_robots
 
                 # Diff-drive contact coupling:
                 # The original paper's holonomic graph term assumes each agent
@@ -1128,6 +1859,7 @@ class MultiPusherConstantTwistDiffdrive:
                     cp_b = data["cp_b"]
                     cp_world = data["cp_world"]
                     intended_pos = data["intended_pos"]
+                    stage_pos = data["stage_pos"]
                     robot_pos2 = data["robot_pos2"]
                     robot_vel2 = data["robot_vel2"]
                     robot_omega_actual = float(data["robot_omega"])
@@ -1145,8 +1877,80 @@ class MultiPusherConstantTwistDiffdrive:
                     object_omega_actual = float(data["object_omega"])
                     omega_eff_i = float(data["omega_eff"])
 
-                    # ── APPROACH → REALIGN → HOLD → PUSH ──────────────────────
-                    if not all_in_contact:
+                    # ── STAGE → APPROACH → REALIGN → HOLD → PUSH ──────────────
+                    if not all_staged:
+                        # ── STAGE — move to contact + outward approach offset ──
+                        stage_err = stage_pos - robot_pos2
+                        stage_dist = float(np.linalg.norm(stage_err))
+                        e_inward_heading = _wrap_angle(phi - robot_heading)
+
+                        if not stage_complete[i]:
+                            if stage_dist > stage_position_tol:
+                                # Translation subphase: face and drive to the
+                                # staging point.  Do not also chase inward
+                                # heading here; switching headings near the
+                                # target makes the robot orbit the stage point.
+                                stage_heading_target = float(np.arctan2(stage_err[1], stage_err[0]))
+                                e_stage_heading = _wrap_angle(stage_heading_target - robot_heading)
+                                v_r = float(np.clip(
+                                    kp_stage_position * stage_dist * np.cos(e_stage_heading),
+                                    -self.max_forward_speed,
+                                    self.max_forward_speed,
+                                ))
+                                # Avoid driving hard sideways when heading is poor.
+                                if abs(e_stage_heading) > np.deg2rad(75.0):
+                                    v_r = 0.0
+                                omega_r = float(np.clip(
+                                    kp_stage_heading * e_stage_heading
+                                    - kd_stage_heading * robot_omega_actual,
+                                    -max_stage_omega,
+                                    max_stage_omega,
+                                ))
+                            else:
+                                # Alignment subphase: hold the staging point and
+                                # rotate in place to face the contact normal.
+                                v_r = 0.0
+                                e_stage_heading = e_inward_heading
+                                omega_r = float(np.clip(
+                                    kp_stage_heading * e_inward_heading
+                                    - kd_stage_heading * robot_omega_actual,
+                                    -max_stage_omega,
+                                    max_stage_omega,
+                                ))
+
+                            if (
+                                stage_dist <= stage_position_tol
+                                and abs(e_inward_heading) <= stage_heading_tol_rad
+                            ):
+                                stage_complete[i] = True
+                                print(
+                                    f"[{name}] stage complete "
+                                    f"(dist={stage_dist:.3f} m, "
+                                    f"|heading|={abs(e_inward_heading):.3f} rad)"
+                                )
+                        else:
+                            v_r = 0.0
+                            omega_r = 0.0
+                            e_stage_heading = 0.0
+
+                        dbg = {
+                            "vr_ff": 0.0, "v_base": 0.0, "v_speed_p": 0.0,
+                            "v_pos_d": 0.0, "v_couple": 0.0, "v_comp": 0.0,
+                            "v_relax": 0.0,
+                            "omega_ff": 0.0, "omega_alpha_p": 0.0,
+                            "omega_alpha_d": 0.0, "omega_tangent": 0.0,
+                            "e_alpha": e_inward_heading, "e_pos": stage_dist,
+                            "e_normal": 0.0, "e_tangent": 0.0,
+                        }
+
+                        if debug_vel and k_ctrl % debug_every == 0:
+                            print(
+                                f"[{name} t={t:.2f}s STAGE] "
+                                f"dist={stage_dist:.3f} e_head={e_stage_heading:+.3f} "
+                                f"v_r={v_r:+.3f} omega_r={omega_r:+.3f}"
+                            )
+
+                    elif not all_in_contact:
                         # ── APPROACH — RobotAgent handles it ───────────────────
                         other_positions = [
                             np.asarray(self.robots[n2].get_state()[0], dtype=float)[:2]
@@ -1267,11 +2071,21 @@ class MultiPusherConstantTwistDiffdrive:
 
                     else:
                         # ── PUSH ──────────────────────────────────────────────
-                        if self.use_live_resolve:
-                            # ── Live re-solve: seg_ref rebuilt from current pose
-                            # every tick.  By default, keep the forward/backward
-                            # branch selected at realign-start to avoid pi-jump
-                            # discontinuities in vr_ff / alpha*.
+                        refresh_seg_ref_push = (
+                            self.use_live_resolve
+                            or (
+                                self.cross_track_integrate
+                                and (
+                                    (
+                                        csv_use
+                                        and csv_push_start_valid
+                                        and csv_segment_push_start_t is not None
+                                    )
+                                    or (not csv_use and ct_ref_valid)
+                                )
+                            )
+                        )
+                        if refresh_seg_ref_push:
                             locked_branch = None
                             if self.lock_live_branch and self._seg_refs[i] is not None:
                                 locked_branch = float(self._seg_refs[i].get("branch_sign", 1.0))
@@ -1282,19 +2096,37 @@ class MultiPusherConstantTwistDiffdrive:
                                 robot_heading=robot_heading,
                                 branch_sign=locked_branch,
                             )
-                            prev_live_ref = self._live_seg_refs[i] or self._seg_refs[i]
-                            seg_ref_push = _smooth_live_segment_reference(
-                                raw_seg_ref_push,
-                                prev_live_ref,
-                                live_ref_filter_alpha=self.live_ref_filter_alpha,
-                                live_alpha_filter_alpha=self.live_alpha_filter_alpha,
-                                live_alpha_hysteresis_rad=self.live_alpha_hysteresis_rad,
-                            )
-                            self._live_seg_refs[i] = seg_ref_push
+                            if self.use_live_resolve:
+                                prev_live_ref = self._live_seg_refs[i] or self._seg_refs[i]
+                                seg_ref_push = _smooth_live_segment_reference(
+                                    raw_seg_ref_push,
+                                    prev_live_ref,
+                                    live_ref_filter_alpha=self.live_ref_filter_alpha,
+                                    live_alpha_filter_alpha=self.live_alpha_filter_alpha,
+                                    live_alpha_hysteresis_rad=self.live_alpha_hysteresis_rad,
+                                )
+                                self._live_seg_refs[i] = seg_ref_push
+                            else:
+                                # Fixed-ref + cross-track-integrate: refresh vr_ff /
+                                # omega_ff / alpha* from current geometry every tick (no
+                                # low-pass).  One-time alpha* snap at first push tick
+                                # matches legacy fixed-ref entry alignment.
+                                if not alpha_snapped[i]:
+                                    alpha_snapped[i] = True
+                                    alpha_entry = float(np.arctan2(
+                                        np.sin(phi - robot_heading),
+                                        np.cos(phi - robot_heading),
+                                    ))
+                                    alpha_star_old = float(raw_seg_ref_push["alpha_star"])
+                                    raw_seg_ref_push["alpha_star"] = float(alpha_entry)
+                                    print(
+                                        f"[{name}] alpha* snapped (fixed-ref): "
+                                        f"{alpha_entry:.4f} rad "
+                                        f"(was {alpha_star_old:.4f}, "
+                                        f"delta={alpha_entry - alpha_star_old:+.4f} rad)"
+                                    )
+                                seg_ref_push = raw_seg_ref_push
                         else:
-                            # ── Fixed reference (original baseline): one-shot
-                            # solve from realign-start + single alpha* snap at
-                            # push entry.  Use this to isolate the PD effect.
                             if not alpha_snapped[i]:
                                 alpha_snapped[i] = True
                                 alpha_entry = float(np.arctan2(
@@ -1311,6 +2143,7 @@ class MultiPusherConstantTwistDiffdrive:
                                 )
                             seg_ref_push = self._seg_refs[i]
 
+                        push_segment_alpha_ref[i] = float(seg_ref_push["alpha_star"])
                         v_r, omega_r, dbg = _compute_phase7_command(
                             seg_ref=seg_ref_push,
                             robot_heading=robot_heading,
@@ -1428,9 +2261,12 @@ class MultiPusherConstantTwistDiffdrive:
                     robot.command_velocity(np.array([v_r, omega_r]))
 
                     # ── History ────────────────────────────────────────────────
-                    alpha_star_i = (
-                        self._seg_refs[i]["alpha_star"] if self._seg_refs[i] is not None else 0.0
-                    )
+                    if push_started and push_segment_alpha_ref[i] is not None:
+                        alpha_star_i = float(push_segment_alpha_ref[i])
+                    elif self._seg_refs[i] is not None:
+                        alpha_star_i = float(self._seg_refs[i]["alpha_star"])
+                    else:
+                        alpha_star_i = 0.0
                     e_alpha_hist = float(np.arctan2(
                         np.sin(current_alpha - alpha_star_i),
                         np.cos(current_alpha - alpha_star_i),
@@ -1443,6 +2279,8 @@ class MultiPusherConstantTwistDiffdrive:
                     hist.robot_angular_velocities.append(float(robot_omega_actual))
                     hist.intended_positions.append(intended_pos.copy())
                     hist.position_errors.append(position_error.copy())
+                    hist.couple_target_positions.append(data["couple_target_pos"].copy())
+                    hist.couple_position_errors.append(data["couple_position_error"].copy())
                     hist.intended_contact_point_velocities.append(v_cp_ref_w.copy())
                     hist.contact_point_velocities.append(cp_velocity.copy())
                     hist.robot_contact_point_velocities.append(robot_cp_velocity.copy())
@@ -1472,12 +2310,20 @@ class MultiPusherConstantTwistDiffdrive:
                 self.object_history.orientations.append(float(obj_theta))
                 self.object_history.velocities.append(obj_vel.copy())
                 self.object_history.angular_velocities.append(float(obj_omega))
+                self.object_history.desired_v_refs_body.append(self.v_ref_body.copy())
+                self.object_history.desired_omegas.append(float(self.omega_ref))
 
             pyb.stepSimulation()
             if gui:
                 time.sleep(TIMESTEP * 0.3)
             t += TIMESTEP
             step_count += 1
+            if csv_use and csv_exit_after_final:
+                print(
+                    f"[segment-csv] simulation stopped early at t={t:.2f}s "
+                    f"(--duration {duration:.2f}s was upper bound)."
+                )
+                break
 
         # ── Finalize ──────────────────────────────────────────────────────────
         if video_log_id >= 0 and video_path is not None:
@@ -1492,10 +2338,24 @@ class MultiPusherConstantTwistDiffdrive:
             else:
                 mean_pos_errs.append(float("nan"))
 
+        if save_dir is not None and csv_segment_end_log:
+            log_path = Path(save_dir) / "csv_segment_end_log.json"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "w") as f:
+                json.dump(csv_segment_end_log, f, indent=2)
+            print(f"[segment-csv] wrote per-segment pose error log: {log_path}")
+
+        self._csv_segment_plot_log = list(csv_segment_end_log) if csv_use else []
+
         return {
             "push_started_at_s": t_push_start,
+            "push_start_times_s": push_start_times,
+            "transition_enabled": bool(test_transition),
+            "transition_done": bool(transition_done),
             "push_duration_s": push_duration,
             "mean_position_errors_m": mean_pos_errs,
+            "csv_exit_after_final": bool(csv_exit_after_final),
+            "csv_segment_end_log": list(csv_segment_end_log),
         }
 
     # ── Plotting ──────────────────────────────────────────────────────────────
@@ -1514,18 +2374,121 @@ class MultiPusherConstantTwistDiffdrive:
 
             fig_traj = plt.figure(figsize=(18, 10))
             gs = GridSpec(2, 3, figure=fig_traj, hspace=0.35, wspace=0.35)
-            fig_traj.suptitle(
-                "Multi-pusher diff-drive: trajectories\n"
-                f"v_ref=({self.v_ref_body[0]:+.3f}, {self.v_ref_body[1]:+.3f}) m/s  "
-                f"ω_ref={self.omega_ref:+.3f} rad/s",
-                fontsize=12,
-            )
+            title_lines = [
+                "Multi-pusher diff-drive: trajectories",
+                (
+                    f"v_ref=({self.v_ref_body[0]:+.3f}, {self.v_ref_body[1]:+.3f}) m/s  "
+                    f"ω_ref={self.omega_ref:+.3f} rad/s"
+                ),
+            ]
+            if self.csv_waypoints_world is not None:
+                title_lines.append(
+                    "CSV: violet = waypoint polyline + θ; cyan = constant-twist integrated from "
+                    "**measured push-start pose** for **actual push duration** (matches reference)"
+                )
+            fig_traj.suptitle("\n".join(title_lines), fontsize=12)
 
             # Object CoM trajectory (spans left 2 columns of top row)
             ax_obj = fig_traj.add_subplot(gs[0, :2])
+            wp_arrow_len = 0.12
+            wxy = self.csv_waypoints_world
+            if wxy is not None and wxy.size > 0:
+                wxy = np.asarray(wxy, dtype=float).reshape(-1, 3)
+                segs = self.csv_segments
+                if wxy.shape[0] >= 2:
+                    xy_span = max(
+                        float(np.ptp(wxy[:, 0])),
+                        float(np.ptp(wxy[:, 1])),
+                        0.2,
+                    )
+                    wp_arrow_len = float(np.clip(0.12 * xy_span, 0.05, 0.22))
+                    plot_log = getattr(self, "_csv_segment_plot_log", None) or []
+                    if plot_log:
+                        nominal_parts_pl: List[np.ndarray] = []
+                        for ent in plot_log:
+                            p0 = np.asarray(ent["push_start_xy_m"], dtype=float).reshape(2)
+                            th0 = float(ent["push_start_theta_rad"])
+                            dur = float(ent["push_duration_s"])
+                            npts = int(max(24, min(300, 40 + int(dur * 60))))
+                            nominal_parts_pl.append(
+                                _sample_constant_twist_world_com_path(
+                                    p0,
+                                    th0,
+                                    np.asarray(ent["v_body"], dtype=float).reshape(2),
+                                    float(ent["omega"]),
+                                    dur,
+                                    n=npts,
+                                )
+                            )
+                        nominal_xy = np.vstack(
+                            [nominal_parts_pl[0]]
+                            + [part[1:] for part in nominal_parts_pl[1:]]
+                        )
+                        ax_obj.plot(
+                            nominal_xy[:, 0],
+                            nominal_xy[:, 1],
+                            ":",
+                            color="tab:cyan",
+                            lw=2.0,
+                            alpha=0.9,
+                            label="Ref twist (push start + duration)",
+                            zorder=2,
+                        )
+                    elif segs is not None and len(segs) == wxy.shape[0] - 1:
+                        nominal_parts: List[np.ndarray] = []
+                        for si, seg in enumerate(segs):
+                            p0 = wxy[si, :2]
+                            th0 = float(wxy[si, 2])
+                            nominal_parts.append(
+                                _sample_constant_twist_world_com_path(
+                                    p0,
+                                    th0,
+                                    seg["v_body"],
+                                    float(seg["omega"]),
+                                    float(seg["T"]),
+                                    n=120,
+                                )
+                            )
+                        nominal_xy = np.vstack(
+                            [nominal_parts[0]]
+                            + [part[1:] for part in nominal_parts[1:]]
+                        )
+                        ax_obj.plot(
+                            nominal_xy[:, 0],
+                            nominal_xy[:, 1],
+                            ":",
+                            color="tab:cyan",
+                            lw=2.0,
+                            alpha=0.9,
+                            label="Nominal SE(2) from CSV rows (no run log)",
+                            zorder=2,
+                        )
+                    ax_obj.plot(
+                        wxy[:, 0],
+                        wxy[:, 1],
+                        "--",
+                        color="tab:purple",
+                        lw=1.35,
+                        alpha=0.88,
+                        label="CSV polyline (chords)",
+                        zorder=2,
+                    )
+                ax_obj.scatter(
+                    wxy[:, 0],
+                    wxy[:, 1],
+                    s=52,
+                    c="white",
+                    edgecolors="darkviolet",
+                    linewidths=1.15,
+                    zorder=8,
+                    marker="D",
+                    label="CSV waypoints",
+                )
+
             ax_obj.plot(
                 obj_pos_arr[:, 0], obj_pos_arr[:, 1],
                 "k-", lw=2.0, label="Object CoM", alpha=0.85,
+                zorder=3,
             )
             # Overlay each robot path lightly on the same axes
             colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
@@ -1536,6 +2499,7 @@ class MultiPusherConstantTwistDiffdrive:
                         rp[:, 0], rp[:, 1],
                         "-", lw=1.0, alpha=0.5, color=colors[i % len(colors)],
                         label=name,
+                        zorder=3,
                     )
             # Heading arrows along object trajectory
             arrow_step = max(1, len(obj_pos_arr) // 20)
@@ -1547,12 +2511,37 @@ class MultiPusherConstantTwistDiffdrive:
                     head_width=0.015, head_length=0.010,
                     fc="red", ec="red", alpha=0.55, zorder=5,
                 )
+
+            if wxy is not None and wxy.size > 0:
+                wxy = np.asarray(wxy, dtype=float).reshape(-1, 3)
+                for j in range(wxy.shape[0]):
+                    ax_obj.annotate(
+                        "",
+                        xy=(
+                            float(wxy[j, 0]) + wp_arrow_len * np.cos(float(wxy[j, 2])),
+                            float(wxy[j, 1]) + wp_arrow_len * np.sin(float(wxy[j, 2])),
+                        ),
+                        xytext=(float(wxy[j, 0]), float(wxy[j, 1])),
+                        arrowprops=dict(
+                            arrowstyle="->",
+                            color="darkviolet",
+                            lw=2.0,
+                            alpha=0.95,
+                            shrinkA=0,
+                            shrinkB=0,
+                        ),
+                        zorder=9,
+                    )
+
             if len(obj_pos_arr):
                 ax_obj.plot(*obj_pos_arr[0], "go", ms=8, label="Start", zorder=6)
                 ax_obj.plot(*obj_pos_arr[-1], "rs", ms=8, label="End", zorder=6)
             ax_obj.set_xlabel("X (m)")
             ax_obj.set_ylabel("Y (m)")
-            ax_obj.set_title("Object CoM trajectory (+ robot paths)", fontsize=11)
+            ax_obj.set_title(
+                "Object CoM trajectory (+ robot paths; CSV refs if enabled)",
+                fontsize=11,
+            )
             ax_obj.axis("equal")
             ax_obj.grid(True, alpha=0.3)
             ax_obj.legend(fontsize=8, loc="upper right")
@@ -1617,7 +2606,14 @@ class MultiPusherConstantTwistDiffdrive:
             fontsize=10,
         )
 
-        col_titles = ["Position error (cm)", "Contact force (N)", "Alpha error (deg)", "v_r cmd (m/s)"]
+        push_start_idx = _plot_push_start_idx(
+            self.robot_histories[0].times if self.robot_histories else [],
+            self._t_push_start,
+        )
+        force_col_title = "Contact force (N)"
+        if push_start_idx > 0:
+            force_col_title += " [push phase, clipped]"
+        col_titles = ["Position error (cm)", force_col_title, "Alpha error (deg)", "v_r cmd (m/s)"]
         for j, title in enumerate(col_titles):
             axes[0][j].set_title(title, fontsize=9)
 
@@ -1626,18 +2622,27 @@ class MultiPusherConstantTwistDiffdrive:
                 continue
             t_arr = np.array(hist.times)
             pos_err_cm = np.array([np.linalg.norm(e) for e in hist.position_errors]) * 100.0
-            contact_f = np.array(hist.contact_forces)
+            if hist.couple_position_errors:
+                couple_err_cm = np.array([np.linalg.norm(e) for e in hist.couple_position_errors]) * 100.0
+            else:
+                couple_err_cm = pos_err_cm
+            contact_f_raw = np.asarray(hist.contact_forces, dtype=float)[push_start_idx:]
+            t_force = t_arr[push_start_idx:]
+            contact_f = _clip_series_percentile(contact_f_raw)
             alpha_err_deg = np.degrees(np.array(hist.alpha_errors))
             v_r_arr = np.array(hist.v_r_history)
 
-            axes[i][0].plot(t_arr, pos_err_cm, lw=1.0)
+            axes[i][0].plot(t_arr, pos_err_cm, lw=1.0, label="contact target")
+            axes[i][0].plot(t_arr, couple_err_cm, lw=1.0, ls="--", label="couple/inflated target")
             axes[i][0].set_ylabel(f"{name}\n(cm)", fontsize=8)
+            axes[i][0].legend(fontsize=7, loc="upper right")
             axes[i][0].grid(True, alpha=0.3)
 
-            axes[i][1].plot(t_arr, contact_f, color="tab:red", lw=1.0)
+            axes[i][1].plot(t_force, contact_f, color="tab:red", lw=1.0)
             axes[i][1].axhline(0.5, ls="--", color="gray", lw=0.8, label="0.5 N gate")
             axes[i][1].set_ylabel("(N)", fontsize=8)
             axes[i][1].grid(True, alpha=0.3)
+            _set_pruned_plot_ylim(axes[i][1], [contact_f], q_low=5.0, q_high=95.0)
 
             axes[i][2].plot(t_arr, alpha_err_deg, color="tab:green", lw=1.0)
             axes[i][2].axhline(0.0, ls="--", color="gray", lw=0.8)
@@ -1682,36 +2687,10 @@ class MultiPusherConstantTwistDiffdrive:
             f"ω_r = ω_ff + kp_α·e_α + kd_α·ė_α + gate·(k_t·e_t + kd_t·ė_t)/R",
             fontsize=9,
         )
-        # Only plot from push-start to avoid the approach/realign outliers.
-        push_start_idx = 0
-        if self.robot_histories[0].times and self._t_push_start is not None:
-            t_arr_full = np.array(self.robot_histories[0].times)
-            idx = np.searchsorted(t_arr_full, self._t_push_start)
-            push_start_idx = max(0, int(idx))
-
-        def _set_pruned_ylim(ax, series_list, q_low: float = 2.0, q_high: float = 98.0) -> None:
-            """Use percentile y-limits so rare spikes do not hide steady behavior."""
-            finite_chunks = []
-            for series in series_list:
-                arr = np.asarray(series, dtype=float).reshape(-1)
-                arr = arr[np.isfinite(arr)]
-                if arr.size:
-                    finite_chunks.append(arr)
-            if not finite_chunks:
-                return
-            vals = np.concatenate(finite_chunks)
-            if vals.size < 4:
-                return
-            lo, hi = np.percentile(vals, [q_low, q_high])
-            lo = min(float(lo), 0.0)
-            hi = max(float(hi), 0.0)
-            span = hi - lo
-            if span <= 1e-9:
-                pad = max(abs(hi), 1.0) * 0.05
-                ax.set_ylim(lo - pad, hi + pad)
-                return
-            margin = 0.15 * span
-            ax.set_ylim(lo - margin, hi + margin)
+        push_start_idx = _plot_push_start_idx(
+            self.robot_histories[0].times if self.robot_histories else [],
+            self._t_push_start,
+        )
 
         for i, (name, hist) in enumerate(zip(names, self.robot_histories)):
             if not hist.times:
@@ -1736,7 +2715,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_v.set_ylabel(f"{name}\n(m/s)", fontsize=8)
             ax_v.legend(fontsize=7, loc="upper right")
             ax_v.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_v, [
+            _set_pruned_plot_ylim(ax_v, [
                 _slice(hist.v_ff_history),
                 _slice(hist.v_base_history),
                 _slice(hist.v_speed_p_history),
@@ -1760,7 +2739,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_w.set_ylabel("(rad/s)", fontsize=8)
             ax_w.legend(fontsize=7, loc="upper right")
             ax_w.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_w, [
+            _set_pruned_plot_ylim(ax_w, [
                 _slice(hist.omega_ff_history),
                 _slice(hist.omega_alpha_p_history),
                 _slice(hist.omega_alpha_d_history),
@@ -1792,7 +2771,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_match.set_ylabel("(m/s)", fontsize=8)
             ax_match.legend(fontsize=6, loc="upper right", ncol=2)
             ax_match.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_match, [
+            _set_pruned_plot_ylim(ax_match, [
                 robot_v[:, 0] if len(robot_v) else [],
                 robot_v[:, 1] if len(robot_v) else [],
                 cp_ref_v[:, 0] if len(cp_ref_v) else [],
@@ -1820,7 +2799,7 @@ class MultiPusherConstantTwistDiffdrive:
             ax_omega_match.set_ylabel("(rad/s)", fontsize=8)
             ax_omega_match.legend(fontsize=7, loc="upper right")
             ax_omega_match.grid(True, alpha=0.3)
-            _set_pruned_ylim(ax_omega_match, [intended_omega, object_omega, robot_omega, omega_cmd])
+            _set_pruned_plot_ylim(ax_omega_match, [intended_omega, object_omega, robot_omega, omega_cmd])
             if i == 0:
                 ax_omega_match.set_title("omega match (pruned y)", fontsize=9)
 
@@ -1875,58 +2854,82 @@ class MultiPusherConstantTwistDiffdrive:
         v_arr = np.array(self.object_history.velocities)         # (N, 2) world-frame
         om_arr = np.array(self.object_history.angular_velocities)
         theta_arr = np.array(self.object_history.orientations)
+        if self.object_history.desired_v_refs_body:
+            v_ref_body_arr = np.array(self.object_history.desired_v_refs_body)
+        else:
+            v_ref_body_arr = np.repeat(self.v_ref_body.reshape(1, 2), len(t_arr), axis=0)
+        if self.object_history.desired_omegas:
+            omega_ref_arr = np.array(self.object_history.desired_omegas)
+        else:
+            omega_ref_arr = np.repeat(float(self.omega_ref), len(t_arr))
 
         # Rotate v_ref_body into world frame at each tick for the reference line.
         c_t = np.cos(theta_arr)
         s_t = np.sin(theta_arr)
-        vx_ref = c_t * self.v_ref_body[0] - s_t * self.v_ref_body[1]
-        vy_ref = s_t * self.v_ref_body[0] + c_t * self.v_ref_body[1]
+        vx_ref = c_t * v_ref_body_arr[:, 0] - s_t * v_ref_body_arr[:, 1]
+        vy_ref = s_t * v_ref_body_arr[:, 0] + c_t * v_ref_body_arr[:, 1]
 
         # Rotate actual world velocity into the object body frame.  The reference
         # is constant in this local frame, so drift is easier to see here.
         vx_body = c_t * v_arr[:, 0] + s_t * v_arr[:, 1]
         vy_body = -s_t * v_arr[:, 0] + c_t * v_arr[:, 1]
         speed_body = np.linalg.norm(np.column_stack([vx_body, vy_body]), axis=1)
-        speed_ref = float(np.linalg.norm(self.v_ref_body))
+        speed_ref = np.linalg.norm(v_ref_body_arr, axis=1)
 
         fig2, axes2 = plt.subplots(2, 3, figsize=(14, 6))
-        fig2.suptitle("Object velocity: actual vs desired reference", fontsize=10)
+        fig2.suptitle("Object velocity: actual vs desired reference (pruned y-limits)", fontsize=10)
 
         axes2[0][0].plot(t_arr, v_arr[:, 0], lw=1.0, label="actual vx")
         axes2[0][0].plot(t_arr, vx_ref, "--", lw=1.0, label="ref vx")
         axes2[0][0].set_title("vx (world)")
         axes2[0][0].legend(fontsize=7)
         axes2[0][0].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][0], [v_arr[:, 0], vx_ref], q_low=1.0, q_high=99.0)
 
         axes2[0][1].plot(t_arr, v_arr[:, 1], lw=1.0, label="actual vy")
         axes2[0][1].plot(t_arr, vy_ref, "--", lw=1.0, label="ref vy")
         axes2[0][1].set_title("vy (world)")
         axes2[0][1].legend(fontsize=7)
         axes2[0][1].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][1], [v_arr[:, 1], vy_ref], q_low=1.0, q_high=99.0)
 
         axes2[0][2].plot(t_arr, om_arr, lw=1.0, label="actual omega")
-        axes2[0][2].axhline(self.omega_ref, ls="--", lw=1.0, label=f"ref {self.omega_ref:+.3f}")
+        axes2[0][2].plot(t_arr, omega_ref_arr, "--", lw=1.0, label="ref omega")
         axes2[0][2].set_title("omega (rad/s)")
         axes2[0][2].legend(fontsize=7)
         axes2[0][2].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[0][2], [om_arr, omega_ref_arr], q_low=1.0, q_high=99.0)
 
         axes2[1][0].plot(t_arr, vx_body, lw=1.0, label="actual vx body")
-        axes2[1][0].axhline(self.v_ref_body[0], ls="--", lw=1.0, label=f"ref {self.v_ref_body[0]:+.3f}")
+        axes2[1][0].plot(t_arr, v_ref_body_arr[:, 0], "--", lw=1.0, label="ref vx body")
         axes2[1][0].set_title("vx (object body)")
         axes2[1][0].legend(fontsize=7)
         axes2[1][0].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(
+            axes2[1][0],
+            [vx_body, v_ref_body_arr[:, 0]],
+            q_low=1.0,
+            q_high=99.0,
+        )
 
         axes2[1][1].plot(t_arr, vy_body, lw=1.0, label="actual vy body")
-        axes2[1][1].axhline(self.v_ref_body[1], ls="--", lw=1.0, label=f"ref {self.v_ref_body[1]:+.3f}")
+        axes2[1][1].plot(t_arr, v_ref_body_arr[:, 1], "--", lw=1.0, label="ref vy body")
         axes2[1][1].set_title("vy (object body)")
         axes2[1][1].legend(fontsize=7)
         axes2[1][1].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(
+            axes2[1][1],
+            [vy_body, v_ref_body_arr[:, 1]],
+            q_low=1.0,
+            q_high=99.0,
+        )
 
         axes2[1][2].plot(t_arr, speed_body, lw=1.0, label="actual |v_body|")
-        axes2[1][2].axhline(speed_ref, ls="--", lw=1.0, label=f"ref {speed_ref:.3f}")
+        axes2[1][2].plot(t_arr, speed_ref, "--", lw=1.0, label="ref |v_body|")
         axes2[1][2].set_title("speed magnitude (body)")
         axes2[1][2].legend(fontsize=7)
         axes2[1][2].grid(True, alpha=0.3)
+        _set_pruned_plot_ylim(axes2[1][2], [speed_body, speed_ref], q_low=1.0, q_high=99.0)
 
         plt.tight_layout()
         if save_dir:
@@ -1992,6 +2995,150 @@ def main() -> None:
         "--omega-ref", type=float, default=0.0,
         help="Desired object angular velocity omega (rad/s). Default: 0.0",
     )
+    parser.add_argument(
+        "--twist-scale",
+        type=float,
+        default=1.0,
+        metavar="K",
+        help=(
+            "Without --segment-csv: multiply --v-ref-x, --v-ref-y, and --omega-ref after parsing "
+            "(same motion direction; K× twist magnitude; ideal arc time scales ~1/K). "
+            "Ignored with --segment-csv—use --segment-v-speed instead."
+        ),
+    )
+    parser.add_argument(
+        "--segment-csv",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional CSV of world poses (columns x,y,theta; optional t ignored). "
+            "Each leg commands a constant body twist toward the next waypoint. "
+            "open-loop solver T_nom per leg (default). Optional --csv-segment-pose-stop "
+            "enables waypoint/timeout completion (experimental). "
+            "Re-solving each leg from measured pose is **on by default**; use "
+            "--no-csv-replan-each-push to disable. "
+            "Forces --test-transition; overrides --v-ref-x/y and --omega-ref for segment 0."
+        ),
+    )
+    parser.add_argument(
+        "--segment-v-speed",
+        type=float,
+        default=0.1,
+        metavar="M/S",
+        help=(
+            "Translation speed argument to solve_constant_body_twist_from_SE2 when "
+            "using --segment-csv. Default 0.1 matches test_magnum_diffdrive_control."
+        ),
+    )
+    parser.add_argument(
+        "--csv-replan-each-push",
+        action="store_true",
+        help=(
+            "Legacy no-op with --segment-csv: replanning is **on by default** for CSV runs. "
+            "Use --no-csv-replan-each-push to disable re-solving each leg from measured pose."
+        ),
+    )
+    parser.add_argument(
+        "--no-csv-replan-each-push",
+        action="store_true",
+        help=(
+            "With --segment-csv: disable default per-leg (and leg-0 pre-push) re-solve from "
+            "measured pose."
+        ),
+    )
+    parser.add_argument(
+        "--cross-track-integrate",
+        action="store_true",
+        dest="cross_track_integrate",
+        help=(
+            "Screw cross-track outer loop: add clipped k·e_d (m) to commanded ω vs the "
+            "nominal constant body-twist path from each push-start pose. With --segment-csv "
+            "uses per-segment solver T; plain runs use T = --duration. Under --fixed-ref, "
+            "feed-forward is re-solved every tick (no VR/α low-pass)."
+        ),
+    )
+    parser.add_argument(
+        "--cross-track-k",
+        type=float,
+        default=4.0,
+        dest="cross_track_k",
+        metavar="RAD/S/M",
+        help="Gain from signed cross-track error (m) to ω trim. Default: 4.0",
+    )
+    parser.add_argument(
+        "--cross-track-omega-max",
+        type=float,
+        default=0.25,
+        dest="cross_track_omega_max",
+        metavar="RAD/S",
+        help="Symmetric cap on ω trim from cross-track. Default: 0.25",
+    )
+    parser.add_argument(
+        "--csv-segment-pose-stop",
+        action="store_true",
+        help=(
+            "With --segment-csv: end each leg on pose proximity (+ optional vel gate) with "
+            "timeout (experimental). Default is open-loop T_nom only."
+        ),
+    )
+    parser.add_argument(
+        "--csv-segment-pos-tol",
+        type=float,
+        default=0.045,
+        metavar="M",
+        help="With --segment-csv (pose mode): position error gate vs waypoint xy. Default: 0.045",
+    )
+    parser.add_argument(
+        "--csv-segment-yaw-tol-deg",
+        type=float,
+        default=10.0,
+        metavar="DEG",
+        help="With --segment-csv (pose mode): |Δθ| gate vs waypoint. Default: 10",
+    )
+    parser.add_argument(
+        "--csv-segment-vel-tol",
+        type=float,
+        default=0.03,
+        metavar="M/S",
+        help="With --segment-csv: max |v| when pose gate also requires low speed. Default: 0.03",
+    )
+    parser.add_argument(
+        "--csv-segment-omega-tol",
+        type=float,
+        default=0.15,
+        metavar="RAD/S",
+        help="With --segment-csv: max |ω| when pose gate also requires low speed. Default: 0.15",
+    )
+    parser.add_argument(
+        "--csv-segment-skip-vel-gate",
+        action="store_true",
+        help="With --segment-csv (pose mode): accept waypoint pose even if object still moving.",
+    )
+    parser.add_argument(
+        "--csv-segment-timeout-factor",
+        type=float,
+        default=6.0,
+        metavar="K",
+        help="With --segment-csv (pose mode): max push time ≥ K * T_nom per leg. Default: 6",
+    )
+    parser.add_argument(
+        "--csv-segment-timeout-min-s",
+        type=float,
+        default=5.0,
+        metavar="S",
+        help="With --segment-csv (pose mode): min cap on max push time per leg. Default: 5",
+    )
+    parser.add_argument(
+        "--csv-segment-time-scale",
+        type=float,
+        default=1.0,
+        metavar="K",
+        help=(
+            "With --segment-csv and T_nom open-loop legs: end each push after K*T_solver "
+            "(default 1). Use K>1 if the object lags the ideal constant-twist distance."
+        ),
+    )
     parser.add_argument("--duration", type=float, default=20.0, help="Total sim duration (s)")
     parser.add_argument(
         "--approach-distance", type=float, default=APPROACH_DISTANCE,
@@ -2009,8 +3156,34 @@ def main() -> None:
         help="Print every K control ticks. Default: 50",
     )
     parser.add_argument("--ground-friction", type=float, default=DEFAULT_GROUND_FRICTION)
+    parser.add_argument(
+        "--object-friction",
+        type=float,
+        default=DEFAULT_OBJECT_FRICTION,
+        help=(
+            "Object lateral friction (PyBullet). Combined with bumper mu for "
+            "bumper-object contacts. Default: %(default)s"
+        ),
+    )
+    parser.add_argument(
+        "--bumper-contact-mu",
+        type=float,
+        default=0.01,
+        help=(
+            "Robot bumper-object lateral friction. Default: %(default)s (very low; "
+            "raise toward object-friction to test cone/slip sensitivity)."
+        ),
+    )
     parser.add_argument("--wheel-friction", type=float, default=DEFAULT_WHEEL_LATERAL_FRICTION)
     parser.add_argument("--caster-friction", type=float, default=DEFAULT_CASTER_LATERAL_FRICTION)
+    parser.add_argument(
+        "--no-planar-cheat",
+        action="store_true",
+        help=(
+            "Drive diff-drive via wheel motors instead of planar-joint velocity "
+            "cheat (slower; friction at wheels/bumper matters more)."
+        ),
+    )
     parser.add_argument("--kp-alpha", type=float, default=0.5)
     parser.add_argument(
         "--kd-alpha", type=float, default=0.0,
@@ -2027,6 +3200,65 @@ def main() -> None:
             "realign-start + alpha* snap at push-entry).  Combine with "
             "--kd-alpha to isolate the PD effect independently of live-resolve. "
             "Without this flag the live re-solve is always active (default)."
+        ),
+    )
+    parser.add_argument(
+        "--test-transition",
+        action="store_true",
+        help=(
+            "Special transition test: push the requested object twist for half "
+            "the duration, stop, switch to perpendicular body-frame translation "
+            "(-vy, vx) and reversed omega, then rerun approach/realign/push. "
+            "With --segment-csv this half-duration swap is disabled; CSV segments "
+            "drive twist changes with the same barrier resets between segments."
+        ),
+    )
+    parser.add_argument(
+        "--transition-teleport-robots",
+        action="store_true",
+        help=(
+            "Simulation-only transition cheat: at the twist switch, reset each "
+            "robot to the current contact point plus the original normal approach "
+            "offset before rerunning approach/realign."
+        ),
+    )
+    parser.add_argument(
+        "--stage-position-tol", type=float, default=0.02,
+        help="Tolerance (m) for the pre-approach staging pose. Default: 0.02",
+    )
+    parser.add_argument(
+        "--stage-heading-tol-deg", type=float, default=5.0,
+        help="Heading tolerance (deg) for the pre-approach staging pose. Default: 5.0",
+    )
+    parser.add_argument(
+        "--kp-stage-position", type=float, default=1.5,
+        help="Diff-drive staging position gain before contact approach. Default: 1.5",
+    )
+    parser.add_argument(
+        "--kp-stage-heading", type=float, default=3.0,
+        help="Diff-drive staging heading gain before contact approach. Default: 3.0",
+    )
+    parser.add_argument(
+        "--kd-stage-heading", type=float, default=0.8,
+        help="Angular damping gain for staging heading control. Default: 0.8",
+    )
+    parser.add_argument(
+        "--max-stage-omega", type=float, default=0.4,
+        help="Stage-only angular speed cap (rad/s) to avoid transition spin chatter. Default: 0.4",
+    )
+    parser.add_argument(
+        "--disable-contact-geometry-update",
+        action="store_true",
+        help=(
+            "Disable bounded contact-point refresh at the all-contact -> realign "
+            "barrier. By default, realign uses the actual landed contact point."
+        ),
+    )
+    parser.add_argument(
+        "--contact-update-max-distance", type=float, default=0.06,
+        help=(
+            "Maximum boundary-distance shift (m) when refreshing landed contact "
+            "geometry before realign. Default: 0.06"
         ),
     )
     parser.add_argument(
@@ -2073,20 +3305,20 @@ def main() -> None:
         help="Hard cap (rad/s) on tangential-slip omega correction. Default: 0.4",
     )
     parser.add_argument(
-        "--obstructing-pusher-speed-scale", type=float, default=1.1,
+        "--obstructing-pusher-speed-scale", type=float, default=1.0,
         help=(
             "Diagnostic cheat applied only during PUSH: multiply the signed "
             "forward speed of precomputed obstructing pushers by this factor. "
             "Obstructing pushers are contacts with normal_ratio < "
-            "-abs(--obstructing-passive-ratio). Default: 1.1"
+            "-abs(--obstructing-passive-ratio). Default: 1.0"
         ),
     )
     parser.add_argument(
-        "--obstructing-passive-ratio", type=float, default=0.25,
+        "--obstructing-passive-ratio", type=float, default=0.1,
         help=(
             "Normalized normal-ratio threshold for obstructing pusher detection. "
             "normal_ratio = cos(true_alpha); robots below -abs(value) are scaled. "
-            "Default: 0.25"
+            "Default: 0.1"
         ),
     )
     parser.add_argument(
@@ -2303,6 +3535,76 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    csv_replan_effective = bool(args.segment_csv) and (not bool(args.no_csv_replan_each_push))
+    if (
+        bool(args.segment_csv)
+        and bool(args.no_csv_replan_each_push)
+        and bool(args.csv_replan_each_push)
+    ):
+        print(
+            "[segment-csv] --no-csv-replan-each-push overrides legacy --csv-replan-each-push."
+        )
+
+    csv_segments: Optional[List[Dict[str, Any]]] = None
+    csv_waypoints_world: Optional[np.ndarray] = None
+    if args.segment_csv:
+        csv_path = Path(args.segment_csv).expanduser().resolve()
+        csv_segments, csv_waypoints_world = _load_csv_twist_segments(
+            csv_path, float(args.segment_v_speed)
+        )
+        args.test_transition = True
+        vb0 = csv_segments[0]["v_body"]
+        args.v_ref_x = float(vb0[0])
+        args.v_ref_y = float(vb0[1])
+        args.omega_ref = float(csv_segments[0]["omega"])
+        print(
+            f"\n[segment-csv] loaded {len(csv_segments)} segment(s) from {csv_path}\n"
+            f"  segment-v-speed={float(args.segment_v_speed):.4f} m/s  "
+            f"segment 0: v=({args.v_ref_x:+.4f}, {args.v_ref_y:+.4f}) m/s, "
+            f"omega={args.omega_ref:+.4f} rad/s, T0={float(csv_segments[0]['T']):.4f}s\n"
+            f"  (--test-transition forced: barrier resets between CSV segments)\n"
+            "  Each leg ends after solver T_nom by default; use --csv-segment-pose-stop for "
+            "experimental pose/timeout completion. See csv_segment_end_log.json.\n"
+            f"  csv-replan-each-push: {csv_replan_effective}  "
+            f"(use --no-csv-replan-each-push to disable)\n"
+        )
+        max_chord = 0.0
+        max_tsol = max(float(s["T"]) for s in csv_segments)
+        wp = np.asarray(csv_waypoints_world, dtype=float).reshape(-1, 3)
+        for ri in range(wp.shape[0] - 1):
+            max_chord = max(
+                max_chord,
+                float(np.linalg.norm(wp[ri + 1, :2] - wp[ri, :2])),
+            )
+        if max_chord > 1.5 or max_tsol > 25.0:
+            print(
+                "[segment-csv] Long path: open-loop T_nom assumes θ follows the constant-twist "
+                "primitive. Body-frame speed can match while **world** motion misses if ω drifts "
+                f"(max chord ≈ {max_chord:.2f} m, max T_nom ≈ {max_tsol:.1f} s). "
+                "Try --kp-object-omega 0.5–2 --max-object-omega-correction 0.2, "
+                "--max-object-v-correction 0.06–0.1, and/or --csv-segment-time-scale 1.2–1.8, "
+                "or use a shorter CSV for diagnosis.\n"
+            )
+
+    if args.segment_csv and abs(float(args.twist_scale) - 1.0) > 1e-12:
+        print(
+            "[twist-scale] ignored with --segment-csv (change --segment-v-speed to scale CSV primitives).\n"
+        )
+    elif not args.segment_csv:
+        k = float(args.twist_scale)
+        if k <= 0.0:
+            raise ValueError("--twist-scale must be > 0")
+        if abs(k - 1.0) > 1e-12:
+            args.v_ref_x = float(args.v_ref_x) * k
+            args.v_ref_y = float(args.v_ref_y) * k
+            args.omega_ref = float(args.omega_ref) * k
+            print(
+                f"\n[twist-scale] K={k:.6g} → "
+                f"v_ref_body=({args.v_ref_x:+.6f}, {args.v_ref_y:+.6f}) m/s, "
+                f"ω_ref={args.omega_ref:+.6f} rad/s\n"
+                "  Ideal rigid-body: same SE(2) arc, ~K× faster (shorter --duration may suffice).\n"
+            )
+
     selected_name = args.object
 
     # ── Magnum Four: solve / load optimal 4-contact-point configuration ────────
@@ -2350,7 +3652,7 @@ def main() -> None:
             position=(0.0, 0.0, DEFAULT_OBJECT_HEIGHT),
             orientation=0.0,
             mass=5.0,
-            lateral_friction=DEFAULT_OBJECT_FRICTION,
+            lateral_friction=float(args.object_friction),
             blind_test=True,
         )
         pyb.disconnect()
@@ -2402,8 +3704,11 @@ def main() -> None:
         omega_ref=args.omega_ref,
         object_name=selected_name,
         approach_distance=args.approach_distance,
+        object_lateral_friction=float(args.object_friction),
+        bumper_contact_mu=float(args.bumper_contact_mu),
         wheel_lateral_friction=float(args.wheel_friction),
         caster_lateral_friction=float(args.caster_friction),
+        use_planar_cheat_control=not args.no_planar_cheat,
         kp_alpha=args.kp_alpha,
         kd_alpha=args.kd_alpha,
         kp_position=args.kp_position,
@@ -2444,6 +3749,13 @@ def main() -> None:
         obstructing_inflate_gap=args.obstructing_inflate_gap,
         couple_obstructing_only=not args.couple_all_robots,
         use_actual_contact_clearance_cheat=not args.disable_actual_contact_clearance_cheat,
+        csv_segments=csv_segments,
+        csv_waypoints_world=csv_waypoints_world,
+        csv_segment_v_speed=float(args.segment_v_speed),
+        csv_replan_each_push=csv_replan_effective,
+        cross_track_integrate=bool(args.cross_track_integrate),
+        cross_track_k=float(args.cross_track_k),
+        cross_track_omega_max=float(args.cross_track_omega_max),
     )
 
     ref_mode_str = "fixed-ref (one-shot)" if args.fixed_ref else "live-resolve (every tick)"
@@ -2451,6 +3763,41 @@ def main() -> None:
     print(f"  t_params  : {[round(t, 4) for t in t_params]}")
     print(f"  v_ref_body: ({args.v_ref_x:.4f}, {args.v_ref_y:.4f}) m/s")
     print(f"  omega_ref : {args.omega_ref:.4f} rad/s")
+    if args.segment_csv:
+        assert csv_segments is not None
+        print(
+            f"  segment-csv: {len(csv_segments)} twist segment(s)  "
+            f"teleport={args.transition_teleport_robots}  "
+            f"replan={csv_replan_effective}  "
+            f"cross_track={bool(args.cross_track_integrate)}  "
+            f"leg_end={'pose+timeout' if args.csv_segment_pose_stop else 'T_nom_open_loop'}  "
+            f"T_scale={float(args.csv_segment_time_scale):.2f}"
+        )
+        if args.csv_segment_pose_stop:
+            print(
+                f"    pose tol: pos≤{args.csv_segment_pos_tol:.3f} m  "
+                f"|Δθ|≤{args.csv_segment_yaw_tol_deg:.1f}°  "
+                f"vel_gate={'off' if args.csv_segment_skip_vel_gate else 'on'}  "
+                f"timeout≥max({args.csv_segment_timeout_factor:.1f}·T_nom, "
+                f"{args.csv_segment_timeout_min_s:.1f}s)"
+            )
+    elif args.test_transition:
+        print(
+            f"  transition: enabled at t={0.5 * args.duration:.2f}s -> "
+            f"v_ref_body=({-args.v_ref_y:.4f}, {args.v_ref_x:.4f}) m/s, "
+            f"omega_ref={-args.omega_ref:.4f} rad/s  "
+            f"teleport={args.transition_teleport_robots}"
+        )
+    if args.cross_track_integrate:
+        _ct_horizon = (
+            "per-segment T_solver"
+            if args.segment_csv
+            else f"T_horizon={float(args.duration):.3f}s (--duration)"
+        )
+        print(
+            f"  cross-track-integrate: k={float(args.cross_track_k):.3f} rad/(s·m)  "
+            f"cap=±{float(args.cross_track_omega_max):.3f} rad/s  ({_ct_horizon})"
+        )
     print(f"  |v_cp_body| per robot: {[round(s, 4) for s in test._desired_cp_speed]}")
     print(f"  ref mode  : {ref_mode_str}")
     print(f"  branch lock: {not args.no_branch_lock}  (live-resolve only)")
@@ -2464,6 +3811,18 @@ def main() -> None:
     print(
         f"  normal    : k_n={args.kp_position:.3f}  kd_n={args.kd_pos:.3f}  "
         f"cap={args.max_normal_speed:.3f} m/s"
+    )
+    print(
+        f"  staging   : pos_tol={args.stage_position_tol:.3f} m  "
+        f"head_tol={args.stage_heading_tol_deg:.2f} deg  "
+        f"kp_pos={args.kp_stage_position:.3f}  "
+        f"kp_head={args.kp_stage_heading:.3f}  "
+        f"kd_head={args.kd_stage_heading:.3f}  "
+        f"max_omega={args.max_stage_omega:.3f}"
+    )
+    print(
+        f"  contact update: {not args.disable_contact_geometry_update}  "
+        f"max_shift={args.contact_update_max_distance:.3f} m"
     )
     print(
         f"  tangent   : k_t={args.k_tangent:.3f}  "
@@ -2506,22 +3865,47 @@ def main() -> None:
         f"max_fraction={args.max_z_relax:.3f}  (simulation creep-up detector)"
     )
     print(
-        f"  friction  : ground={args.ground_friction:.3f}  "
-        f"wheel={args.wheel_friction:.3f}  caster={args.caster_friction:.3f}"
+        f"  friction  : object={args.object_friction:.3f}  "
+        f"bumper={args.bumper_contact_mu:.3f}  ground={args.ground_friction:.3f}  "
+        f"wheel={args.wheel_friction:.3f}  caster={args.caster_friction:.3f}  "
+        f"planar_cheat={not args.no_planar_cheat}"
     )
     print()
 
     save_dir = Path(args.save_dir) if args.save_dir else None
-    results = test.run(
-        duration=args.duration,
-        gui=not args.no_gui,
-        debug_vel=args.debug_vel,
-        debug_every=args.debug_vel_every,
-        save_dir=save_dir,
-        record_video=args.record_video,
-        align_heading_tol_rad=np.deg2rad(args.align_heading_tol_deg),
-        stop_go_sleep_after_realign_s=float(args.stop_go_pre_push_hold_s),
-    )
+    run_kw: Dict[str, Any] = {
+        "duration": args.duration,
+        "gui": not args.no_gui,
+        "debug_vel": args.debug_vel,
+        "debug_every": args.debug_vel_every,
+        "save_dir": save_dir,
+        "record_video": args.record_video,
+        "align_heading_tol_rad": np.deg2rad(args.align_heading_tol_deg),
+        "stop_go_sleep_after_realign_s": float(args.stop_go_pre_push_hold_s),
+        "test_transition": bool(args.test_transition),
+        "transition_teleport_robots": bool(args.transition_teleport_robots),
+        "stage_position_tol": float(args.stage_position_tol),
+        "stage_heading_tol_rad": np.deg2rad(args.stage_heading_tol_deg),
+        "kp_stage_position": float(args.kp_stage_position),
+        "kp_stage_heading": float(args.kp_stage_heading),
+        "kd_stage_heading": float(args.kd_stage_heading),
+        "max_stage_omega": float(args.max_stage_omega),
+        "update_contact_on_realign": not args.disable_contact_geometry_update,
+        "contact_update_max_distance": float(args.contact_update_max_distance),
+    }
+    if args.segment_csv:
+        run_kw.update(
+            csv_segment_time_only=not bool(args.csv_segment_pose_stop),
+            csv_segment_pos_tol_m=float(args.csv_segment_pos_tol),
+            csv_segment_yaw_tol_rad=np.deg2rad(float(args.csv_segment_yaw_tol_deg)),
+            csv_segment_vel_tol_m_s=float(args.csv_segment_vel_tol),
+            csv_segment_omega_tol_rad_s=float(args.csv_segment_omega_tol),
+            csv_segment_require_low_speed=not bool(args.csv_segment_skip_vel_gate),
+            csv_segment_timeout_factor=float(args.csv_segment_timeout_factor),
+            csv_segment_timeout_min_s=float(args.csv_segment_timeout_min_s),
+            csv_segment_time_scale=float(args.csv_segment_time_scale),
+        )
+    results = test.run(**run_kw)
     print(f"\nResults: {results}")
 
     if save_dir is None:

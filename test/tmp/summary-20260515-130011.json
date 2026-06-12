@@ -1,0 +1,4 @@
+{
+  "summary": "Explained deltas when --cross-track-integrate is enabled: new signed lateral error e_d to nominal screw path, omega_path_ref = omega_ref + clip(k*e_d), omega servo uses omega_path_ref, v_cp_ref and feed-forward re-solved every tick even under --fixed-ref; ct_ref anchored at each push/leg start. Defaults k=4, cap=0.25 rad/s.",
+  "current_status": "Cross-track equation deltas documented relative to prior block equation sheet."
+}
