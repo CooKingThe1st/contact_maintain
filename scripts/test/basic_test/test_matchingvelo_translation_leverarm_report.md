@@ -65,6 +65,8 @@ $$
 }
 $$
 
+just a quick test
+
 ### Translation feasibility with a robot speed cap
 If the robot has a translational speed magnitude limit $V_{r,\max}$ (however your controller maps it to actuator limits), then the matched-motion reference must satisfy:
 $$
