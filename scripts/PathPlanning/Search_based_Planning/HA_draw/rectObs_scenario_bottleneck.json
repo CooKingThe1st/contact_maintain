@@ -1,26 +1,28 @@
 {
   "version": 1,
   "map": {
-    "width": 14.0,
-    "height": 14.0,
+    "width": 8.0,
+    "height": 7.0,
     "resolution": 0.2
   },
   "robot": {
     "type": "holonomic",
     "width": 2.0,
     "length": 3.0,
-    "shape_name": "plus",
-    "safety_margin": 0.0
+    "shape_name": "right_triangle",
+    "safety_margin": 0.2,
+    "margin_ge_robot_size": true,
+    "obj_path": "/home/docker_user/catkin_ws/src/contact_maintain/urdf/right_triangle.obj"
   },
   "pose": {
     "start": [
-      3.0,
-      3.0,
+      1.0,
+      1.0,
       0.0
     ],
     "goal": [
-      10.0,
-      10.0,
+      6.0,
+      5.0,
       90.0
     ]
   },
@@ -28,21 +30,21 @@
     "line_thickness": 1.0
   },
   "planner": {
-    "yaw_fill_mode": "none"
+    "yaw_fill_mode": "linear"
   },
   "obstacles": {
     "rects": {
       "RECT_001": [
-        1.3502433147500712,
-        4.745157327789852,
-        7.048284985353869,
-        7.857885287725597
+        0.6603479922286745,
+        3.011565750351534,
+        3.3386644912679926,
+        2.9800671940577272
       ],
       "RECT_002": [
-        9.498122124677266,
-        4.996352060273239,
-        1.5032691674651844,
-        0.5025788449920743
+        4.357609780706933,
+        2.5045833646404683,
+        1.2736386762985301,
+        1.5085817330914635
       ]
     },
     "lines": {},

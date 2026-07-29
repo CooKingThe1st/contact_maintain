@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "map": {
+    "width": 8.0,
+    "height": 5.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 0.8,
+    "length": 1.0,
+    "shape_name": "pi",
+    "safety_margin": 0.0,
+    "obj_path": "/home/docker_user/catkin_ws/src/contact_maintain/urdf/pi.obj"
+  },
+  "pose": {
+    "start": [
+      1.0,
+      1.0,
+      0.0
+    ],
+    "goal": [
+      7.0,
+      4.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 5.0
+  },
+  "planner": {
+    "yaw_fill_mode": "linear"
+  },
+  "obstacles": {
+    "rects": {},
+    "lines": {},
+    "rect_count": 0,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "rectObs_scenario_revised_baseline.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

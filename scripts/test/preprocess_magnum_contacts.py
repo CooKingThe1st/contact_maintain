@@ -6,8 +6,8 @@ This script:
   1. Forcefully clears the existing Magnum Four cache at:
        urdf/magnum_four_cache.json
   2. Loads each target object via obj_to_generic
-  3. Runs find_the_magnum_four_v3 with a C-space reachability filter
-     (via robot_radius → get_reachable_contact_intervals)
+  3. Runs find_the_magnum_stochastic (default) or legacy find_the_magnum_four_v3
+     with C-space reachability filter (robot_radius → get_reachable_contact_intervals)
   4. Saves the resulting t_params into the cache JSON.
 
 Usage examples:
@@ -19,10 +19,12 @@ Usage examples:
 """
 
 import argparse
+import csv
 import json
 import sys
+import time
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 import numpy as np
 import pybullet as pyb
@@ -40,8 +42,13 @@ sys.path.insert(0, str(pkg_path / "src" / "legacy"))
 
 from contact_maintain.object_bridge import obj_to_generic  # noqa: E402
 from contact_optimizer_utils import find_the_magnum_four_v3  # noqa: E402
-from contact_optimizer_utils_test_ver import (  # noqa: E402
-    find_the_magnum_stochastic,
+from stochastic_magnum_finder import find_the_magnum_stochastic  # noqa: E402
+from grasp_covariance import (  # noqa: E402
+    DEFAULT_SOFT_DEGENERACY_THRESHOLD,
+    calculate_grasp_covariance,
+    format_grasp_covariance_report,
+    recommend_tangent_fallback,
+    screening_fields_for_log,
 )
 
 
@@ -131,6 +138,48 @@ Examples:
             "(`find_the_magnum_four_v3`)."
         ),
     )
+    parser.add_argument(
+        "--soft-threshold",
+        type=float,
+        default=DEFAULT_SOFT_DEGENERACY_THRESHOLD,
+        help=(
+            f"D >= this value recommends tangent fallback before search "
+            f"(default {DEFAULT_SOFT_DEGENERACY_THRESHOLD}, Section 11)."
+        ),
+    )
+    parser.add_argument(
+        "--samples-per-edge",
+        type=int,
+        default=4,
+        help="Interior boundary samples per edge for grasp covariance (default 4)",
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help=(
+            "CSV log path for degeneracy screening and solver results "
+            "(default: urdf/magnum_preprocess_screening.csv)"
+        ),
+    )
+    parser.add_argument(
+        "--force-tangent",
+        action="store_true",
+        help="Always enable used_tangent_as_fallback (ignore D gate)",
+    )
+    parser.add_argument(
+        "--ignore-degeneracy-gate",
+        action="store_true",
+        help="Never enable tangent from D screening (normal-only stochastic pass only)",
+    )
+    parser.add_argument(
+        "--no-retry-tangent-on-failure",
+        action="store_true",
+        help=(
+            "Disable Section 11 step 3: do not retry with tangent when D gate "
+            "said normal-only (default: retry enabled for OBJ preprocessing)"
+        ),
+    )
     args = parser.parse_args()
 
     effective_radius = DEFAULT_ROBOT_RADIUS * float(args.safety_scale)
@@ -142,8 +191,10 @@ Examples:
     print(f"Safety scale: {args.safety_scale:.3f}")
     print(f"Effective reachability radius: {effective_radius:.4f} m")
     print(f"Solver: {args.solver}")
+    print(f"Degeneracy gate: D_soft={args.soft_threshold:.1f}")
 
     cache_path = pkg_path / "urdf" / "magnum_four_cache.json"
+    csv_path = args.csv or (pkg_path / "urdf" / "magnum_preprocess_screening.csv")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Forcefully clear existing cache
@@ -158,6 +209,7 @@ Examples:
     setup_pybullet(gui=False)
 
     cache_data = {}
+    csv_rows: List[Dict[str, Any]] = []
 
     # 3. Process each target shape
     for shape_name in TARGET_SHAPES:
@@ -185,29 +237,93 @@ Examples:
         print(f"    Mass: {generic_object.mass:.3f} kg")
         print(f"    Moment of inertia: {generic_object.moment_of_inertia:.6f} kg·m²")
 
+        cov = calculate_grasp_covariance(
+            generic_object,
+            samples_per_edge=args.samples_per_edge,
+            soft_degeneracy_threshold=args.soft_threshold,
+        )
+        tangent_rec = recommend_tangent_fallback(
+            cov,
+            soft_degeneracy_threshold=args.soft_threshold,
+        )
+        screening = screening_fields_for_log(cov, tangent_rec)
+        print(f"    {format_grasp_covariance_report(cov, shape_name)}")
+        if tangent_rec["recommend_tangent_fallback"]:
+            print(
+                f"    🔶 Tangent recommended: {tangent_rec['reason']} "
+                f"(D={screening['degeneracy_index']:.2f})"
+            )
+        else:
+            print(
+                f"    🟢 Normal-only by D gate "
+                f"(D={screening['degeneracy_index']:.2f}, "
+                f"class={screening['degeneracy_classification']})"
+            )
+
+        if args.force_tangent:
+            tangent_required = True
+            use_tangent_fallback = True
+        elif args.ignore_degeneracy_gate:
+            tangent_required = False
+            use_tangent_fallback = not args.no_retry_tangent_on_failure
+        else:
+            tangent_required = tangent_rec["recommend_tangent_fallback"]
+            use_tangent_fallback = (
+                tangent_required or not args.no_retry_tangent_on_failure
+            )
+
+        row: Dict[str, Any] = {
+            "shape_name": shape_name,
+            "solver": args.solver,
+            "safety_scale": args.safety_scale,
+            "effective_robot_radius_m": effective_radius,
+            "force_range_scalar": 2.0,
+            "tangent_required": tangent_required,
+            "used_tangent_as_fallback_requested": use_tangent_fallback,
+            "cache_saved": False,
+            "success": False,
+            "search_used_tangent_fallback": False,
+            "elapsed_time_s": None,
+            "t_params": "",
+            "error": "",
+            **screening,
+        }
+
         # Run Magnum solver with reachability filtering
         if args.solver == "stochastic":
             print(
                 "  Computing Magnum Four contact points using stochastic "
-                "solver (with reachability filter)..."
+                f"solver (tangent_required={tangent_required}, "
+                f"tangent_fallback={use_tangent_fallback and not tangent_required})..."
             )
+            t0 = time.time()
             magnum_result = find_the_magnum_stochastic(
                 generic_object,
                 threshold=1.0,
-                max_batches=20,
                 timeout=10.0,
                 force_range_scalar=2.0,
                 robot_radius=effective_radius,
-                used_tangent_as_fallback=True,
+                used_tangent_as_fallback=use_tangent_fallback and not tangent_required,
+                tangent_required=tangent_required,
                 verbose=False,
             )
+            row["elapsed_time_s"] = time.time() - t0
 
             if not magnum_result or not magnum_result.get("success", False):
+                row["error"] = "stochastic_solver_failed"
+                csv_rows.append(row)
                 print(f"  ✗ Stochastic Magnum solver failed for '{shape_name}'")
                 continue
 
+            row["success"] = True
+            row["search_used_tangent_fallback"] = bool(
+                magnum_result.get("used_tangent_fallback", False)
+            )
             contacts = magnum_result.get("contacts", [])
             if not contacts:
+                row["success"] = False
+                row["error"] = "no_contacts_returned"
+                csv_rows.append(row)
                 print(
                     f"  ✗ Stochastic Magnum solver returned no contacts for "
                     f"'{shape_name}'"
@@ -218,6 +334,7 @@ Examples:
                 "  Computing Magnum Four contact points using legacy v3 solver "
                 "(with reachability filter)..."
             )
+            t0 = time.time()
             magnum_result = find_the_magnum_four_v3(
                 generic_object,
                 verbose=False,
@@ -226,11 +343,15 @@ Examples:
                 torque_method=3,
                 robot_radius=effective_radius,
             )
+            row["elapsed_time_s"] = time.time() - t0
 
             if not magnum_result or not magnum_result.get("success", False):
+                row["error"] = "v3_solver_failed"
+                csv_rows.append(row)
                 print(f"  ✗ Magnum Four v3 solver failed for '{shape_name}'")
                 continue
 
+            row["success"] = True
             contacts = magnum_result["best_solution"]["contacts"]
         t_params = [float(c.parameter) for c in contacts]
         # Normalize into [0, 1) for cache
@@ -238,13 +359,30 @@ Examples:
         t_params = np.array(t_params, dtype=float).tolist()
 
         if len(t_params) != 4:
+            row["error"] = f"expected_4_contacts_got_{len(t_params)}"
+            csv_rows.append(row)
             print(f"  ✗ Expected 4 contacts, got {len(t_params)} for '{shape_name}' – skipping")
             continue
 
+        row["t_params"] = ",".join(f"{v:.6f}" for v in t_params)
+        row["cache_saved"] = True
+        csv_rows.append(row)
+
         print(f"  ✓ Magnum Four t_params for '{shape_name}': {[f'{v:.6f}' for v in t_params]}")
+        if row.get("search_used_tangent_fallback"):
+            print("    (solution found with tangent-force fallback)")
         cache_data[shape_name] = t_params
 
     # 4. Save updated cache
+    if csv_rows:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = list(csv_rows[0].keys())
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"\nSaved screening CSV: {csv_path}")
+
     if cache_data:
         with cache_path.open("w") as f:
             json.dump(cache_data, f, indent=2)

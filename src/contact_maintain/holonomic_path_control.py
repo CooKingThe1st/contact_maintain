@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -99,7 +100,7 @@ def primitives_to_hybrid_path(
                     [float(p["x1"]), float(p["y1"])],
                 )
             )
-        elif typ == "A":
+        elif typ in ("A", "C"):
             ocx = float(p["ocx"])
             ocy = float(p["ocy"])
             r = float(p["r"])
@@ -138,6 +139,55 @@ def polyline_to_hybrid_path_straight_arc(
         wpts = [[outx[i], outy[i]] for i in range(len(outx))]
         return HybridPath([SplineComponentPath(wpts)])
     return primitives_to_hybrid_path(prims)
+
+
+def build_hybrid_path_from_planned(
+    px: Sequence[float],
+    py: Sequence[float],
+    primitives: Optional[Sequence[Tuple[str, dict]]] = None,
+) -> HybridPath:
+    """Build HybridPath from HA_draw planner output."""
+    if primitives:
+        return primitives_to_hybrid_path(primitives)
+    px_list = [float(x) for x in px]
+    py_list = [float(y) for y in py]
+    if len(px_list) < 2:
+        raise ValueError("Planned path must have at least 2 points")
+    comps: List = []
+    for i in range(len(px_list) - 1):
+        comps.append(
+            StraightComponentPath(
+                [px_list[i], py_list[i]],
+                [px_list[i + 1], py_list[i + 1]],
+            )
+        )
+    return HybridPath(comps)
+
+
+def lateral_error_to_polyline(
+    pos: np.ndarray,
+    px: Sequence[float],
+    py: Sequence[float],
+) -> float:
+    """Minimum distance from pos to planned polyline (m)."""
+    pos = np.asarray(pos, dtype=float).reshape(2)
+    pts = np.column_stack([np.asarray(px, dtype=float), np.asarray(py, dtype=float)])
+    if len(pts) < 2:
+        return float(np.linalg.norm(pos - pts[0])) if len(pts) == 1 else 0.0
+    best = 1e18
+    for i in range(len(pts) - 1):
+        a = pts[i]
+        b = pts[i + 1]
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        if denom < 1e-18:
+            d = float(np.linalg.norm(pos - a))
+        else:
+            t = float(np.clip(np.dot(pos - a, ab) / denom, 0.0, 1.0))
+            proj = a + t * ab
+            d = float(np.linalg.norm(pos - proj))
+        best = min(best, d)
+    return best
 
 
 def translate_polyline(
@@ -497,6 +547,7 @@ def orientation_pid_omega(
     kd: float = 0.2,
     max_omega: float = 0.15,
 ) -> float:
+    goal_theta = align_heading_to_current(current_orientation, goal_theta)
     err = goal_theta - current_orientation
     err = math.atan2(math.sin(err), math.cos(err))
     w = kp * err - kd * current_omega
@@ -508,9 +559,341 @@ def theta_goal_for_waypoint_mode(
     s_milestones: Sequence[float],
     theta_milestones: Sequence[float],
 ) -> float:
-    """Piecewise-constant theta: use last milestone with s_milestone <= current_s."""
+    """Deprecated piecewise-constant fallback; prefer ``theta_goal_linear_along_segments``."""
     goal = float(theta_milestones[0])
     for s_th, th in zip(s_milestones, theta_milestones):
         if current_s + 1e-6 >= float(s_th):
             goal = float(th)
     return goal
+
+
+@dataclass(frozen=True)
+class SegmentThetaSpec:
+    """One planner primitive span with linear theta reference."""
+
+    s0: float
+    s1: float
+    theta0: float
+    theta1: float
+
+
+def segment_theta_specs_from_df_primitives(
+    df: Sequence[dict],
+) -> List[SegmentThetaSpec]:
+    """Per-primitive (s0, s1, theta0, theta1) matching ``df_xy_linear_theta_v1``."""
+    if not df:
+        return []
+    specs: List[SegmentThetaSpec] = []
+    cum = 0.0
+    for seg in df:
+        kind = str(seg.get("kind", "line"))
+        if kind == "line":
+            length = math.hypot(
+                float(seg["x1"]) - float(seg["x0"]),
+                float(seg["y1"]) - float(seg["y0"]),
+            )
+        else:
+            length = abs(float(seg["sweep"])) * max(float(seg["r"]), 1e-9)
+        s0 = cum
+        s1 = cum + float(length)
+        specs.append(
+            SegmentThetaSpec(
+                s0=s0,
+                s1=s1,
+                theta0=float(seg["theta0"]),
+                theta1=float(seg["theta1"]),
+            )
+        )
+        cum = s1
+    return specs
+
+
+def resolve_segment_theta_specs(
+    *,
+    df_primitives: Optional[Sequence[dict]] = None,
+    s_vertices: Optional[Sequence[float]] = None,
+    theta_vertices: Optional[Sequence[float]] = None,
+) -> List[SegmentThetaSpec]:
+    if df_primitives:
+        return segment_theta_specs_from_df_primitives(df_primitives)
+    if s_vertices and theta_vertices:
+        return segment_theta_specs_from_vertex_milestones(s_vertices, theta_vertices)
+    return []
+
+
+def segment_theta_specs_from_vertex_milestones(
+    s_vertices: Sequence[float],
+    theta_vertices: Sequence[float],
+) -> List[SegmentThetaSpec]:
+    """Build linear segment specs from headings at polyline vertices."""
+    if len(s_vertices) < 2 or len(theta_vertices) < 2:
+        return []
+    n = min(len(s_vertices), len(theta_vertices))
+    specs: List[SegmentThetaSpec] = []
+    for i in range(n - 1):
+        specs.append(
+            SegmentThetaSpec(
+                s0=float(s_vertices[i]),
+                s1=float(s_vertices[i + 1]),
+                theta0=float(theta_vertices[i]),
+                theta1=float(theta_vertices[i + 1]),
+            )
+        )
+    return specs
+
+
+def segment_index_for_s(current_s: float, segments: Sequence[SegmentThetaSpec]) -> int:
+    if not segments:
+        return 0
+    s = float(current_s)
+    for i, seg in enumerate(segments):
+        if s <= seg.s1 + 1e-6:
+            return i
+    return len(segments) - 1
+
+
+def theta_goal_at_segment_endpoint(
+    current_s: float,
+    segments: Sequence[SegmentThetaSpec],
+    current_orientation: Optional[float] = None,
+) -> float:
+    """Piecewise-constant heading: current primitive's mandated endpoint ``theta1``."""
+    if not segments:
+        return 0.0
+    s = float(np.clip(current_s, segments[0].s0, segments[-1].s1))
+    idx = segment_index_for_s(s, segments)
+    goal = float(segments[idx].theta1)
+    if current_orientation is not None:
+        goal = align_heading_to_current(current_orientation, goal)
+    return goal
+
+
+def theta_goal_linear_along_segments(
+    current_s: float,
+    segments: Sequence[SegmentThetaSpec],
+    current_orientation: Optional[float] = None,
+) -> float:
+    """Deprecated: use ``theta_goal_at_segment_endpoint`` (piecewise endpoint reference)."""
+    return theta_goal_at_segment_endpoint(current_s, segments, current_orientation)
+
+
+def orient_gate_should_hold(
+    current_orientation: float,
+    seg: SegmentThetaSpec,
+    tolerance: float,
+    max_residual: float = 0.35,
+) -> bool:
+    """True for a small segment-end residual that along-path PID did not clear."""
+    goal = align_heading_to_current(current_orientation, float(seg.theta1))
+    err = orientation_error_rad(current_orientation, goal)
+    if abs(err) <= float(tolerance):
+        return False
+    return abs(err) <= float(max_residual)
+
+
+def completed_segment_at_s_crossing(
+    prev_s: float,
+    current_s: float,
+    segments: Sequence[SegmentThetaSpec],
+) -> Optional[int]:
+    """Return completed primitive index when ``current_s`` crosses its end."""
+    if not segments:
+        return None
+    for i, seg in enumerate(segments):
+        if float(prev_s) < float(seg.s1) - 1e-6 and float(current_s) >= float(seg.s1) - 1e-6:
+            return i
+    return None
+
+
+def mandated_theta_at_segment_end(
+    segments: Sequence[SegmentThetaSpec],
+    completed_seg_idx: int,
+) -> float:
+    if not segments:
+        return 0.0
+    idx = int(np.clip(completed_seg_idx, 0, len(segments) - 1))
+    return float(segments[idx].theta1)
+
+
+@dataclass
+class HolonomicSegmentOrientGate:
+    """Hold XY and rotate to mandated primitive-end theta before continuing."""
+
+    segment_specs: Sequence[SegmentThetaSpec]
+    orientation_tol: float = 0.1
+    orient_gate_max_residual: float = 0.35
+    gate_active: bool = False
+    gate_theta: float = 0.0
+    active_boundary_key: Optional[Tuple[int, int]] = None
+    pending_retouch_key: Optional[Tuple[int, int]] = None
+    pending_retouch: bool = False
+    retouch_resume_theta: float = 0.0
+
+    def reset(self) -> None:
+        self.gate_active = False
+        self.gate_theta = 0.0
+        self.active_boundary_key = None
+        self.pending_retouch_key = None
+        self.pending_retouch = False
+        self.retouch_resume_theta = 0.0
+
+    def begin_segment_end_hold(
+        self,
+        completed_seg_idx: int,
+        *,
+        boundary_key: Tuple[int, int],
+        do_retouch: bool,
+        retouch_already_consumed: bool,
+        current_orientation: Optional[float] = None,
+        current_s: Optional[float] = None,
+    ) -> bool:
+        """
+        Arm the orient gate for primitive ``completed_seg_idx``.
+
+        Returns True when an active XY hold + rotate is required; False when heading
+        is already within tolerance or residual is too large for a gate touch-up.
+        """
+        self.active_boundary_key = boundary_key
+        seg = self.segment_specs[int(completed_seg_idx)]
+        self.gate_theta = align_heading_to_current(
+            float(current_orientation or seg.theta1),
+            mandated_theta_at_segment_end(self.segment_specs, completed_seg_idx),
+        )
+        self.retouch_resume_theta = self.gate_theta
+        self.pending_retouch_key = boundary_key
+        self.pending_retouch = bool(do_retouch and not retouch_already_consumed)
+        if current_orientation is None:
+            self.gate_active = True
+            return True
+        if self.orientation_satisfied(current_orientation, self.gate_theta):
+            self.gate_active = False
+            return False
+        if not orient_gate_should_hold(
+            current_orientation,
+            seg,
+            self.orientation_tol,
+            self.orient_gate_max_residual,
+        ):
+            self.gate_active = False
+            return False
+        self.gate_active = True
+        return True
+
+    def orientation_satisfied(self, current_orientation: float, goal_theta: float) -> bool:
+        goal_theta = align_heading_to_current(current_orientation, goal_theta)
+        return abs(orientation_error_rad(current_orientation, goal_theta)) < float(
+            self.orientation_tol
+        )
+
+    def clear_gate(self) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]]]:
+        """Return ``(retouch_boundary_key, orient_boundary_key)`` and disarm the gate."""
+        self.gate_active = False
+        retouch_key = self.pending_retouch_key if self.pending_retouch else None
+        orient_key = self.active_boundary_key
+        self.pending_retouch_key = None
+        self.pending_retouch = False
+        self.active_boundary_key = None
+        return retouch_key, orient_key
+
+    def retouch_may_resume(self, current_orientation: float) -> bool:
+        return self.orientation_satisfied(current_orientation, self.retouch_resume_theta)
+
+
+def apply_orientation_hold(
+    *,
+    current_orientation: float,
+    current_angular_velocity: float,
+    hold_theta: float,
+    orientation_tol: float,
+    kp: float = 0.8,
+    kd: float = 0.2,
+    max_omega: float = 0.15,
+) -> Tuple[np.ndarray, float, bool]:
+    """Freeze translation and PID toward ``hold_theta``; third value is satisfied."""
+    hold_theta = align_heading_to_current(current_orientation, hold_theta)
+    err = orientation_error_rad(current_orientation, hold_theta)
+    if abs(err) < float(orientation_tol):
+        return np.array([0.0, 0.0], dtype=float), 0.0, True
+    omega = orientation_pid_omega(
+        current_orientation,
+        hold_theta,
+        current_angular_velocity,
+        kp=kp,
+        kd=kd,
+        max_omega=max_omega,
+    )
+    return np.array([0.0, 0.0], dtype=float), omega, False
+
+
+def orientation_error_rad(current_orientation: float, goal_theta: float) -> float:
+    err = float(goal_theta) - float(current_orientation)
+    return math.atan2(math.sin(err), math.cos(err))
+
+
+def final_theta_goal_for_mode(
+    theta_mode: ThetaMode,
+    *,
+    s_total: float,
+    theta_milestones: Sequence[float],
+    segment_specs: Optional[Sequence[SegmentThetaSpec]] = None,
+    fixed_theta: float = 0.0,
+    path_theta_sine_amp: float = 0.0,
+    path_theta_sine_k: float = 1.0,
+) -> float:
+    """Terminal heading used after XY path completion."""
+    if theta_mode == ThetaMode.WAYPOINT:
+        if segment_specs:
+            return float(segment_specs[-1].theta1)
+        return float(theta_milestones[-1]) if theta_milestones else 0.0
+    if theta_mode == ThetaMode.FIXED:
+        return float(fixed_theta)
+    return float(path_theta_sine_amp) * math.sin(float(path_theta_sine_k) * float(s_total))
+
+
+def holonomic_path_xy_completed(
+    path_following_controller=None,
+    pursuit_controller=None,
+) -> bool:
+    if path_following_controller is not None and path_following_controller.is_completed():
+        return True
+    if pursuit_controller is not None and pursuit_controller.is_completed():
+        return True
+    return False
+
+
+def apply_path_completion_to_desired_motion(
+    *,
+    desired_obj_velocity: np.ndarray,
+    desired_obj_omega: float,
+    current_orientation: float,
+    current_angular_velocity: float,
+    path_xy_done: bool,
+    final_theta: float,
+    orientation_tol: float,
+    kp: float = 0.8,
+    kd: float = 0.2,
+    max_omega: float = 0.15,
+) -> Tuple[np.ndarray, float, bool]:
+    """
+    After XY path completion, hold translation and rotate toward ``final_theta``.
+
+    Returns ``(velocity, omega, scenario_complete)`` where ``scenario_complete`` is
+    True when both XY is done and ``|orientation error| < orientation_tol``.
+    """
+    if not path_xy_done:
+        return np.asarray(desired_obj_velocity, dtype=float), float(desired_obj_omega), False
+
+    vel = np.array([0.0, 0.0], dtype=float)
+    err = orientation_error_rad(current_orientation, final_theta)
+    if abs(err) < float(orientation_tol):
+        return vel, 0.0, True
+
+    omega = orientation_pid_omega(
+        current_orientation,
+        final_theta,
+        current_angular_velocity,
+        kp=kp,
+        kd=kd,
+        max_omega=max_omega,
+    )
+    return vel, omega, False

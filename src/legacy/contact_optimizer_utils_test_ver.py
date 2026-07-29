@@ -259,6 +259,8 @@ def _find_circles_voronoi(obj, edge_characterizer, samples_per_edge, tolerance):
     print(f"   Using Voronoi method with {samples_per_edge} samples per edge...")
     
     # STEP 2.1: Sample points on edges
+    # TODO: when len(edges) is large, consider deduping nearby sites or lowering
+    # samples_per_edge — 46 edges × 50 samples = 2300 Voronoi sites for sym crescent.
     edge_samples, edge_map = _sample_edges(obj, edge_characterizer, samples_per_edge)
     
     if len(edge_samples) < 3:
@@ -276,28 +278,28 @@ def _find_circles_voronoi(obj, edge_characterizer, samples_per_edge, tolerance):
     
     print(f"   Voronoi diagram has {len(vor.vertices)} vertices")
     
-    # STEP 2.3: For each Voronoi vertex, check if inside and compute radius
+    # STEP 2.3: For each Voronoi vertex inside the shape, compute clearance radius.
+    # Use prepared geometry for fast contains; Shapely boundary distance for radius.
+    from shapely.prepared import prep
+
+    prepared_geom = prep(obj.geometry)
+    boundary = _get_object_boundary(obj)
     candidates = []
-    
+
     for idx, vertex in enumerate(vor.vertices):
-        # FIX: Use obj.geometry instead of obj.shape
-        point_shapely = Point(vertex[0], vertex[1])
-        
-        # Check if point is inside the object's geometry (not on boundary)
-        is_inside = obj.geometry.contains(point_shapely)
-        
-        if is_inside:
-            # Compute distance to nearest edge (this is the radius)
-            radius = _distance_to_nearest_edge(vertex, obj, edge_characterizer)
-            
-            candidates.append({
-                'center': vertex,
-                'radius': radius
-            })
-            
-            if idx < 5:  # Debug: print first few
-                print(f"      Vertex {idx}: center=({vertex[0]:.3f}, {vertex[1]:.3f}), "
-                      f"radius={radius:.4f}, inside={is_inside}")
+        if not prepared_geom.contains(Point(vertex[0], vertex[1])):
+            continue
+
+        radius = boundary.distance(Point(vertex[0], vertex[1]))
+
+        candidates.append({
+            'center': vertex,
+            'radius': radius
+        })
+
+        if idx < 5:  # Debug: print first few inside vertices
+            print(f"      Vertex {idx}: center=({vertex[0]:.3f}, {vertex[1]:.3f}), "
+                  f"radius={radius:.4f}, inside=True")
     
     if len(candidates) == 0:
         print("   ⚠️ No Voronoi vertices inside object")
@@ -307,7 +309,7 @@ def _find_circles_voronoi(obj, edge_characterizer, samples_per_edge, tolerance):
         # Fallback: Use centroid with distance to nearest edge
         centroid = obj.get_centroid()
         centroid_array = np.array([centroid.x, centroid.y])
-        radius = _distance_to_nearest_edge(centroid_array, obj, edge_characterizer)
+        radius = _distance_to_nearest_edge(centroid_array, obj)
         
         print(f"   Fallback: Using centroid with radius={radius:.4f}")
         
@@ -372,37 +374,34 @@ def _sample_edges(obj, edge_characterizer, samples_per_edge):
     return np.array(edge_samples), edge_map
 
 
-def _distance_to_nearest_edge(point, obj, edge_characterizer):
+_object_boundary_cache: Dict[int, Any] = {}
+
+
+def _get_object_boundary(obj):
+    """Return (and cache) the Shapely boundary geometry for distance queries."""
+    cache_key = id(obj)
+    if cache_key not in _object_boundary_cache:
+        _object_boundary_cache[cache_key] = obj.geometry.boundary
+    return _object_boundary_cache[cache_key]
+
+
+def _distance_to_nearest_edge(point, obj, edge_characterizer=None):
     """
     Compute distance from point to nearest edge of object.
+
+    Uses Shapely/GEOS boundary distance (O(log n) typical) instead of looping
+    all logical edges in Python.
     
     Args:
         point: np.array([x, y])
         obj: GenericObject
-        edge_characterizer: EdgeCharacterizer
+        edge_characterizer: Unused; kept for backward-compatible call sites.
     
     Returns:
-        float: minimum distance to any edge
+        float: minimum distance to any boundary segment
     """
-    min_dist = float('inf')
-    
-    edges = edge_characterizer.edges
-    
-    for edge_info in edges:
-        t_start = edge_info['start_param']
-        t_end = edge_info['end_param']
-        
-        # Sample edge endpoints
-        start_info = edge_characterizer.parameterization.get_contact_info(t_start)
-        end_info = edge_characterizer.parameterization.get_contact_info(t_end)
-        
-        A = np.array(start_info['point'])
-        B = np.array(end_info['point'])
-        
-        dist = _distance_point_to_segment(point, A, B)
-        min_dist = min(min_dist, dist)
-    
-    return min_dist
+    _ = edge_characterizer
+    return float(_get_object_boundary(obj).distance(Point(float(point[0]), float(point[1]))))
 
 
 def _distance_point_to_segment(point, A, B):
@@ -1297,7 +1296,35 @@ def _check_points_distinct(contacts, tolerance=0.01):
     return True
 
 
-def _check_enough_space_for_robots(contacts, robot_radius: float, buffer: float = 0.1):
+_object_min_edge_length_cache: Dict[int, float] = {}
+
+
+def _get_object_min_edge_length(obj) -> float:
+    """Return the shortest boundary segment length for `obj` (cached per object)."""
+    cache_key = id(obj)
+    if cache_key not in _object_min_edge_length_cache:
+        param = ContactPointParameterization(obj)
+        lengths = param.segment_lengths
+        _object_min_edge_length_cache[cache_key] = (
+            float(min(lengths)) if len(lengths) > 0 else 0.1
+        )
+    return _object_min_edge_length_cache[cache_key]
+
+
+def _compute_robot_spacing_buffer(robot_radius: float, min_edge_length: float) -> float:
+    """
+    Additional clearance beyond 2 * robot_radius for center-to-center spacing.
+
+    Uses max(0.01 m floor, 0.5 * robot_radius, 10% of shortest object edge).
+    """
+    return max(0.01, 0.5 * robot_radius, 0.1 * min_edge_length)
+
+
+def _check_enough_space_for_robots(
+    contacts,
+    robot_radius: float,
+    min_edge_length: Optional[float] = None,
+):
     """
     Check that robot centers have enough spacing to avoid collisions.
     
@@ -1305,12 +1332,14 @@ def _check_enough_space_for_robots(contacts, robot_radius: float, buffer: float 
         robot_center = contact.position + robot_radius * normal_outward
     
     For any two robot centers, the distance must be >= 2 * robot_radius + buffer
-    to ensure the robots don't collide.
+    to ensure the robots don't collide. The buffer is computed dynamically from
+    robot size and the object's shortest edge length.
     
     Args:
         contacts: list of ContactPoint objects
         robot_radius: Radius of the circular robot
-        buffer: Additional safety buffer distance (default: 0.1 m)
+        min_edge_length: Optional shortest boundary segment length (m). If None,
+            inferred from contacts[0].object_ref.
     
     Returns:
         bool: True if all robot centers have sufficient spacing, False otherwise
@@ -1318,6 +1347,12 @@ def _check_enough_space_for_robots(contacts, robot_radius: float, buffer: float 
     n = len(contacts)
     if n < 2:
         return True  # No spacing check needed for < 2 contacts
+
+    if min_edge_length is None:
+        obj = contacts[0].object_ref if contacts else None
+        min_edge_length = _get_object_min_edge_length(obj) if obj is not None else 0.1
+
+    buffer = _compute_robot_spacing_buffer(robot_radius, min_edge_length)
     
     # Compute robot center positions
     robot_centers = []
@@ -3822,6 +3857,7 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
     
     edge_characterizer = preprocess_result['edge_characterizer']
     num_edges = preprocess_result['num_edges']
+    obj_min_edge_length = _get_object_min_edge_length(obj)
     
     if num_edges < 3:
         print("❌ Need at least 3 edges for meaningful contact configuration")
@@ -4049,7 +4085,9 @@ def find_the_magnum_four_v3(obj, verbose=True, visualize=True, force_magnitude=1
                         
                         # Prune 4: Check robot center spacing (if robot_radius provided)
                         if robot_radius is not None:
-                            if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                            if not _check_enough_space_for_robots(
+                                contacts, robot_radius, min_edge_length=obj_min_edge_length
+                            ):
                                 pruned_count['insufficient_robot_spacing'] += 1
                                 continue
                         
@@ -4293,12 +4331,13 @@ def _cem_update_distribution_placeholder(
 def find_the_magnum_stochastic(
     obj,
     threshold: float = 1.0,
-    max_batches: int = 10,
     timeout: float = 10.0,
     n_ellipse_samples: int = 72,
     force_range_scalar: float = 2.0,
     robot_radius: Optional[float] = None,
     used_tangent_as_fallback: bool = False,
+    tangent_required: bool = False,
+    theory_mode: bool = False,
     verbose: bool = True,
 ):
     """
@@ -4311,13 +4350,18 @@ def find_the_magnum_stochastic(
         - For each row (combination):
               1) Map 4 indices to strategic points (edge_idx, t_param)
               2) Build ContactPoint objects
-              3) Apply pruning checks (distinct points, normals, force closure, robot spacing)
-              4) Run `check_wrench_space_sufficiency(...)` (skips torque closure check)
+              3) Apply pruning checks (engineering mode only: robot spacing,
+                 parallel normals, quick force closure; always: distinct points)
+              4) Run `check_wrench_space_sufficiency(...)`
           If the test passes, RETURN IMMEDIATELY (anytime algorithm).
-        - If no configuration passes after `max_batches` batches or `timeout` seconds,
-          and `used_tangent_as_fallback` is True, re-run the same search with
-          wrench space built using tangent forces enabled; if that finds a config,
-          return it with `used_tangent_fallback=True`.
+        - If no configuration passes before the first-pass time budget,
+          and `used_tangent_as_fallback` is True (and `tangent_required` is False),
+          re-run the search with `enable_tangent_forces=True` and quick FC pruning
+          disabled; if that finds a config, return it with `used_tangent_fallback=True`.
+          When tangent fallback is enabled without `tangent_required`, the total
+          `timeout` is split evenly between the normal-force pass and the tangent-force pass.
+        - If `tangent_required` is True, skip the normal-only pass and use the full
+          `timeout` on a tangent-force search (quick FC prune off).
         - Otherwise return `success=False`.
 
     Design:
@@ -4329,16 +4373,25 @@ def find_the_magnum_stochastic(
     Args:
         obj:          `GenericObject` instance.
         threshold:    LS coverage factor (1.0 = 100% LS; >1.0 = stricter).
-        max_batches:  Maximum number of Latin square batches to try.
-        timeout:      Maximum time in seconds (default 10.0).
+        timeout:      Search time budget in seconds (default 10.0), measured after
+            setup (edge characterization, inscribed circles, strategic sampling).
+            Batches continue until this budget is exhausted.
         n_ellipse_samples: Boundary samples per LS projection ellipse.
         force_range_scalar: Multiplier for maximum force range.
             Force range = [0, force_range_scalar × static_f_max]
             where static_f_max = static_friction × (mass × 9.81)
             Default 2.0 means robots can exert up to 2× static friction limit.
-        robot_radius: Optional robot radius for spacing checks.
-        used_tangent_as_fallback: If True, on first-pass failure re-run the full
-            search with `enable_tangent_forces=True` in the sufficiency check.
+        robot_radius: Optional robot radius for spacing checks (engineering mode).
+        used_tangent_as_fallback: If True, on first-pass failure re-run the search
+            with `enable_tangent_forces=True` and quick FC pruning disabled.
+            Total `timeout` is split evenly across both passes (ignored when
+            `tangent_required` is True).
+        tangent_required: If True, skip the normal-only pass and search with tangent
+            forces for the full `timeout` (e.g. D/σ₃ screening already mandates friction).
+        theory_mode: If True, validate Latin-square search with minimal pruning:
+            keeps distinct-point check and `check_wrench_space_sufficiency` (use a
+            small non-zero `threshold`), but skips robot-spacing and quick
+            force-closure heuristics. `robot_radius` is ignored for pruning.
         verbose:      If True, prints batch-level progress and summary.
 
     Returns:
@@ -4352,18 +4405,24 @@ def find_the_magnum_stochastic(
             'pruned_count'     : dict of pruning statistics
             'sufficiency_result': result dict from last sufficiency check
             'used_tangent_fallback': bool (if success via tangent-force fallback)
+            'theory_mode'        : bool (whether theory validation mode was used)
     """
     import time
 
+    apply_robot_spacing_check = (robot_radius is not None) and (not theory_mode)
+    apply_quick_prune = not theory_mode
+
     if verbose:
         print("\n" + "=" * 80)
-        print("🎲 STOCHASTIC MAGNUM SEARCH (Phase 2 - Latin Square + Early Termination)")
+        mode_label = "THEORY" if theory_mode else "ENGINEERING"
+        print(f"🎲 STOCHASTIC MAGNUM SEARCH (Phase 2 - Latin Square + Early Termination) [{mode_label}]")
         print("=" * 80)
 
     # ---------------------------------------------------------------------
     # STEP 0: Setup – edge characterization and strategic sampling
+    # (not counted against search timeout)
     # ---------------------------------------------------------------------
-    start_time_total = time.time()
+    setup_start_time = time.time()
 
     edge_characterizer = EdgeCharacterizer(obj, force_magnitude=1.0)
     num_edges = len(edge_characterizer.edges)
@@ -4376,6 +4435,7 @@ def find_the_magnum_stochastic(
             'found_by': None,
             'reason': 'no_edges',
             'threshold': threshold,
+            'theory_mode': theory_mode,
             'batches_tested': 0,
             'configs_tested': 0,
             'pruned_count': {},
@@ -4408,6 +4468,7 @@ def find_the_magnum_stochastic(
             'found_by': None,
             'reason': 'insufficient_strategic_points',
             'threshold': threshold,
+            'theory_mode': theory_mode,
             'batches_tested': 0,
             'configs_tested': 0,
             'pruned_count': {},
@@ -4416,17 +4477,43 @@ def find_the_magnum_stochastic(
     
     # Compute epsilon for pruning
     epsilon = compute_epsilon(max_inscribed_circles, edge_characterizer)
+    obj_min_edge_length = _get_object_min_edge_length(obj)
+    robot_spacing_buffer = (
+        _compute_robot_spacing_buffer(robot_radius, obj_min_edge_length)
+        if robot_radius is not None else None
+    )
     
     if verbose:
         print(f"\n📐 Edges found           : {num_edges}")
         print(f"📍 Strategic points      : {n_strategic_points}")
         print(f"📏 Epsilon (pruning)     : {epsilon:.6f}")
-        print(f"🎯 Max batches           : {max_batches}")
-        print(f"⏱️  Timeout               : {timeout:.1f} s")
+        if tangent_required:
+            print(f"⏱️  Timeout (tangent-only) : {timeout:.1f} s")
+        elif used_tangent_as_fallback:
+            print(f"⏱️  Timeout (total budget): {timeout:.1f} s ({timeout / 2.0:.1f} s per pass)")
+        else:
+            print(f"⏱️  Timeout (search budget): {timeout:.1f} s")
         print(f"🎯 Threshold (LS scale)  : {threshold:.2f}")
-        if robot_radius is not None:
+        if theory_mode:
+            print("🧪 Theory mode          : ON (skip robot spacing + quick FC prune)")
+        if tangent_required:
+            print("🔄 Tangent required     : ON (skip normal-only pass)")
+        elif used_tangent_as_fallback:
+            print("🔄 Tangent fallback     : ON (2nd pass skips quick FC prune)")
+        if apply_robot_spacing_check:
             print(f"🤖 Robot radius          : {robot_radius:.3f}")
+            print(f"📏 Min edge length       : {obj_min_edge_length:.6f}")
+            print(f"📏 Robot spacing buffer  : {robot_spacing_buffer:.6f}")
 
+    setup_elapsed = time.time() - setup_start_time
+    if verbose:
+        print(f"⏱️  Setup time (excluded) : {setup_elapsed:.2f} s")
+
+    pass_timeout = (
+        timeout
+        if tangent_required
+        else (timeout / 2.0 if used_tangent_as_fallback else timeout)
+    )
     rng = np.random.default_rng()
 
     def _create_latin_square(n: int, n_cols: int = 4):
@@ -4442,14 +4529,22 @@ def find_the_magnum_stochastic(
             square[:, col] = rng.permutation(n)
         return square
 
-    def _run_one_pass(enable_tangent_forces: bool, quick_prune_check: bool = True):
+    def _run_one_pass(
+        enable_tangent_forces: bool,
+        apply_robot_spacing: bool = True,
+        apply_quick_prune: bool = True,
+    ):
         """
         Run one full stochastic pass (batches of Latin square rows).
-        quick_prune_check: if True, apply distinct-points/normals/force-closure/robot-spacing
-            pruning; if False (e.g. fallback pass), skip pruning and only run sufficiency check.
+
+        Pruning:
+            - Distinct contact points: always applied.
+            - Robot spacing / quick FC heuristics: controlled by flags (off in theory_mode).
+        Each call resets the per-pass search timer (`pass_timeout`).
         Returns (success_result_dict, None) on success, else (None, failure_stats).
         failure_stats = (batches_tested, configs_tested, pruned_count, last_sufficiency_result).
         """
+        search_start_time = time.time()
         local_configs_tested = 0
         local_pruned_count = {
             'duplicate_points': 0,
@@ -4459,23 +4554,25 @@ def find_the_magnum_stochastic(
         }
         local_last_sufficiency_result = None
         batch_idx = 0
-        for batch_idx in range(max_batches):
-            elapsed_time = time.time() - start_time_total
-            if elapsed_time >= timeout:
+        while True:
+            elapsed_time = time.time() - search_start_time
+            if elapsed_time >= pass_timeout:
                 if verbose:
-                    print(f"\n⏱️  Timeout reached ({timeout:.1f} s)")
+                    print(f"\n⏱️  Pass timeout reached ({pass_timeout:.1f} s)")
                 break
 
             if verbose:
-                print(f"\n--- Batch {batch_idx + 1}/{max_batches} (elapsed: {elapsed_time:.2f} s) ---")
+                print(f"\n--- Batch {batch_idx + 1} (search elapsed: {elapsed_time:.2f} s) ---")
 
             latin_square = _create_latin_square(n_strategic_points, n_cols=4)
+            timed_out_mid_batch = False
 
             for row_idx in range(n_strategic_points):
-                elapsed_time = time.time() - start_time_total
-                if elapsed_time >= timeout:
+                elapsed_time = time.time() - search_start_time
+                if elapsed_time >= pass_timeout:
                     if verbose:
-                        print(f"   ⏱️  Timeout reached during batch {batch_idx + 1}")
+                        print(f"   ⏱️  Pass timeout reached during batch {batch_idx + 1}")
+                    timed_out_mid_batch = True
                     break
 
                 point_indices = latin_square[row_idx, :]
@@ -4493,12 +4590,14 @@ def find_the_magnum_stochastic(
                     local_pruned_count['duplicate_points'] += 1
                     continue
 
-                if robot_radius is not None:
-                    if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                if apply_robot_spacing:
+                    if not _check_enough_space_for_robots(
+                        contacts, robot_radius, min_edge_length=obj_min_edge_length
+                    ):
                         local_pruned_count['insufficient_robot_spacing'] += 1
                         continue
 
-                if quick_prune_check:
+                if apply_quick_prune:
 
                     if not _check_normals_not_parallel(contacts):
                         local_pruned_count['parallel_normals'] += 1
@@ -4519,13 +4618,15 @@ def find_the_magnum_stochastic(
                 )
 
                 if local_last_sufficiency_result.get('satisfied', False):
-                    total_time = time.time() - start_time_total
+                    search_elapsed = time.time() - search_start_time
+                    total_elapsed = time.time() - setup_start_time
                     if verbose:
                         print(f"\n✅ SUFFICIENT CONFIGURATION FOUND (stochastic)")
                         print(f"   Batch index     : {batch_idx + 1}")
                         print(f"   Config in batch : {row_idx + 1}")
                         print(f"   Total configs   : {local_configs_tested}")
-                        print(f"   Elapsed time    : {total_time:.3f} s")
+                        print(f"   Search elapsed  : {search_elapsed:.3f} s")
+                        print(f"   Total elapsed   : {total_elapsed:.3f} s")
                         print(f"   Pruning stats   : {local_pruned_count}")
 
                     return (
@@ -4538,53 +4639,89 @@ def find_the_magnum_stochastic(
                             'configs_tested': local_configs_tested,
                             'pruned_count': local_pruned_count.copy(),
                             'sufficiency_result': local_last_sufficiency_result,
+                            'theory_mode': theory_mode,
                         },
                         None,
                     )
 
-            if elapsed_time >= timeout:
+            batch_idx += 1
+            if timed_out_mid_batch:
                 break
 
         return (
             None,
-            (batch_idx + 1, local_configs_tested, local_pruned_count, local_last_sufficiency_result),
+            (batch_idx, local_configs_tested, local_pruned_count, local_last_sufficiency_result),
         )
 
     # ---------------------------------------------------------------------
     # STEP 1: Latin square batches with early termination
     # ---------------------------------------------------------------------
-    if verbose:
-        print("\n🚀 Starting Latin square batches...")
+    if tangent_required:
+        if verbose:
+            print("\n🚀 Starting tangent-force Latin square batches (D/σ₃ gate)...")
+        result, fail_stats = _run_one_pass(
+            enable_tangent_forces=True,
+            apply_robot_spacing=apply_robot_spacing_check,
+            apply_quick_prune=False,
+        )
+        if result is not None:
+            result['used_tangent_fallback'] = True
+            return result
+    else:
+        if verbose:
+            print("\n🚀 Starting Latin square batches...")
 
-    result, fail_stats = _run_one_pass(enable_tangent_forces=False)
-    if result is not None:
-        return result
+        result, fail_stats = _run_one_pass(
+            enable_tangent_forces=False,
+            apply_robot_spacing=apply_robot_spacing_check,
+            apply_quick_prune=apply_quick_prune,
+        )
+        if result is not None:
+            return result
 
     # ---------------------------------------------------------------------
     # STEP 2: No stochastic success – optional tangent-force fallback
     # ---------------------------------------------------------------------
-    if used_tangent_as_fallback:
+    if used_tangent_as_fallback and not tangent_required:
         if verbose:
-            print("\n🔄 Fallback: re-running with tangent forces enabled (no quick prune)...")
-        result, _ = _run_one_pass(enable_tangent_forces=True, quick_prune_check=False)
+            print(
+                f"\n🔄 Fallback: re-running with tangent forces enabled "
+                f"({pass_timeout:.1f} s, quick FC prune off)..."
+            )
+        result, tangent_fail_stats = _run_one_pass(
+            enable_tangent_forces=True,
+            apply_robot_spacing=apply_robot_spacing_check,
+            apply_quick_prune=False,
+        )
         if result is not None:
             result['used_tangent_fallback'] = True
             return result
 
+        b1, c1, p1, l1 = fail_stats
+        b2, c2, p2, l2 = tangent_fail_stats
+        fail_stats = (
+            b1 + b2,
+            c1 + c2,
+            {k: p1[k] + p2[k] for k in p1},
+            l2 if l2 is not None else l1,
+        )
+
     batches_tested, configs_tested, pruned_count, last_sufficiency_result = fail_stats
-    total_time = time.time() - start_time_total
+    total_elapsed = time.time() - setup_start_time
     if verbose:
         print(f"\n❌ No sufficient configuration found by stochastic search")
         print(f"   Batches tested    : {batches_tested}")
         print(f"   Configs tested    : {configs_tested}")
-        print(f"   Elapsed time     : {total_time:.3f} s")
-        print(f"   Pruning stats    : {pruned_count}")
+        print(f"   Search timeout    : {timeout:.1f} s")
+        print(f"   Total elapsed     : {total_elapsed:.3f} s")
+        print(f"   Pruning stats     : {pruned_count}")
 
     return {
         'success': False,
         'found_by': None,
         'contacts': None,
         'threshold': threshold,
+        'theory_mode': theory_mode,
         'batches_tested': batches_tested,
         'configs_tested': configs_tested,
         'pruned_count': pruned_count,
@@ -4631,6 +4768,7 @@ def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=
     
     edge_characterizer = preprocess_result['edge_characterizer']
     num_edges = preprocess_result['num_edges']
+    obj_min_edge_length = _get_object_min_edge_length(obj)
     
     if len(preprocess_result['valid_3edge_combos']) == 0:
         if verbose:
@@ -4716,7 +4854,9 @@ def find_the_magnum_three_v3(obj, verbose=True, visualize=True, force_magnitude=
                     
                     # Check robot center spacing (if robot_radius provided)
                     if robot_radius is not None:
-                        if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                        if not _check_enough_space_for_robots(
+                            contacts, robot_radius, min_edge_length=obj_min_edge_length
+                        ):
                             continue
                     
                     solution = {
@@ -4806,6 +4946,7 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
     
     edge_characterizer = preprocess_result['edge_characterizer']
     num_edges = preprocess_result['num_edges']
+    obj_min_edge_length = _get_object_min_edge_length(obj)
     
     if num_edges < 2:
         print("❌ Need at least 2 edges for meaningful contact configuration")
@@ -4980,7 +5121,9 @@ def find_the_magnum_three_v3_logtime(obj, verbose=True, visualize=True, force_ma
                     
                     # Check robot center spacing (if robot_radius provided)
                     if robot_radius is not None:
-                        if not _check_enough_space_for_robots(contacts, robot_radius, buffer=0.1):
+                        if not _check_enough_space_for_robots(
+                            contacts, robot_radius, min_edge_length=obj_min_edge_length
+                        ):
                             pruned_count['insufficient_robot_spacing'] += 1
                             continue
                     

@@ -5,7 +5,7 @@ import math
 import time
 import matplotlib.pyplot as plt
 from shapely.geometry import Point, Polygon, LineString
-from shapely.ops import transform, nearest_points
+from shapely.ops import transform, nearest_points, unary_union
 from shapely.affinity import rotate, translate
 from pathlib import Path
 from typing import Union, Optional
@@ -149,6 +149,13 @@ class GenericObject:
         self.lateral_friction = lateral_friction
         self.heading = heading  # Object's local frame orientation
         self.name = name
+
+        # New friction model (additive; legacy fields above stay for old scripts):
+        # - material_friction: single PyBullet lateralFriction on the object (floor pairing)
+        # - contact_friction: effective robot–object Coulomb µ (= material × bumper)
+        # Unset (_material_friction / _contact_friction = None) → fall back to lateral_friction.
+        self._material_friction = None
+        self._contact_friction = None
         
         # Calculate moment of inertia if not provided
         if moment_of_inertia is None:
@@ -166,7 +173,109 @@ class GenericObject:
         
         # Current pose (for transformed objects)
         self.position = np.array([0.0, 0.0])  # (x, y) position of centroid
-    
+
+    # ------------------------------------------------------------------
+    # Friction model (material + effective contact). Legacy kinetic/static/
+    # lateral_friction fields are unchanged; revised paths should prefer these.
+    # ------------------------------------------------------------------
+    @property
+    def material_friction(self) -> float:
+        """Object material µ for PyBullet body (and ground pairing in revised scenes)."""
+        if self._material_friction is not None:
+            return float(self._material_friction)
+        return float(self.lateral_friction)
+
+    @material_friction.setter
+    def material_friction(self, value: float) -> None:
+        self.set_material_friction(value)
+
+    def set_material_friction(
+        self,
+        mu: float,
+        *,
+        sync_legacy_lateral: bool = True,
+        sync_legacy_static: bool = False,
+    ) -> None:
+        """
+        Set object material friction (PyBullet object lateralFriction).
+
+        Parameters
+        ----------
+        mu : float
+            Material coefficient >= 0.
+        sync_legacy_lateral : bool
+            If True, also set ``lateral_friction`` so older GWS paths see the
+            same body µ until they migrate to ``get_contact_friction()``.
+        sync_legacy_static : bool
+            If True, also set ``static_friction`` (LS/ground scale). Use in
+            revised scenes where material µ is the shared floor story.
+        """
+        mu = float(mu)
+        if mu < 0.0:
+            raise ValueError(f"material_friction must be >= 0, got {mu}")
+        self._material_friction = mu
+        if sync_legacy_lateral:
+            self.lateral_friction = mu
+        if sync_legacy_static:
+            self.static_friction = mu
+
+    @property
+    def contact_friction(self) -> float:
+        """
+        Effective robot–object Coulomb µ used by AFC search / friction cone.
+
+        Prefer the value set by ``set_contact_friction`` (product model).
+        Falls back to ``lateral_friction`` for legacy callers.
+        """
+        return self.get_contact_friction()
+
+    @contact_friction.setter
+    def contact_friction(self, value: float) -> None:
+        self.set_contact_friction(value)
+
+    def get_contact_friction(self) -> float:
+        if self._contact_friction is not None:
+            return float(self._contact_friction)
+        return float(self.lateral_friction)
+
+    def set_contact_friction(self, mu: float, *, sync_legacy_lateral: bool = False) -> None:
+        """
+        Set effective contact µ for search (typically material × bumper).
+
+        Does not change ``material_friction``. Optionally mirrors into
+        ``lateral_friction`` so code that only reads that field stays aligned.
+        """
+        mu = float(mu)
+        if mu < 0.0:
+            raise ValueError(f"contact_friction must be >= 0, got {mu}")
+        self._contact_friction = mu
+        if sync_legacy_lateral:
+            self.lateral_friction = mu
+
+    def effective_contact_friction(self, bumper_mu: float) -> float:
+        """Product model: µ_contact = material_friction × bumper_mu."""
+        return float(self.material_friction) * float(bumper_mu)
+
+    def apply_bumper_contact_model(
+        self,
+        bumper_mu: float,
+        *,
+        sync_search_to_legacy_lateral: bool = False,
+    ) -> float:
+        """
+        Set contact_friction from material × bumper and return µ_contact.
+
+        Call after ``set_material_friction`` and after choosing bumper µ.
+        Does **not** overwrite ``lateral_friction`` by default (that remains the
+        object body / material µ for PyBullet); GWS should use
+        ``get_contact_friction()``.
+        """
+        mu_c = self.effective_contact_friction(bumper_mu)
+        self.set_contact_friction(
+            mu_c, sync_legacy_lateral=sync_search_to_legacy_lateral
+        )
+        return mu_c
+
     def _calculate_moment_of_inertia(self):
         """Calculate moment of inertia for the geometry (approximation)."""
         # For complex shapes, use bounding box approximation
@@ -293,6 +402,8 @@ class GenericObject:
             heading=new_heading,
             name=self.name
         )
+        new_obj._material_friction = self._material_friction
+        new_obj._contact_friction = self._contact_friction
         
         # Update position to the target location
         new_obj.position = np.array([x, y])
@@ -982,100 +1093,142 @@ def dxf_to_generic(
     return generic_obj
 
 
+def _vertices_from_path2d_entities(path2d) -> list:
+    """Extract ordered closed polygons from each entity in a trimesh Path2D."""
+    polys = []
+    verts = path2d.vertices
+    for ent in path2d.entities:
+        if not hasattr(ent, "points") or len(ent.points) < 3:
+            continue
+        coords = [(float(verts[i][0]), float(verts[i][1])) for i in ent.points]
+        if len(coords) >= 2 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            continue
+        poly = Polygon(coords)
+        if poly.is_valid and poly.area > 1e-8:
+            polys.append(poly)
+    return polys
+
+
+def _polygon_to_vertex_list(poly: Polygon) -> list:
+    coords = list(poly.exterior.coords)
+    if len(coords) >= 2 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 3:
+        raise ValueError("Polygon has fewer than 3 vertices")
+    return [(float(x), float(y)) for x, y in coords]
+
+
+def _read_dxf_vertices(dxf_path: Union[str, Path], reverse_sign: bool = True) -> list:
+    """Read the outer LWPOLYLINE boundary from a sibling DXF footprint file."""
+    dxf_path = Path(dxf_path)
+    if not dxf_path.exists():
+        raise FileNotFoundError(f"DXF file not found: {dxf_path}")
+
+    doc = ezdxf.readfile(str(dxf_path))
+    msp = doc.modelspace()
+    vertices = []
+    for e in msp:
+        if e.dxftype() == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in e.get_points()]
+            if len(pts) >= 2 and pts[0] == pts[-1]:
+                pts = pts[:-1]
+            if len(pts) >= 3:
+                vertices = pts
+                break
+
+    if not vertices:
+        raise ValueError(f"No valid LWPOLYLINE with >=3 points found in DXF: {dxf_path}")
+
+    if reverse_sign:
+        vertices = [(-x, -y) for x, y in vertices]
+
+    geometry = Polygon(vertices)
+    if not geometry.is_valid or geometry.area <= 0:
+        raise ValueError(f"DXF polygon is invalid or has zero area: {dxf_path}")
+    return vertices
+
+
+def _mesh_xy_convex_hull_vertices(mesh) -> list:
+    xy = mesh.vertices[:, :2]
+    if len(xy) < 3:
+        raise ValueError("Mesh has fewer than 3 vertices for convex hull")
+    hull = Polygon(xy).convex_hull
+    if hull.is_empty or hull.area <= 0:
+        raise ValueError("Convex hull of mesh XY projection is degenerate")
+    return _polygon_to_vertex_list(hull)
+
+
 def read_obj_to_vertices(
     obj_path: Union[str, Path],
 ) -> list:
     """
-    Extract 2D vertices from an OBJ file by slicing at the bottom (z_min).
-    
-    This function uses trimesh to load the OBJ file, then creates a cross-section
-    at the bottom of the mesh (minimum z-coordinate) to extract the 2D boundary.
-    This allows comparison with DXF-extracted vertices to detect orientation/vertex mismatches.
-    
-    Parameters
-    ----------
-    obj_path : str | Path
-        Path to the OBJ file.
-    
-    Returns
-    -------
-    list
-        List of (x, y) tuples representing the 2D boundary vertices.
-        The vertices are extracted from the bottom cross-section of the 3D mesh.
-    
-    Raises
-    ------
-    ImportError
-        If trimesh is not available.
-    FileNotFoundError
-        If the OBJ file does not exist.
-    ValueError
-        If the mesh cannot be sliced or no valid cross-section is found.
+    Extract 2D footprint vertices from an OBJ file.
+
+    Uses a bottom cross-section when it yields a single valid polygon. For meshes
+    whose slice is split (e.g. hourglass waist above the bottom plane) or whose
+    section vertex order is ambiguous, falls back to a sibling ``.dxf`` file, then
+    to the XY convex hull of the mesh.
     """
     if not TRIMESH_AVAILABLE:
         raise ImportError(
             "trimesh is required for read_obj_to_vertices. "
             "Install it with: pip install trimesh"
         )
-    
+
     obj_path = Path(obj_path)
     if not obj_path.exists():
         raise FileNotFoundError(f"OBJ file not found: {obj_path}")
-    
-    # Load mesh
+
     try:
         mesh = trimesh.load(str(obj_path))
     except Exception as e:
         raise ValueError(f"Failed to load OBJ file {obj_path}: {e}")
-    
-    # Get minimum z-coordinate (bottom of mesh)
+
     z_min = mesh.bounds[0][2]
-    
-    # Create a cross-section at the bottom with plane normal pointing up (z-direction)
     try:
         section = mesh.section(
             plane_origin=[0, 0, z_min],
-            plane_normal=[0, 0, 1]
+            plane_normal=[0, 0, 1],
         )
     except Exception as e:
-        raise ValueError(f"Failed to create cross-section at z={z_min}: {e}")
-    
-    if section is None:
-        raise ValueError(
-            f"No valid cross-section found at z={z_min}. "
-            "The mesh may not intersect the slicing plane."
-        )
-    
-    # Convert to planar (2D) representation
-    try:
-        path2d, _ = section.to_planar()
-    except Exception as e:
-        raise ValueError(f"Failed to convert section to planar: {e}")
-    
-    # Extract vertices
-    # path2d.vertices is a numpy array of (x, y) coordinates
-    vertices_2d = path2d.vertices
-    
-    if len(vertices_2d) < 3:
-        raise ValueError(
-            f"Cross-section has only {len(vertices_2d)} vertices. "
-            "Need at least 3 vertices to form a valid polygon."
-        )
-    
-    # Convert to list of tuples
-    vertices = [(float(v[0]), float(v[1])) for v in vertices_2d]
-    
-    # Remove duplicate first/last vertex if present (closed polygon)
-    if len(vertices) >= 2 and vertices[0] == vertices[-1]:
-        vertices = vertices[:-1]
-    
-    if len(vertices) < 3:
-        raise ValueError(
-            f"After processing, only {len(vertices)} unique vertices remain. "
-            "Need at least 3 vertices for a valid polygon."
-        )
-    
-    return vertices
+        section = None
+        slice_err = e
+    else:
+        slice_err = None
+
+    if section is not None:
+        try:
+            path2d, _ = section.to_planar()
+            entity_polys = _vertices_from_path2d_entities(path2d)
+            if len(entity_polys) == 1:
+                return _polygon_to_vertex_list(entity_polys[0])
+            if len(entity_polys) > 1:
+                dxf_path = obj_path.with_suffix(".dxf")
+                if dxf_path.exists():
+                    return _read_dxf_vertices(dxf_path)
+                merged = unary_union(entity_polys)
+                if merged.geom_type == "Polygon" and merged.is_valid and merged.area > 1e-8:
+                    return _polygon_to_vertex_list(merged)
+                if merged.geom_type == "MultiPolygon":
+                    largest = max(merged.geoms, key=lambda g: g.area)
+                    if largest.is_valid and largest.area > 1e-8:
+                        return _polygon_to_vertex_list(largest)
+        except Exception:
+            pass
+
+    dxf_path = obj_path.with_suffix(".dxf")
+    if dxf_path.exists():
+        try:
+            return _read_dxf_vertices(dxf_path)
+        except Exception:
+            pass
+
+    if slice_err is not None:
+        raise ValueError(f"Failed to create cross-section at z={z_min}: {slice_err}")
+
+    return _mesh_xy_convex_hull_vertices(mesh)
 
 
 def create_pybullet_objects():
@@ -1636,8 +1789,8 @@ class ContactPoint:
         desired_tangential = tangential_component
         
         # Apply friction constraint: |tangential| ≤ μ * |normal|
-        if enforce_friction and self.object_ref.lateral_friction > 0:
-            max_tangential = abs(desired_normal) * self.object_ref.lateral_friction
+        if enforce_friction and self.object_ref.get_contact_friction() > 0:
+            max_tangential = abs(desired_normal) * self.object_ref.get_contact_friction()
             if abs(desired_tangential) > max_tangential:
                 # Clamp tangential component to friction limit
                 desired_tangential = np.sign(desired_tangential) * max_tangential
@@ -1657,8 +1810,8 @@ class ContactPoint:
         
         # Check if the force satisfies all constraints
         is_valid = True
-        if enforce_friction and self.object_ref.lateral_friction > 0:
-            friction_satisfied = abs(desired_tangential) <= abs(desired_normal) * self.object_ref.lateral_friction + 1e-6
+        if enforce_friction and self.object_ref.get_contact_friction() > 0:
+            friction_satisfied = abs(desired_tangential) <= abs(desired_normal) * self.object_ref.get_contact_friction() + 1e-6
             magnitude_satisfied = np.linalg.norm(force_vector) <= max_magnitude + 1e-6
             is_valid = friction_satisfied and magnitude_satisfied
         
@@ -1692,8 +1845,8 @@ class ContactPoint:
         
         # Check friction constraint: |tangential_force| ≤ μ * |normal_force|
         is_valid = True
-        if friction_constraint and self.object_ref.lateral_friction > 0:
-            max_tangential = abs(normal_force) * self.object_ref.lateral_friction
+        if friction_constraint and self.object_ref.get_contact_friction() > 0:
+            max_tangential = abs(normal_force) * self.object_ref.get_contact_friction()
             if abs(tangential_force) > max_tangential:
                 if friction_constraint:
                     # Clamp to friction limit
@@ -1733,16 +1886,17 @@ class ContactPoint:
         Returns:
             dict: Contains friction cone information
         """
-        if self.object_ref is None or self.object_ref.lateral_friction <= 0:
+        mu = self.object_ref.get_contact_friction() if self.object_ref is not None else 0.0
+        if self.object_ref is None or mu <= 0:
             return {'friction_angle': 0, 'has_friction': False}
         
-        friction_angle = np.arctan(self.object_ref.lateral_friction)
+        friction_angle = np.arctan(mu)
         
         return {
             'friction_angle': friction_angle,
-            'friction_coefficient': self.object_ref.lateral_friction,
+            'friction_coefficient': mu,
             'has_friction': True,
-            'max_tangential_ratio': self.object_ref.lateral_friction
+            'max_tangential_ratio': mu
         }
     
     def __repr__(self):
@@ -2276,8 +2430,8 @@ class WrenchSpaceVisualizer:
             
             contact_forces = []
             
-            if enable_tangent_forces and cp.object_ref and cp.object_ref.lateral_friction > 0:
-                μ = cp.object_ref.lateral_friction
+            if enable_tangent_forces and cp.object_ref and cp.object_ref.get_contact_friction() > 0:
+                μ = cp.object_ref.get_contact_friction()
                 
                 for α in normal_samples:
                     # Friction constraint: |β| ≤ μ * α
@@ -2326,8 +2480,8 @@ class WrenchSpaceVisualizer:
                     break
                 
                 cp = contact_points[i]
-                if cp.object_ref and cp.object_ref.lateral_friction > 0:
-                    μ = cp.object_ref.lateral_friction
+                if cp.object_ref and cp.object_ref.get_contact_friction() > 0:
+                    μ = cp.object_ref.get_contact_friction()
                     if abs(β) > μ * α + 1e-6:  # Friction cone violation
                         combo_feasible = False
                         break
@@ -2896,34 +3050,63 @@ class EdgeCharacterizer:
     def identify_edges(self, min_edge_length=0.05):
         """
         Identify distinct edges of the object boundary.
-        
+
+        Segments shorter than `min_edge_length` are not dropped; they are merged
+        into the next sufficiently long edge along the boundary (trailing shorts
+        at the end of the loop attach to the last edge).
+
+        The underlying polygon parameterization is unchanged — only the logical
+        edge grouping used for characterization and sampling is affected.
+
         Args:
-            min_edge_length: Minimum length to consider as a separate edge
-            
+            min_edge_length: Minimum length for a segment to start a new edge
+                chain on its own. Shorter segments are absorbed into a neighbor.
+
         Returns:
-            list: List of edge dictionaries with start/end parameters and segment info
+            list: Edge dicts with start_param, end_param, length, segment_index,
+                and segment_indices (all raw segment indices in the chain).
         """
+        param = self.parameterization
+        n_segments = param.n_segments
+        lengths = param.segment_lengths
+        cumulative = param.cumulative_distances
+        total_length = param.total_length
+
+        if n_segments == 0 or total_length <= 0:
+            return []
+
+        chains = []
+        pending_short = []
+
+        for seg_idx in range(n_segments):
+            seg_len = lengths[seg_idx]
+            if seg_len >= min_edge_length:
+                chains.append(pending_short + [seg_idx])
+                pending_short = []
+            else:
+                pending_short.append(seg_idx)
+
+        if pending_short:
+            if chains:
+                chains[-1].extend(pending_short)
+            else:
+                chains.append(pending_short)
+
         edges = []
-        cumulative_length = 0
-        
-        for i in range(self.parameterization.n_segments):
-            edge_length = self.parameterization.segment_lengths[i]
-            
-            if edge_length >= min_edge_length:
-                # Calculate parameter range for this edge
-                start_param = cumulative_length / self.parameterization.total_length
-                end_param = (cumulative_length + edge_length) / self.parameterization.total_length
-                
-                edges.append({
-                    'edge_id': i,
-                    'start_param': start_param,
-                    'end_param': end_param,
-                    'length': edge_length,
-                    'segment_index': i
-                })
-            
-            cumulative_length += edge_length
-        
+        for edge_id, chain in enumerate(chains):
+            start_dist = cumulative[chain[0]]
+            end_dist = cumulative[chain[-1]] + lengths[chain[-1]]
+            edge_length = end_dist - start_dist
+
+            edges.append({
+                'edge_id': edge_id,
+                'start_param': start_dist / total_length,
+                'end_param': end_dist / total_length,
+                'length': edge_length,
+                'segment_index': chain[0],
+                'segment_indices': chain,
+            })
+
         return edges
     
     def _characterize_edges(self):

@@ -15,6 +15,7 @@ import sys
 import rospkg
 rospack = rospkg.RosPack()
 pkg_path = rospack.get_path("contact_maintain")
+sys.path.insert(0, str(Path(pkg_path) / "src"))
 sys.path.insert(0, str(Path(pkg_path) / "src" / "legacy"))
 
 from object_utils import GenericObject, create_standard_objects, estimate_realistic_mass, read_obj_to_vertices, dxf_to_generic
@@ -1127,15 +1128,18 @@ def obj_to_generic(
     local_inertia_diagonal = dynamics_info[2]  # (Ixx, Iyy, Izz)
     moment_of_inertia = kwargs.get('moment_of_inertia', local_inertia_diagonal[2])  # Izz for 2D
 
-    # Extract 2D vertices directly from OBJ file (new pipeline - no DXF needed)
-    # This gives correct vertex coordinates (verified against Fusion 360)
-    try:
-        vertices_2d = read_obj_to_vertices(obj_path)
-    except Exception as e:
-        raise ValueError(
-            f"Failed to extract 2D vertices from OBJ file {obj_path}: {e}. "
-            "Ensure the OBJ file has a valid mesh that can be sliced at z_min."
-        )
+    # 2D footprint: precomputed cache first, then OBJ/DXF slice fallback
+    from contact_maintain.footprint_cache import vertices_for_shape
+
+    vertices_2d = vertices_for_shape(shape_name)
+    if not vertices_2d:
+        try:
+            vertices_2d = read_obj_to_vertices(obj_path)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to extract 2D vertices from OBJ file {obj_path}: {e}. "
+                "Run scripts/test/preprocess_obj_footprints.py or ensure the OBJ can be sliced."
+            )
     
     # Create polygon from extracted vertices
     geometry = Polygon(vertices_2d)
@@ -1218,6 +1222,13 @@ def obj_to_generic(
         lateral_friction=actual_lateral_friction,
         heading=orientation,
         name=shape_name,
+    )
+    # New friction model: parameter is object material µ (PyBullet body).
+    # Contact µ (material × bumper) is applied later by revised / spawn logic.
+    generic_obj.set_material_friction(
+        actual_lateral_friction,
+        sync_legacy_lateral=True,
+        sync_legacy_static=False,
     )
     generic_obj.position = np.array([position[0], position[1]])
     generic_obj.moment_of_inertia = moment_of_inertia

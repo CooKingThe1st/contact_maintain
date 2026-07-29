@@ -9,16 +9,24 @@ experimental holonomic Pure Pursuit; theta via waypoint PID, fixed heading, or p
 Usage:
   python3 test_magnum_holonomic_control.py --xy-path zigzag --planner hybrid --theta-mode waypoint --save-dir /tmp/holo/
   python3 test_magnum_holonomic_control.py --xy-path sine --planner pursuit --theta-mode path --duration 40
+
+  after the planner upgrade
+    python3 test_magnum_holonomic_control.py 
+    --planned-path rectObs_scenario_root_SE_minprime.planned.json 
+    --planner hybrid --theta-mode waypoint --duration 60
+
+
 """
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -50,11 +58,20 @@ from contact_maintain.holonomic_path_control import (
     ThetaMode,
     build_zigzag_hybrid_path_at_start,
     build_sine_hybrid_path_at_start,
+    build_hybrid_path_from_planned,
     HolonomicPurePursuitPolyline,
     cumulative_vertex_s,
     zigzag_vertex_thetas,
     orientation_pid_omega,
-    theta_goal_for_waypoint_mode,
+    theta_goal_at_segment_endpoint,
+    final_theta_goal_for_mode,
+    holonomic_path_xy_completed,
+    apply_path_completion_to_desired_motion,
+    apply_orientation_hold,
+    HolonomicSegmentOrientGate,
+    resolve_segment_theta_specs,
+    completed_segment_at_s_crossing,
+    mandated_theta_at_segment_end,
     nearest_s_on_hybrid_path,
     nearest_s_on_polyline,
     sine_polyline,
@@ -75,7 +92,28 @@ PID_DECIMATION = 5  # Update ObjectVelocityPIDController every 5 Phase 7 control
 DEFAULT_OBJECT_HEIGHT_WHEEL = 0.08   # For wheel robots (taller to avoid multi-contact)
 DEFAULT_OBJECT_FRICTION = 0.3
 ROBOT_RADIUS = 0.06  # Robot radius for position offset calculation
-APPROACH_DISTANCE = ROBOT_RADIUS + 0.02  # Distance from contact point to spawn robot (for faster testing)
+APPROACH_DISTANCE = ROBOT_RADIUS + 0.1  # Distance from contact point to spawn robot (for faster testing)
+
+
+def robot_spawn_pose_world(
+    contact_point_body: np.ndarray,
+    normal_outward: np.ndarray,
+    normal_inward: np.ndarray,
+    object_xy: Tuple[float, float],
+    object_yaw_rad: float,
+    approach_distance: float = APPROACH_DISTANCE,
+) -> Tuple[float, float, float]:
+    """Body-frame Magnum contact offset → world spawn pose for the object at ``object_xy``."""
+    spawn_body = np.asarray(contact_point_body, dtype=float) + float(approach_distance) * np.asarray(
+        normal_outward, dtype=float
+    )
+    c = math.cos(float(object_yaw_rad))
+    s = math.sin(float(object_yaw_rad))
+    rot = np.array([[c, -s], [s, c]], dtype=float)
+    spawn_world = rot @ spawn_body + np.asarray(object_xy, dtype=float)
+    n_in_w = rot @ np.asarray(normal_inward, dtype=float)
+    heading = float(math.atan2(n_in_w[1], n_in_w[0]))
+    return float(spawn_world[0]), float(spawn_world[1]), heading
 
 
 @dataclass
@@ -1637,11 +1675,157 @@ def import_histories(
     return histories, t_params
 
 
+def _resolve_planned_path_file(path: Path, pkg_path: Path) -> Path:
+    p = Path(path)
+    if p.is_file():
+        return p.resolve()
+    ha_draw = pkg_path / "scripts" / "PathPlanning" / "Search_based_Planning" / "HA_draw"
+    for folder in (Path.cwd(), ha_draw):
+        cand = folder / p.name
+        if cand.is_file():
+            return cand.resolve()
+    raise FileNotFoundError(f"Planned path not found: {path}")
+
+
+def _load_planned_path_context(planned_arg: str, pkg_path: Path) -> Dict[str, Any]:
+    ha_draw = pkg_path / "scripts" / "PathPlanning" / "Search_based_Planning" / "HA_draw"
+    test_dir = pkg_path / "scripts" / "test"
+    for folder in (str(ha_draw), str(test_dir), str(test_dir / "basic_test")):
+        if folder not in sys.path:
+            sys.path.insert(0, folder)
+
+    from scenario_planner_bridge import resolve_planned_bundle_paths
+    from load_json_to_obstacles import spawn_scenario_obstacles, OBJ_SHAPE_FILES
+
+    planned_file = _resolve_planned_path_file(Path(planned_arg), pkg_path)
+    scenario_path, _, scenario, planned, bundle = resolve_planned_bundle_paths(
+        planned_file, search_dirs=[ha_draw, planned_file.parent]
+    )
+    shape_name = str((scenario.get("robot", {}) or {}).get("shape_name", "right_triangle"))
+    if shape_name not in OBJ_SHAPE_FILES:
+        raise ValueError(
+            f"Scenario shape '{shape_name}' is not supported by test_magnum_holonomic_control."
+        )
+    return {
+        "planned_file": planned_file,
+        "scenario_path": scenario_path,
+        "scenario": scenario,
+        "planned": planned,
+        "bundle": bundle,
+        "shape_name": shape_name,
+        "spawn_scenario_obstacles": spawn_scenario_obstacles,
+    }
+
+
+def _build_followers_from_planned(
+    planned,
+    start_xy: np.ndarray,
+    *,
+    planner_mode: str,
+    pyaw: Optional[List[float]] = None,
+) -> Tuple[
+    Optional[PathFollowingController],
+    Optional[HolonomicPurePursuitPolyline],
+    object,
+    List[float],
+    List[float],
+    List,
+]:
+    a_max = 0.15
+    a_lat_max = 0.08
+    v_user_max = 0.1
+    look_ahead_hybrid = 0
+
+    path_following_controller = None
+    pursuit_controller = None
+    holonomic_hybrid_path = None
+    s_milestones: List[float] = []
+    theta_milestones: List[float] = []
+    segment_theta_specs: List = []
+
+    prims = list(planned.primitives) if planned.primitives else []
+    df_prims = list(getattr(planned, "df_primitives", None) or [])
+
+    if planner_mode == "hybrid":
+        if not prims:
+            raise RuntimeError(
+                "Planned-path hybrid mode requires df_primitives / primitives in the export "
+                "(re-export from HA_draw after phase-3 planning)."
+            )
+        holonomic_hybrid_path = build_hybrid_path_from_planned(
+            planned.px, planned.py, primitives=prims
+        )
+        path_following_controller = PathFollowingController(
+            holonomic_hybrid_path,
+            a_max=a_max,
+            a_lat_max=a_lat_max,
+            v_user_max=v_user_max,
+            look_ahead=look_ahead_hybrid,
+            use_tracking=False,
+        )
+        if df_prims:
+            from scenario_planner_bridge import theta_milestones_from_df_primitives
+
+            s_milestones, theta_milestones = theta_milestones_from_df_primitives(df_prims)
+        else:
+            sv = cumulative_vertex_s(holonomic_hybrid_path)
+            s_milestones = [float(x) for x in sv]
+            theta_milestones = list(pyaw) if pyaw else [0.0] * len(s_milestones)
+            if theta_milestones and len(theta_milestones) < len(s_milestones):
+                theta_milestones = theta_milestones + [theta_milestones[-1]] * (
+                    len(s_milestones) - len(theta_milestones)
+                )
+    else:
+        pts = np.column_stack([planned.px, planned.py])
+        pursuit_controller = HolonomicPurePursuitPolyline(
+            pts, a_max=a_max, v_user_max=v_user_max, Ld=0.25, kf=0.5
+        )
+        s_milestones = [float(x) for x in pursuit_controller.cum]
+        if df_prims:
+            from scenario_planner_bridge import theta_milestones_from_df_primitives
+
+            s_milestones, theta_milestones = theta_milestones_from_df_primitives(df_prims)
+        elif pyaw:
+            theta_milestones = list(pyaw)
+            if len(theta_milestones) < len(s_milestones):
+                theta_milestones = theta_milestones + [theta_milestones[-1]] * (
+                    len(s_milestones) - len(theta_milestones)
+                )
+        else:
+            theta_milestones = [0.0] * len(planned.px)
+
+    segment_theta_specs = resolve_segment_theta_specs(
+        df_primitives=df_prims or None,
+        s_vertices=s_milestones if not df_prims else None,
+        theta_vertices=theta_milestones if not df_prims else None,
+    )
+
+    return (
+        path_following_controller,
+        pursuit_controller,
+        holonomic_hybrid_path,
+        s_milestones,
+        theta_milestones,
+        segment_theta_specs,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Swarm Magnum Four navigation / contact test")
     parser.add_argument("--object", type=str, default="right_triangle",
                         choices=["right_triangle", "pi", "root", "rect", "hourglass", "meteor"],
-                        help="Object shape name (must have OBJ and DXF files in urdf directory, bolt shape is buggy now)")
+                        help="Object shape name (ignored when --planned-path is set)")
+    parser.add_argument(
+        "--planned-path",
+        type=str,
+        default=None,
+        help="HA_draw *.planned.json; loads paired scenario via scenario_ref and uses exported path",
+    )
+    parser.add_argument(
+        "--no-boundary-walls",
+        action="store_true",
+        help="Planned-path mode: skip spawning map boundary walls (rect obstacles still spawn)",
+    )
     parser.add_argument("--duration", type=float, default=20.0,
                         help="Test duration in seconds")
     parser.add_argument("--no-gui", action="store_true", help="Run headless")
@@ -1737,6 +1921,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--orientation-complete-tol",
+        type=float,
+        default=0.1,
+        help="After XY path completion, keep rotating until |theta_err| < this (rad).",
+    )
+    parser.add_argument(
         "--hybrid-retouch-timeout",
         type=float,
         default=2.0,
@@ -1820,7 +2010,24 @@ def main():
 
     setup_pybullet(gui=not args.no_gui)
 
-    selected_name = args.object
+    planned_ctx = None
+    if args.planned_path:
+        planned_ctx = _load_planned_path_context(args.planned_path, Path(pkg_path))
+        print(
+            f"\nPlanned-path mode: {planned_ctx['planned_file'].name} "
+            f"+ scenario {planned_ctx['scenario_path'].name}"
+        )
+        planned_ctx["spawn_scenario_obstacles"](
+            planned_ctx["scenario"],
+            wall_thickness=0.2,
+            wall_height=0.5,
+            mu=1.0,
+            spawn_walls=not args.no_boundary_walls,
+        )
+        if args.no_boundary_walls:
+            print("  Boundary walls: disabled (--no-boundary-walls)")
+
+    selected_name = planned_ctx["shape_name"] if planned_ctx else args.object
     
     # Mapping from shape names to OBJ file names
     obj_file_map = {
@@ -1839,8 +2046,14 @@ def main():
             f"Unknown object '{selected_name}'. "
             f"Available: {', '.join(obj_file_map.keys())}"
         )
-    
 
+    if planned_ctx:
+        start_pose = (planned_ctx["scenario"].get("pose", {}) or {}).get("start", [0.0, 0.0, 0.0])
+        obj_position = (float(start_pose[0]), float(start_pose[1]), 0.2)
+        obj_orientation = math.radians(float(start_pose[2]) if len(start_pose) >= 3 else 0.0)
+    else:
+        obj_position = (0.0, 0.0, 0.2)
+        obj_orientation = 0.0
 
     obj_file = obj_file_map[selected_name]
     print(f"Loading OBJ file: {obj_file} for shape '{selected_name}'...")
@@ -1848,8 +2061,8 @@ def main():
     generic_object, object_uid = obj_to_generic(
         obj_path=obj_file,
         shape_name=selected_name,
-        position=(0, 0, 0.2),
-        orientation=0.0,
+        position=obj_position,
+        orientation=obj_orientation,
         mass=1.0,
         lateral_friction=DEFAULT_OBJECT_FRICTION,
         blind_test=True,
@@ -1946,15 +2159,14 @@ def main():
         contact_point_body = np.array(contact_info['point'], dtype=float)
         normal_outward = np.array(contact_info['normal_outward'], dtype=float)
         normal_inward = np.array(contact_info['normal_inward'], dtype=float)
-        
-        # Calculate spawn position: contact_point + approach_distance * normal_outward
-        # Object is at origin (0, 0, 0), so body frame = world frame initially
-        spawn_position_body = contact_point_body + APPROACH_DISTANCE * normal_outward
-        robot_x = float(spawn_position_body[0])
-        robot_y = float(spawn_position_body[1])
-        
-        # Robot heading: point toward contact point (normal_inward direction)
-        robot_heading = float(np.arctan2(normal_inward[1], normal_inward[0]))
+
+        robot_x, robot_y, robot_heading = robot_spawn_pose_world(
+            contact_point_body,
+            normal_outward,
+            normal_inward,
+            object_xy=(float(obj_position[0]), float(obj_position[1])),
+            object_yaw_rad=float(obj_orientation),
+        )
 
         robot = create_robot(
             kinematics=args.kinematics,
@@ -1988,6 +2200,7 @@ def main():
     holonomic_hybrid_path = None
     s_milestones: List[float] = []
     theta_milestones: List[float] = []
+    segment_theta_specs: List = []
 
     theta_mode_enum = {
         "waypoint": ThetaMode.WAYPOINT,
@@ -1995,7 +2208,10 @@ def main():
         "path": ThetaMode.PATH,
     }[args.theta_mode]
 
-    run_tag = f"{args.xy_path}_{args.planner}_{args.theta_mode}"
+    if planned_ctx:
+        run_tag = f"planned_{planned_ctx['scenario_path'].stem}_{args.planner}_{args.theta_mode}"
+    else:
+        run_tag = f"{args.xy_path}_{args.planner}_{args.theta_mode}"
 
     obj_state_init = get_object_state(object_uid)
     start_xy = np.asarray(obj_state_init["position"], dtype=float)
@@ -2005,7 +2221,28 @@ def main():
     v_user_max = 0.1
     look_ahead_hybrid = 0  # stop at segment joins (contact recovery window)
 
-    if args.xy_path == "zigzag":
+    if planned_ctx:
+        planned = planned_ctx["planned"]
+        if not planned.ok:
+            raise RuntimeError(f"Planned path in {planned_ctx['planned_file'].name} has fewer than 2 points.")
+        print(
+            f"  Using exported path: planner={planned.planner} phase={planned.stop_phase} "
+            f"points={len(planned.px)}"
+        )
+        (
+            path_following_controller,
+            pursuit_controller,
+            holonomic_hybrid_path,
+            s_milestones,
+            theta_milestones,
+            segment_theta_specs,
+        ) = _build_followers_from_planned(
+            planned,
+            start_xy,
+            planner_mode=args.planner,
+            pyaw=planned.pyaw,
+        )
+    elif args.xy_path == "zigzag":
         x0, x1 = args.zigzag_x0, args.zigzag_x1
         y_c = 0.0
         y_a = args.zigzag_y_amplitude
@@ -2043,6 +2280,10 @@ def main():
         elif pursuit_controller is not None:
             s_milestones = [float(x) for x in pursuit_controller.cum]
             theta_milestones = zigzag_vertex_thetas(nseg, x0, x1, y_c, y_a)
+        segment_theta_specs = resolve_segment_theta_specs(
+            s_vertices=s_milestones,
+            theta_vertices=theta_milestones,
+        )
 
     elif args.xy_path == "sine":
         x0, x1 = args.sine_x0, args.sine_x1
@@ -2093,10 +2334,15 @@ def main():
                 s_milestones.append(
                     nearest_s_on_polyline(pursuit_controller.pts, pursuit_controller.cum, pos)
                 )
+        segment_theta_specs = resolve_segment_theta_specs(
+            s_vertices=s_milestones,
+            theta_vertices=theta_milestones,
+        )
 
     print(
-        f"\nHolonomic experiment: xy_path={args.xy_path} planner={args.planner} "
-        f"theta_mode={args.theta_mode} tag={run_tag}\n"
+        f"\nHolonomic experiment: "
+        f"{'planned=' + planned_ctx['planned_file'].name if planned_ctx else 'xy_path=' + args.xy_path} "
+        f"planner={args.planner} theta_mode={args.theta_mode} tag={run_tag}\n"
         f"  start_xy={start_xy}  hybrid_L="
         f"{holonomic_hybrid_path.total_length if holonomic_hybrid_path else 'n/a'}  "
         f"pursuit_L={pursuit_controller.L if pursuit_controller else 'n/a'}\n"
@@ -2167,8 +2413,14 @@ def main():
     hybrid_retouch_t0 = 0.0
     # Remember which segment boundary has already been retouched (consume-once).
     hybrid_retouch_consumed_boundaries = set()
+    orient_gate_consumed_boundaries = set()
     # One-cycle guard after resume to avoid same-tick boundary retrigger.
     hybrid_retouch_resume_guard = False
+    segment_orient_gate = HolonomicSegmentOrientGate(
+        segment_specs=segment_theta_specs,
+        orientation_tol=float(args.orientation_complete_tol),
+    )
+    tracking_prev_s = 0.0
 
     for _ in range(n_steps):
         obj_state = get_object_state(object_uid)
@@ -2204,21 +2456,29 @@ def main():
                         )
                         if do_hybrid_retouch and hybrid_retouch_active:
                             all_in_c = all(a.in_contact for a in robot_agents.values())
+                            theta_ok = segment_orient_gate.retouch_may_resume(
+                                obj_state["orientation"]
+                            )
                             soft_end = hybrid_retouch_t0 + args.hybrid_retouch_duration
                             hard_end = soft_end + args.hybrid_retouch_timeout
                             if t >= soft_end and (all_in_c or t >= hard_end):
-                                hybrid_retouch_active = False
-                                hybrid_retouch_resume_guard = True
-                                for rname in robot_agents:
-                                    host.robot_states[rname] = RobotState.PUSHING
-                                    robot_agents[rname].set_goal("push", target_map[rname])
-                                print(
-                                    f"[hybrid retouch] resume PUSH at t={t:.2f}s "
-                                    f"(in_contact_all={all_in_c})"
-                                )
+                                if not theta_ok and t < hard_end:
+                                    pass
+                                else:
+                                    hybrid_retouch_active = False
+                                    hybrid_retouch_resume_guard = True
+                                    for rname in robot_agents:
+                                        host.robot_states[rname] = RobotState.PUSHING
+                                        robot_agents[rname].set_goal("push", target_map[rname])
+                                    print(
+                                        f"[hybrid retouch] resume PUSH at t={t:.2f}s "
+                                        f"(in_contact_all={all_in_c}, theta_ok={theta_ok})"
+                                    )
 
                         if path_following_controller is not None:
-                            if do_hybrid_retouch and hybrid_retouch_active:
+                            if segment_orient_gate.gate_active or (
+                                do_hybrid_retouch and hybrid_retouch_active
+                            ):
                                 path_following_controller.compute_velocity(dt=None)
                                 vx = vy = w_path = 0.0
                                 current_s = path_following_controller.get_current_s()
@@ -2236,28 +2496,72 @@ def main():
                                     seg_after = path_following_controller.current_segment_idx
                                     if seg_after > seg_before:
                                         boundary_key = (int(seg_before), int(seg_after))
-                                        if boundary_key not in hybrid_retouch_consumed_boundaries:
-                                            # Rewind one planning tick and enter retouch once.
-                                            path_following_controller.elapsed_time -= dt_pid
-                                            path_following_controller._update_state_from_time()
+                                        orient_done = boundary_key in orient_gate_consumed_boundaries
+                                        retouch_done = boundary_key in hybrid_retouch_consumed_boundaries
+
+                                        if orient_done and retouch_done:
+                                            vx, vy, w_path = map(float, velocity_cmd)
+                                        elif orient_done and not retouch_done and do_hybrid_retouch:
                                             hybrid_retouch_active = True
                                             hybrid_retouch_t0 = t
                                             hybrid_retouch_consumed_boundaries.add(boundary_key)
+                                            segment_orient_gate.retouch_resume_theta = (
+                                                mandated_theta_at_segment_end(
+                                                    segment_theta_specs, int(seg_before)
+                                                )
+                                            )
                                             for rname in robot_agents:
                                                 host.robot_states[rname] = RobotState.APPROACHING
-                                                robot_agents[rname].set_goal("approach", target_map[rname])
+                                                robot_agents[rname].set_goal(
+                                                    "approach", target_map[rname]
+                                                )
                                             print(
                                                 f"[hybrid retouch] boundary {seg_before}->{seg_after} "
                                                 f"at t={t:.2f}s — path refrozen, approach"
                                             )
                                             vx, vy, w_path = 0.0, 0.0, 0.0
                                         else:
-                                            # Boundary already serviced: continue forward.
-                                            vx, vy, w_path = (
-                                                float(velocity_cmd[0]),
-                                                float(velocity_cmd[1]),
-                                                float(velocity_cmd[2]),
+                                            path_following_controller.elapsed_time -= dt_pid
+                                            path_following_controller._update_state_from_time()
+                                            needs_hold = segment_orient_gate.begin_segment_end_hold(
+                                                int(seg_before),
+                                                boundary_key=boundary_key,
+                                                do_retouch=do_hybrid_retouch,
+                                                retouch_already_consumed=retouch_done,
+                                                current_orientation=obj_state["orientation"],
+                                                current_s=path_following_controller.get_current_s(),
                                             )
+                                            if needs_hold:
+                                                print(
+                                                    f"[orient gate] segment {seg_before} end "
+                                                    f"θ→{segment_orient_gate.gate_theta:.3f} rad "
+                                                    f"at t={t:.2f}s"
+                                                )
+                                            else:
+                                                orient_gate_consumed_boundaries.add(boundary_key)
+                                                if (
+                                                    segment_orient_gate.pending_retouch
+                                                    and not retouch_done
+                                                ):
+                                                    hybrid_retouch_active = True
+                                                    hybrid_retouch_t0 = t
+                                                    hybrid_retouch_consumed_boundaries.add(
+                                                        boundary_key
+                                                    )
+                                                    for rname in robot_agents:
+                                                        host.robot_states[rname] = (
+                                                            RobotState.APPROACHING
+                                                        )
+                                                        robot_agents[rname].set_goal(
+                                                            "approach", target_map[rname]
+                                                        )
+                                                    print(
+                                                        f"[hybrid retouch] boundary "
+                                                        f"{seg_before}->{seg_after} at t={t:.2f}s "
+                                                        f"— path refrozen, approach"
+                                                    )
+                                                segment_orient_gate.clear_gate()
+                                            vx, vy, w_path = 0.0, 0.0, 0.0
                                     else:
                                         vx, vy, w_path = (
                                             float(velocity_cmd[0]),
@@ -2273,19 +2577,99 @@ def main():
                                     float(velocity_cmd[2]),
                                 )
                                 current_s = path_following_controller.get_current_s()
+                                if segment_theta_specs:
+                                    crossed = completed_segment_at_s_crossing(
+                                        tracking_prev_s, current_s, segment_theta_specs
+                                    )
+                                    if crossed is not None:
+                                        boundary_key = (int(crossed), int(crossed) + 1)
+                                        if boundary_key not in orient_gate_consumed_boundaries:
+                                            path_following_controller.elapsed_time -= dt_pid
+                                            path_following_controller._update_state_from_time()
+                                            needs_hold = segment_orient_gate.begin_segment_end_hold(
+                                                int(crossed),
+                                                boundary_key=boundary_key,
+                                                do_retouch=False,
+                                                retouch_already_consumed=True,
+                                                current_orientation=obj_state["orientation"],
+                                                current_s=path_following_controller.get_current_s(),
+                                            )
+                                            if needs_hold:
+                                                print(
+                                                    f"[orient gate] segment {crossed} end "
+                                                    f"θ→{segment_orient_gate.gate_theta:.3f} rad "
+                                                    f"at t={t:.2f}s"
+                                                )
+                                            else:
+                                                orient_gate_consumed_boundaries.add(boundary_key)
+                                                segment_orient_gate.clear_gate()
+                                            vx, vy, w_path = 0.0, 0.0, 0.0
                         elif pursuit_controller is not None:
-                            vc = pursuit_controller.compute_velocity(
-                                obj_state["position"],
-                                obj_state["velocity"],
-                                dt_pid,
-                                omega_override=None,
-                            )
-                            vx, vy = float(vc[0]), float(vc[1])
-                            current_s = pursuit_controller.s_progress
+                            if segment_orient_gate.gate_active:
+                                current_s = pursuit_controller.s_progress
+                                vx = vy = 0.0
+                            else:
+                                vc = pursuit_controller.compute_velocity(
+                                    obj_state["position"],
+                                    obj_state["velocity"],
+                                    dt_pid,
+                                    omega_override=None,
+                                )
+                                vx, vy = float(vc[0]), float(vc[1])
+                                current_s = pursuit_controller.s_progress
+                                if segment_theta_specs:
+                                    crossed = completed_segment_at_s_crossing(
+                                        tracking_prev_s, current_s, segment_theta_specs
+                                    )
+                                    if crossed is not None:
+                                        boundary_key = (int(crossed), int(crossed) + 1)
+                                        if boundary_key not in orient_gate_consumed_boundaries:
+                                            pursuit_controller.s_along = float(
+                                                segment_theta_specs[crossed].s1
+                                            )
+                                            needs_hold = segment_orient_gate.begin_segment_end_hold(
+                                                int(crossed),
+                                                boundary_key=boundary_key,
+                                                do_retouch=False,
+                                                retouch_already_consumed=True,
+                                                current_orientation=obj_state["orientation"],
+                                                current_s=path_following_controller.get_current_s(),
+                                            )
+                                            if needs_hold:
+                                                print(
+                                                    f"[orient gate] segment {crossed} end "
+                                                    f"θ→{segment_orient_gate.gate_theta:.3f} rad "
+                                                    f"at t={t:.2f}s"
+                                                )
+                                            else:
+                                                orient_gate_consumed_boundaries.add(boundary_key)
+                                                segment_orient_gate.clear_gate()
+                                            vx, vy = 0.0, 0.0
 
-                        if theta_mode_enum == ThetaMode.PATH:
+                        if segment_orient_gate.gate_active:
+                            desired_obj_velocity, desired_obj_omega, gate_ok = apply_orientation_hold(
+                                current_orientation=obj_state["orientation"],
+                                current_angular_velocity=obj_state["angular_velocity"],
+                                hold_theta=segment_orient_gate.gate_theta,
+                                orientation_tol=float(args.orientation_complete_tol),
+                            )
+                            if gate_ok:
+                                retouch_key, orient_key = segment_orient_gate.clear_gate()
+                                if orient_key is not None:
+                                    orient_gate_consumed_boundaries.add(orient_key)
+                                if retouch_key is not None:
+                                    hybrid_retouch_active = True
+                                    hybrid_retouch_t0 = t
+                                    hybrid_retouch_consumed_boundaries.add(retouch_key)
+                                    for rname in robot_agents:
+                                        host.robot_states[rname] = RobotState.APPROACHING
+                                        robot_agents[rname].set_goal("approach", target_map[rname])
+                                    print(
+                                        f"[hybrid retouch] boundary {retouch_key[0]}->{retouch_key[1]} "
+                                        f"at t={t:.2f}s — path refrozen, approach"
+                                    )
+                        elif theta_mode_enum == ThetaMode.PATH:
                             desired_obj_velocity = np.array([vx, vy])
-                            # Heading reference is sine in arc length only (decoupled from path tangent).
                             theta_goal = float(args.path_theta_sine_amp) * float(
                                 np.sin(float(args.path_theta_sine_k) * float(current_s))
                             )
@@ -2302,8 +2686,8 @@ def main():
                                 obj_state["angular_velocity"],
                             )
                         else:
-                            th_goal = theta_goal_for_waypoint_mode(
-                                current_s, s_milestones, theta_milestones
+                            th_goal = theta_goal_at_segment_endpoint(
+                                current_s, segment_theta_specs, obj_state["orientation"]
                             )
                             desired_obj_velocity = np.array([vx, vy])
                             desired_obj_omega = orientation_pid_omega(
@@ -2312,14 +2696,38 @@ def main():
                                 obj_state["angular_velocity"],
                             )
 
-                        done = False
-                        if path_following_controller is not None and path_following_controller.is_completed():
-                            done = True
-                        if pursuit_controller is not None and pursuit_controller.is_completed():
-                            done = True
-                        if done:
-                            desired_obj_velocity = np.array([0.0, 0.0])
-                            desired_obj_omega = 0.0
+                        if not segment_orient_gate.gate_active:
+                            if path_following_controller is not None:
+                                s_total = float(path_following_controller.hybrid_path.total_length)
+                            elif pursuit_controller is not None:
+                                s_total = float(pursuit_controller.L)
+                            else:
+                                s_total = float(current_s)
+                            path_xy_done = holonomic_path_xy_completed(
+                                path_following_controller, pursuit_controller
+                            )
+                            final_theta = final_theta_goal_for_mode(
+                                theta_mode_enum,
+                                s_total=s_total,
+                                theta_milestones=theta_milestones,
+                                segment_specs=segment_theta_specs,
+                                fixed_theta=float(args.fixed_theta),
+                                path_theta_sine_amp=float(args.path_theta_sine_amp),
+                                path_theta_sine_k=float(args.path_theta_sine_k),
+                            )
+                            desired_obj_velocity, desired_obj_omega, _scenario_done = (
+                                apply_path_completion_to_desired_motion(
+                                    desired_obj_velocity=desired_obj_velocity,
+                                    desired_obj_omega=desired_obj_omega,
+                                    current_orientation=obj_state["orientation"],
+                                    current_angular_velocity=obj_state["angular_velocity"],
+                                    path_xy_done=path_xy_done,
+                                    final_theta=final_theta,
+                                    orientation_tol=float(args.orientation_complete_tol),
+                                )
+                            )
+
+                        tracking_prev_s = float(current_s)
 
                         if pid_cycle_count % (PID_DECIMATION * 100) == 0:
                             prog = (

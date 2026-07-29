@@ -1,19 +1,17 @@
 """
 SE(2) holonomic planner (mod_grid_SE):
 
-This file is currently focused on **Phase 1**: an augmented grid A* with yaw in the state.
+Phase 1 — SE(2) A* on a precomputed 3D conservative occupancy volume.
+    State: (grid_x, grid_y, yaw_idx)  — no m_prev (unlike 2D disk mod_grid).
+    - 12-connected moves: 4 cardinal XY × {dθ ∈ {-1,0,+1} bins}
+    - 3-cell edge gate on the product grid (see se2_grid_volume.se2_edge_free_3cell)
+    - Offline volume: convex footprint + OBB SAT; disk-free columns free at all θ
+    Edge cost: c_move + c_rot·|dθ|  (rotation costs extra; no c_risk / c_heading)
+    Heuristic: disk BFS h_xy + disk-column-gated h_θ (admissible)
 
-Phase 1 — SE(2) augmented A*
-    State: (grid_x, grid_y, yaw_idx, m_prev)
-    - translation edges: 8-connected moves on the x-y grid; yaw is unchanged
-    - rotation edges: in-place yaw changes; x-y is unchanged
-    Edge cost: c_move + c_risk(d_min) + c_heading(m_prev, m_new) + c_yaw(yaw_delta)
-      - c_risk: piecewise penalty from clearance between the robot footprint boundary samples and obstacle points
-      - c_heading: penalty for turning away from the previous translation direction (straight legs)
+Phase 3 — constant body-twist DP (legacy; not yet updated for the 3D volume).
 
-Important:
-  - Phase 2/3 are still the original mod_grid implementations and are not yet SE(2)-consistent.
-  - `astar_planning(..., stop_phase=1)` is the supported entrypoint for now.
+``astar_planning(..., stop_phase=1)`` is the primary entrypoint.
 """
 
 from __future__ import annotations
@@ -23,8 +21,9 @@ import heapq
 import math
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -69,19 +68,31 @@ except Exception:
 
 
 def _rect_polys_from_obstacle_rects(
-    obstacle_rects: Optional[List[Tuple[float, float, float, float]]],
+    obstacle_rects: Optional[List[Tuple[float, ...]]],
 ) -> List:
-    """Axis-aligned rectangle obstacles as Shapely polygons (world frame, meters)."""
+    """Rectangle obstacles as Shapely polygons (axis-aligned or oriented)."""
     if not (_HAS_SHAPELY and obstacle_rects):
         return []
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import ObstacleRect, parse_rect_values
+
     out: List = []
     for t in obstacle_rects:
-        if len(t) != 4:
-            continue
-        rx, ry, rw, rh = map(float, t)
-        x0, y0 = rx, ry
-        x1, y1 = rx + rw, ry + rh
-        out.append(_ShapelyPolygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)]))
+        if len(t) == 4:
+            rx, ry, rw, rh = map(float, t)
+            rect = ObstacleRect(cx=rx + 0.5 * rw, cy=ry + 0.5 * rh, w=rw, h=rh)
+        elif len(t) == 5:
+            cx, cy, rw, rh, ang = map(float, t)
+            rect = ObstacleRect(cx=cx, cy=cy, w=rw, h=rh, angle_deg=ang)
+        else:
+            try:
+                rect = parse_rect_values(t)
+            except ValueError:
+                continue
+        corners = rect.corners()
+        out.append(_ShapelyPolygon(corners))
     return out
 
 
@@ -133,7 +144,7 @@ def _geom_vertices_xy(geom: Any) -> List[Tuple[float, float]]:
     """
     Exterior vertices for polygon-like geometry.
     Used for cheap vertex-inside quick rejection.
-    """
+    """ 
     if not _HAS_SHAPELY or geom is None:
         return []
     if getattr(geom, "is_empty", True):
@@ -251,13 +262,23 @@ M_PREV_NONE = -1
 _NUM_MOTION = 8
 
 # SE(2) tunables
-# 5° bins so Phase 1 can hit goal orientation reliably.
-_YAW_BINS = 72
+# 10° bins (36 layers) — sufficient with four-corner edge checks.
+_YAW_BINS = 36
 _YAW_STEP_RAD = 2.0 * math.pi / float(_YAW_BINS)
 _YAW_GOAL_TOL_BINS = 0  # accept if within +/- this many yaw bins
 
-# Rotation penalty (kept in similar "cost units" as motion costs)
+# Rotation penalty per yaw-bin step (when dθ ≠ 0 on an edge)
 _ROTATE_COST_PER_BIN = 0.35
+
+# SE(2) Phase-1 edge costs (cardinal grid)
+_C_MOVE = 1.0
+_C_ROT = _ROTATE_COST_PER_BIN
+
+# Phase 3 SE(2) primitive / collision modes
+SE_P3_PRIMITIVE_LINEAR_YAW = "linear_yaw_dp"
+SE_P3_PRIMITIVE_BODY_TWIST = "body_twist"
+SE_P3_COLLISION_VOLUME_BIN = "volume_bin"
+SE_P3_COLLISION_SAT_DIRECT = "sat_direct"
 
 # Shape collision / clearance
 _SHAPE_MAX_BOUNDARY_SAMPLES = 48
@@ -441,6 +462,12 @@ def _sample_polygon_boundary(
 
 
 def _extract_robot_footprint_vertices_local(scenario_robot: dict, reso: float) -> List[Tuple[float, float]]:
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_planner_bridge import _resolve_robot_dict
+
+    scenario_robot = _resolve_robot_dict(scenario_robot)
     # Direct 2D vertices
     for k in ("footprint_vertices", "vertices", "shape_vertices"):
         if k in scenario_robot and isinstance(scenario_robot[k], list) and scenario_robot[k]:
@@ -455,34 +482,49 @@ def _extract_robot_footprint_vertices_local(scenario_robot: dict, reso: float) -
         from object_utils import create_standard_objects
 
         objs = create_standard_objects()
-        if shape_name not in objs:
-            raise ValueError(f"Unknown robot.shape_name='{shape_name}'. Available keys: {sorted(objs.keys())}")
-        poly = objs[shape_name].geometry
-        pts_raw = list(poly.exterior.coords)
-        pts = [(float(x), float(y)) for (x, y) in pts_raw]
-        if len(pts) >= 2 and abs(pts[0][0] - pts[-1][0]) < 1e-9 and abs(pts[0][1] - pts[-1][1]) < 1e-9:
-            pts = pts[:-1]
-        pts = _vertices_centered_at_centroid(pts)
-        # create_standard_objects() uses fixed ~0.3–1 m shapes; scale so circumradius matches
-        # max(width,length)/2 (same characteristic size as the disk holonomic robot in HA_draw).
-        width = float(scenario_robot.get("width", 2.0))
-        length = float(scenario_robot.get("length", 3.0))
-        target_r = max(width, length) / 2.0
-        r_ref = max(math.hypot(x, y) for x, y in pts)
-        if r_ref > 1e-9:
-            s = target_r / r_ref
-            pts = [(s * x, s * y) for x, y in pts]
-        return pts
+        if shape_name in objs:
+            poly = objs[shape_name].geometry
+            pts_raw = list(poly.exterior.coords)
+            pts = [(float(x), float(y)) for (x, y) in pts_raw]
+            if len(pts) >= 2 and abs(pts[0][0] - pts[-1][0]) < 1e-9 and abs(pts[0][1] - pts[-1][1]) < 1e-9:
+                pts = pts[:-1]
+            pts = _vertices_centered_at_centroid(pts)
+            return pts
 
-    # OBJ -> 2D vertices slice (headless "real" pipeline)
+    # OBJ -> 2D footprint (prefer precomputed cache from preprocess_obj_footprints.py)
+    obj_path = None
     for k in ("obj_path", "mesh_obj", "obj"):
         if k in scenario_robot and scenario_robot[k]:
-            from object_utils import read_obj_to_vertices
+            obj_path = str(scenario_robot[k])
+            break
+    shape_name = str(scenario_robot.get("shape_name", "")).strip() or None
+    if obj_path or shape_name:
+        vertices = None
+        try:
+            import rospkg
 
-            vertices = read_obj_to_vertices(scenario_robot[k])
+            pkg_src = Path(rospkg.RosPack().get_path("contact_maintain")) / "src"
+            if str(pkg_src) not in sys.path:
+                sys.path.insert(0, str(pkg_src))
+            from contact_maintain.footprint_cache import resolve_footprint_vertices
+
+            vertices = resolve_footprint_vertices(shape_name=shape_name, obj_path=obj_path)
+        except Exception:
+            if obj_path:
+                from object_utils import read_obj_to_vertices
+
+                vertices = read_obj_to_vertices(obj_path)
+        if vertices:
             if len(vertices) < 3:
-                raise ValueError("OBJ->2D slice produced < 3 vertices")
-            return _vertices_centered_at_centroid(vertices)
+                raise ValueError("OBJ footprint has < 3 vertices")
+            pts = _vertices_centered_at_centroid(vertices)
+            return pts
+
+    if "shape_name" in scenario_robot:
+        shape_name = str(scenario_robot["shape_name"])
+        raise ValueError(
+            f"Unknown robot.shape_name='{shape_name}' and no obj_path provided."
+        )
 
     # Fallback: rectangle from width/length
     width = float(scenario_robot.get("width", 2.0))
@@ -498,22 +540,309 @@ def _yaw_delta_bins(y0: int, y1: int) -> int:
     return min(d, _YAW_BINS - d)
 
 
-def _state_index_se2(x: int, y: int, yaw_idx: int, m_in: int, P: base_astar.Para) -> int:
+def _robot_circumradius(robot_vertices_local: List[Tuple[float, float]]) -> float:
+    return float(max(math.hypot(x, y) for (x, y) in robot_vertices_local))
+
+
+def _yaw_fill_disk_path(n: int, syaw_rad: float, gyaw_rad: float) -> List[float]:
+    """Linear yaw interpolation along a disk (x,y) polyline."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [float(gyaw_rad)]
+    delta = math.atan2(math.sin(gyaw_rad - syaw_rad), math.cos(gyaw_rad - syaw_rad))
+    out: List[float] = []
+    for i in range(n):
+        t = i / float(n - 1)
+        yaw = syaw_rad + t * delta
+        out.append(float(math.atan2(math.sin(yaw), math.cos(yaw))))
+    return out
+
+
+def _normalize_obstacle_rects(
+    obstacle_rects: Optional[Sequence[Union[Tuple[float, ...], Any]]],
+) -> List:
+    if not obstacle_rects:
+        return []
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import ObstacleRect, obstacle_rects_from_se_values
+
+    first = obstacle_rects[0]
+    if isinstance(first, ObstacleRect):
+        return list(obstacle_rects)
+    return obstacle_rects_from_se_values(obstacle_rects)  # type: ignore[arg-type]
+
+
+def _motion_index_for_delta(dx: int, dy: int, motion: List[List[int]]) -> int:
+    for mi, mv in enumerate(motion):
+        if mv[0] == dx and mv[1] == dy:
+            return mi
+    return -1
+
+
+def _se2_neighbors_12() -> List[Tuple[int, int, int]]:
+    """4 cardinal XY moves × {dθ ∈ {-1, 0, +1} yaw bins} = 12 edges."""
+    out: List[Tuple[int, int, int]] = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for dt in (-1, 0, 1):
+            out.append((dx, dy, dt))
+    return out
+
+
+_SE2_NEIGHBORS_12 = _se2_neighbors_12()
+
+
+def _manhattan_xy(x: int, y: int, gx: int, gy: int) -> int:
+    return abs(int(x) - int(gx)) + abs(int(y) - int(gy))
+
+
+def _build_disk_cardinal_dist_to_goal(
+    gx: int,
+    gy: int,
+    P: base_astar.Para,
+    disk_obsmap: np.ndarray,
+) -> np.ndarray:
+    """Cardinal BFS distance (grid steps) from each cell to goal on the disk-free subgraph."""
+    from collections import deque
+
+    xw, yw = disk_obsmap.shape
+    inf = np.iinfo(np.int32).max // 4
+    dist = np.full((xw, yw), inf, dtype=np.int32)
+    gix = int(gx) - int(P.minx)
+    giy = int(gy) - int(P.miny)
+    if gix < 0 or giy < 0 or gix >= xw or giy >= yw:
+        return dist
+    dist[gix, giy] = 0
+    q: deque = deque([(gix, giy)])
+    while q:
+        ix, iy = q.popleft()
+        base = int(dist[ix, iy])
+        for dix, diy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nix, niy = ix + dix, iy + diy
+            if nix < 0 or niy < 0 or nix >= xw or niy >= yw:
+                continue
+            if disk_obsmap[nix, niy]:
+                continue
+            nd = base + 1
+            if nd < dist[nix, niy]:
+                dist[nix, niy] = nd
+                q.append((nix, niy))
+    return dist
+
+
+def _state_index_se2(x: int, y: int, yaw_idx: int, P: base_astar.Para) -> int:
     cell = (y - P.miny) * P.xw + (x - P.minx)
-    m_id = m_in + 1  # -1 -> 0, 0..7 -> 1..8
-    return (((cell * _YAW_BINS) + yaw_idx) * 9) + m_id
+    return cell * _YAW_BINS + (int(yaw_idx) % _YAW_BINS)
 
 
 class _AugNodeSE2:
-    __slots__ = ("x", "y", "yaw_idx", "m_in", "cost", "p_ind")
+    __slots__ = ("x", "y", "yaw_idx", "cost", "p_ind")
 
-    def __init__(self, x: int, y: int, yaw_idx: int, m_in: int, cost: float, p_ind: int):
+    def __init__(self, x: int, y: int, yaw_idx: int, cost: float, p_ind: int):
         self.x = x
         self.y = y
         self.yaw_idx = yaw_idx
-        self.m_in = m_in
         self.cost = cost
         self.p_ind = p_ind
+
+
+def _ms(seconds: float) -> float:
+    return 1000.0 * float(seconds)
+
+
+def format_se2_pipeline_report(
+    timing: Dict[str, float],
+    *,
+    prep: Optional[Dict[str, float]] = None,
+    meta: Optional[Dict[str, object]] = None,
+    phase3_s: Optional[float] = None,
+    wall_s: Optional[float] = None,
+) -> List[str]:
+    """Human-readable pipeline lines for the app status log."""
+    prep = prep or {}
+    meta = meta or {}
+    lines: List[str] = []
+
+    phase = int(meta.get("phase", 1))
+    lines.append(f"[timing] mod_grid_SE pipeline (stop phase {phase})")
+
+    meta_bits = []
+    if "shape" in meta:
+        meta_bits.append(f"shape={meta['shape']}")
+    if "reso" in meta:
+        meta_bits.append(f"reso={meta['reso']}")
+    if "map_w" in meta and "map_h" in meta:
+        meta_bits.append(f"map={meta['map_w']}x{meta['map_h']}m")
+    if "obstacle_pts" in meta:
+        meta_bits.append(f"ox={meta['obstacle_pts']}")
+    if "footprint_verts" in meta:
+        meta_bits.append(f"footprint_verts={meta['footprint_verts']}")
+    if "safety_margin" in meta:
+        meta_bits.append(f"margin={meta['safety_margin']}")
+    if meta_bits:
+        lines.append("  setup: " + " ".join(meta_bits))
+    if prep.get("footprint_s", 0.0) > 0.0:
+        lines.append(f"  prep: footprint={_ms(prep['footprint_s']):.0f}ms")
+
+    disk_ms = _ms(timing.get("disk_astar_s", 0.0))
+    if timing.get("disk_fast_path", 0.0) >= 0.5:
+        lines.append(
+            f"  1 disk A*: {disk_ms:.0f}ms -> GOAL REACHED (disk holonomic); skip volume + SE A*"
+        )
+    else:
+        reached = "NO" if timing.get("disk_goal_reached", 0.0) < 0.5 else "YES"
+        closed = int(timing.get("disk_closed_cells", 0.0))
+        lines.append(
+            f"  1 disk A*: {disk_ms:.0f}ms -> goal reached={reached} closed={closed}"
+        )
+        vol_ms = _ms(timing.get("volume_s", 0.0))
+        if vol_ms > 0.0:
+            cells_sat = int(timing.get("vol_cells_sat", 0.0))
+            cells_lazy = int(timing.get("vol_cells_lazy", 0.0))
+            occ_true = int(timing.get("vol_occ_true", 0.0))
+            disk_blk = int(timing.get("vol_disk_blocked", 0.0))
+            parts = int(timing.get("vol_convex_parts", 0.0))
+            classify_ms = _ms(timing.get("vol_classify_s", 0.0))
+            lazy_sat_ms = _ms(timing.get("vol_lazy_sat_s", 0.0))
+            lazy_queries = int(timing.get("vol_lazy_sat_queries", 0.0))
+            lines.append(
+                f"  2 volume: {vol_ms:.0f}ms "
+                f"(disk_map={_ms(timing.get('vol_disk_map_s', 0.0)):.0f}ms "
+                f"classify={classify_ms:.0f}ms "
+                f"lazy_sat={lazy_sat_ms:.0f}ms "
+                f"clearance={_ms(timing.get('vol_clearance_s', 0.0)):.0f}ms) "
+                f"cells={cells_sat} lazy={cells_lazy} lazy_queries={lazy_queries} "
+                f"disk_blk={disk_blk} occ_vox={occ_true} parts={parts}"
+            )
+        se_ms = _ms(timing.get("se_astar_s", 0.0))
+        if se_ms > 0.0:
+            se_exp = int(timing.get("se_expanded_states", timing.get("se_closed_states", 0.0)))
+            se_rate = float(timing.get("se_states_per_s", 0.0))
+            se_max_open = int(timing.get("se_max_open", 0.0))
+            se_stale = int(timing.get("se_stale_pops", 0.0))
+            path_pts = int(timing.get("path_pts", 0.0))
+            rate_s = f" {se_rate:.0f} states/s" if se_rate > 0.0 else ""
+            lines.append(
+                f"  3 SE A*: {se_ms:.0f}ms expanded={se_exp}{rate_s} "
+                f"open_max={se_max_open} stale_pops={se_stale} -> path {path_pts} pts"
+            )
+
+    if phase3_s is not None:
+        lines.append(f"  4 phase3 DP: {_ms(phase3_s):.0f}ms")
+
+    path_stats = meta.get("path_stats")
+    if isinstance(path_stats, dict) and path_stats:
+        poly_len = float(path_stats.get("polyline_length_m", 0.0))
+        prim_len = float(path_stats.get("primitive_length_m", 0.0))
+        n_prims = int(path_stats.get("n_primitives", 0))
+        n_s = int(path_stats.get("n_straight", 0))
+        n_c = int(path_stats.get("n_arc", 0))
+        out_pts = int(path_stats.get("output_pts", 0))
+        p1_pts = int(path_stats.get("p1_spine_pts", 0))
+        fallback = bool(path_stats.get("p3_fallback", False))
+        compressed = bool(path_stats.get("p3_compressed", False))
+        fb_note = " fallback=phase1" if fallback else (" compressed" if compressed else "")
+        lines.append(
+            f"  path: {out_pts} pts len={poly_len:.2f}m | "
+            f"prims={n_prims} (S={n_s} C={n_c}) prim_len={prim_len:.2f}m | "
+            f"p1={p1_pts}{fb_note}"
+        )
+        direct_q = int(path_stats.get("direct_sat_queries", 0))
+        if direct_q > 0:
+            lines.append(f"  phase3 direct SAT queries: {direct_q}")
+
+    plan_ms = _ms(timing.get("total_s", 0.0))
+    if phase3_s is not None:
+        plan_ms += _ms(phase3_s)
+    wall_ms = _ms(wall_s) if wall_s is not None else plan_ms
+    lines.append(f"  TOTAL: planner={plan_ms:.0f}ms wall={wall_ms:.0f}ms")
+    return lines
+
+
+def _merge_volume_lazy_timing(vol_timing: Dict[str, float], volume: Any) -> None:
+    """Fold on-demand SAT stats accumulated during SE A* into volume timing."""
+    if volume is None:
+        return
+    lazy_s = float(getattr(volume, "lazy_sat_s", 0.0))
+    lazy_q = int(getattr(volume, "lazy_sat_queries", 0))
+    if lazy_s > 0.0 or lazy_q > 0:
+        vol_timing["lazy_sat_s"] = lazy_s
+        vol_timing["lazy_sat_queries"] = float(lazy_q)
+        vol_timing["sat_s"] = lazy_s
+
+
+def _fill_phase1_timing(
+    timing: Dict[str, float],
+    *,
+    t_all: float,
+    t_disk0: float,
+    t_disk1: float,
+    t_vol0: float,
+    t_vol1: float,
+    t_se0: Optional[float],
+    vol_timing: Dict[str, float],
+    disk_goal_reached_flag: bool,
+    reachable_xy: Set[Tuple[int, int]],
+    se_closed: int,
+    path_pts: int,
+    disk_fast_path: bool,
+    se_heap_pops: int = 0,
+    se_stale_pops: int = 0,
+    se_max_open: int = 0,
+) -> None:
+    se_s = (time.perf_counter() - t_se0) if t_se0 is not None else 0.0
+    timing.clear()
+    timing.update(
+        {
+            "disk_astar_s": t_disk1 - t_disk0,
+            "volume_s": t_vol1 - t_vol0,
+            "se_astar_s": se_s,
+            "disk_fast_path": 1.0 if disk_fast_path else 0.0,
+            "disk_goal_reached": 1.0 if disk_goal_reached_flag else 0.0,
+            "disk_closed_cells": float(len(reachable_xy)),
+            "se_expanded_states": float(se_closed),
+            "se_closed_states": float(se_closed),
+            "se_heap_pops": float(se_heap_pops),
+            "se_stale_pops": float(se_stale_pops),
+            "se_max_open": float(se_max_open),
+            "se_states_per_s": float(se_closed) / se_s if se_s > 1e-9 and se_closed > 0 else 0.0,
+            "path_pts": float(path_pts),
+            "total_s": time.perf_counter() - t_all,
+        }
+    )
+    if vol_timing:
+        timing.update(
+            {
+                "vol_decompose_s": vol_timing.get("decompose_s", 0.0),
+                "vol_disk_map_s": vol_timing.get("disk_map_s", 0.0),
+                "vol_classify_s": vol_timing.get("classify_s", 0.0),
+                "vol_sat_s": vol_timing.get("sat_s", 0.0),
+                "vol_lazy_sat_s": vol_timing.get("lazy_sat_s", 0.0),
+                "vol_lazy_sat_queries": vol_timing.get("lazy_sat_queries", 0.0),
+                "vol_disk_reuse_s": vol_timing.get("disk_reuse_s", 0.0),
+                "vol_clearance_s": vol_timing.get("clearance_s", 0.0),
+                "vol_cells_sat": vol_timing.get("cells_sat", 0.0),
+                "vol_cells_lazy": vol_timing.get("cells_lazy", 0.0),
+                "vol_occ_true": vol_timing.get("occ_true", 0.0),
+                "vol_disk_blocked": vol_timing.get("disk_blocked", 0.0),
+                "vol_convex_parts": vol_timing.get("convex_parts", 0.0),
+                "vol_grid_xy": vol_timing.get("grid_xy", 0.0),
+            }
+        )
+
+
+def _p3_phase1_result(
+    px: List[float],
+    py: List[float],
+    pyaw: List[float],
+    volume: Optional[Any],
+    return_volume: bool,
+):
+    if return_volume:
+        return px, py, pyaw, volume
+    return px, py, pyaw
 
 
 def phase1_augmented_astar_se2(
@@ -528,209 +857,155 @@ def phase1_augmented_astar_se2(
     reso: float,
     robot_vertices_local: List[Tuple[float, float]],
     safety_margin: float = 0.0,
-    obstacle_rects: Optional[List[Tuple[float, float, float, float]]] = None,
+    obstacle_rects: Optional[Sequence] = None,
     obstacle_polygons: Optional[List[List[Tuple[float, float]]]] = None,
     map_bounds: Optional[Tuple[float, float, float, float]] = None,
-) -> Tuple[List[float], List[float], List[float]]:
-    motion = _get_motion()
+    volume: Optional[Any] = None,
+    timing: Optional[Dict[str, float]] = None,
+    return_volume: bool = False,
+) -> Union[Tuple[List[float], List[float], List[float]], Tuple[List[float], List[float], List[float], Any]]:
+    del obstacle_polygons  # v1: OBB rects + point cloud only
+
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import clamp_safety_margin
+    from se2_grid_volume import build_se2_grid_volume, se2_edge_free_3cell
+
+    import HybridAstarPlanner.mod_grid as mod_grid_disk
+
+    safety_margin = clamp_safety_margin(safety_margin)
+    rects = _normalize_obstacle_rects(obstacle_rects)
+    rr = _robot_circumradius(robot_vertices_local)
 
     sx_i, sy_i = round(sx / reso), round(sy / reso)
     gx_i, gy_i = round(gx / reso), round(gy / reso)
     syaw_idx = _yaw_to_bin(syaw_rad)
     gyaw_idx = _yaw_to_bin(gyaw_rad)
 
-    # Hard clearance threshold for footprint samples. This is the "true" collision gate.
-    # We also use it to define a conservative occupancy radius for quick acceptance below.
-    hard_pad = (
-        max(_SHAPE_MIN_HARD_CLEARANCE_PAD, _SHAPE_HARD_CLEARANCE_PAD_FACTOR * float(reso))
-        + float(safety_margin)
+    t_all = time.perf_counter()
+    t_disk0 = time.perf_counter()
+    px_disk, py_disk, disk_goal_reached, reachable_xy, _reachable_cost = (
+        mod_grid_disk.phase1_augmented_astar_with_meta(
+            sx,
+            sy,
+            gx,
+            gy,
+            ox,
+            oy,
+            reso,
+            rr,
+            safety_margin=float(safety_margin),
+            obstacle_rects=rects if rects else None,
+        )
     )
+    t_disk1 = time.perf_counter()
+    if disk_goal_reached and len(px_disk) >= 2:
+        if timing is not None:
+            timing.clear()
+            timing.update(
+                {
+                    "disk_astar_s": t_disk1 - t_disk0,
+                    "volume_s": 0.0,
+                    "se_astar_s": 0.0,
+                    "disk_fast_path": 1.0,
+                    "disk_goal_reached": 1.0,
+                    "disk_closed_cells": float(len(reachable_xy)),
+                    "path_pts": float(len(px_disk)),
+                    "total_s": time.perf_counter() - t_all,
+                }
+            )
+        return _p3_phase1_result(
+            px_disk, py_disk, _yaw_fill_disk_path(len(px_disk), syaw_rad, gyaw_rad),
+            None, return_volume,
+        )
 
-    # Bounding circle for cheap occupancy prefiltering.
-    rb = float(max(math.hypot(x, y) for (x, y) in robot_vertices_local))
-    # If a cell is free for this inflated disk, then the polygon boundary samples are guaranteed
-    # to have clearance > hard_pad (disk encloses polygon). This lets us skip the expensive
-    # `_pose_is_valid` evaluation in the common case.
-    occ_rr = rb + hard_pad
+    t_vol0 = time.perf_counter()
+    if volume is None:
+        vol_timing: Dict[str, float] = {}
+        volume = build_se2_grid_volume(
+            ox=ox,
+            oy=oy,
+            reso=reso,
+            robot_vertices_local=robot_vertices_local,
+            safety_margin=float(safety_margin),
+            rects=rects,
+            map_bounds=map_bounds,
+            n_yaw_bins=_YAW_BINS,
+            reachable_disk_cells=reachable_xy,
+            timing=vol_timing,
+        )
+    else:
+        vol_timing = {}
+    t_vol1 = time.perf_counter()
 
-    obstacle_rect_polys = _rect_polys_from_obstacle_rects(obstacle_rects)
-    obstacle_poly_geoms = _poly_obstacles_from_vertices(obstacle_polygons)
-    obstacle_geoms = obstacle_rect_polys + obstacle_poly_geoms
-    obstacle_tree, obstacle_bounds = _build_spatial_index(obstacle_geoms)
-    obstacle_vertices_xy = {id(g): _geom_vertices_xy(g) for g in obstacle_geoms}
-    map_inner = None
-    if _HAS_SHAPELY and map_bounds is not None:
-        x0, y0, x1, y1 = map(float, map_bounds)
-        if x1 > x0 and y1 > y0:
-            world_box = _ShapelyBox(x0, y0, x1, y1)
-            map_inner = world_box.buffer(1e-6)
-
-    ox_g = [float(x) / reso for x in ox]
-    oy_g = [float(y) / reso for y in oy]
-    P, obsmap = base_astar.calc_parameters(ox_g, oy_g, occ_rr, reso)
+    P = volume.P
+    disk_obsmap = volume.disk_obsmap
+    disk_dist = _build_disk_cardinal_dist_to_goal(gx_i, gy_i, P, disk_obsmap)
+    disk_dist_inf = int(np.iinfo(np.int32).max // 8)
+    goal_disk_free = volume.disk_column_free(gx_i, gy_i)
 
     def in_bounds(x: int, y: int) -> bool:
-        if x <= P.minx or x >= P.maxx or y <= P.miny or y >= P.maxy:
+        return P.minx < x < P.maxx and P.miny < y < P.maxy
+
+    def pose_free(x: int, y: int, yaw_idx: int) -> bool:
+        if not in_bounds(x, y):
             return False
-        return True
-
-    def ok_cell_fast(x: int, y: int) -> bool:
-        """Cheap disk-occupancy check (conservative accept only)."""
-        return not obsmap[x - P.minx][y - P.miny]
-
-    # Boundary samples for clearance against obstacle point cloud.
-    sample_step = max(0.05, _SHAPE_SAMPLE_STEP_FACTOR * float(reso))
-    robot_boundary = _sample_polygon_boundary(
-        robot_vertices_local, sample_step=sample_step, max_samples=_SHAPE_MAX_BOUNDARY_SAMPLES
-    )  # (N_pts,2)
-
-    if ox and oy and _HAS_KDTREE:
-        tree = _cKDTree(np.column_stack([ox, oy]).astype(np.float64))
-        obs_arr = None
-    else:
-        tree = None
-        obs_arr = np.column_stack([ox, oy]).astype(np.float64) if (ox and oy) else np.zeros((0, 2), dtype=np.float64)
-
-    clearance_cache: Dict[Tuple[int, int, int], float] = {}
-    valid_cache: Dict[Tuple[int, int, int], bool] = {}
-
-    def _min_clearance_at_pose(x_i: int, y_i: int, yaw_idx: int) -> float:
-        key = (x_i, y_i, yaw_idx)
-        if key in clearance_cache:
-            return clearance_cache[key]
-
-        xw = float(x_i) * float(reso)
-        yw = float(y_i) * float(reso)
-        yaw = _bin_to_yaw(yaw_idx)
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-        R = np.array([[c, -s], [s, c]], dtype=np.float64)
-        world_pts = (robot_boundary @ R.T) + np.array([xw, yw], dtype=np.float64)
-
-        if tree is not None:
-            d, _ = tree.query(world_pts, k=1)
-            d_min = float(np.min(d))
-        else:
-            if obs_arr.shape[0] == 0:
-                d_min = float("inf")
-            else:
-                diff = world_pts[:, None, :] - obs_arr[None, :, :]
-                dist = np.hypot(diff[..., 0], diff[..., 1])
-                d_min = float(np.min(dist))
-
-        clearance_cache[key] = d_min
-        return d_min
-
-    def _pose_is_valid(x_i: int, y_i: int, yaw_idx: int) -> bool:
-        key = (x_i, y_i, yaw_idx)
-        if key in valid_cache:
-            return valid_cache[key]
-
-        xw = float(x_i) * float(reso)
-        yw = float(y_i) * float(reso)
-        yaw = _bin_to_yaw(yaw_idx)
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-        world_vertices = [(c * vx - s * vy + xw, s * vx + c * vy + yw) for (vx, vy) in robot_vertices_local]
-
-        # Stage A (cheap): if point-cloud gate fails, reject immediately.
-        d_min = _min_clearance_at_pose(x_i, y_i, yaw_idx)
-        if not (d_min > hard_pad):
-            valid_cache[key] = False
-            return False
-
-        if not _HAS_SHAPELY:
-            valid_cache[key] = True
+        if volume.disk_column_free(x, y):
             return True
+        return not volume.is_occupied(x, y, yaw_idx)
 
-        poly = _ShapelyPolygon(world_vertices)
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty:
-            valid_cache[key] = False
-            return False
-
-        # Stage B (exact geometry): check continuous map wall + obstacle polygons.
-        if map_inner is not None:
-            if map_inner.is_empty or (not map_inner.covers(poly)):
-                valid_cache[key] = False
-                return False
-
-        # Stage B: narrow expensive checks to only nearby obstacle AABBs.
-        query_bounds = _expand_bounds(tuple(map(float, poly.bounds)), hard_pad)
-        obstacle_candidates = _query_spatial_candidates(query_bounds, obstacle_geoms, obstacle_tree, obstacle_bounds)
-
-        # Cheap early rejects:
-        # 1) any robot vertex inside an obstacle candidate
-        for vx, vy in world_vertices:
-            p = _ShapelyPoint(float(vx), float(vy))
-            for og in obstacle_candidates:
-                if og.covers(p):
-                    valid_cache[key] = False
-                    return False
-        # 2) any obstacle vertex inside robot polygon
-        for og in obstacle_candidates:
-            for ovx, ovy in obstacle_vertices_xy.get(id(og), []):
-                if poly.covers(_ShapelyPoint(float(ovx), float(ovy))):
-                    valid_cache[key] = False
-                    return False
-
-        for og in obstacle_candidates:
-            if poly.distance(og) <= hard_pad + 1e-9:
-                valid_cache[key] = False
-                return False
-
-        # Stage C: sparse-point containment fallback.
-        if not ox:
-            valid_cache[key] = True
-            return True
-
-        query_r = float(rb + hard_pad + max(0.05, 0.25 * float(reso)))
-        near_pts: np.ndarray
-        if tree is not None:
-            idxs = tree.query_ball_point([xw, yw], r=query_r)
-            if not idxs:
-                valid_cache[key] = True
-                return True
-            near_pts = np.asarray(tree.data[idxs], dtype=np.float64)
-        else:
-            if obs_arr.shape[0] == 0:
-                valid_cache[key] = True
-                return True
-            dx = obs_arr[:, 0] - xw
-            dy = obs_arr[:, 1] - yw
-            mask = (dx * dx + dy * dy) <= (query_r * query_r)
-            if not np.any(mask):
-                valid_cache[key] = True
-                return True
-            near_pts = obs_arr[mask]
-
-        for ptx, pty in near_pts:
-            if poly.covers(_ShapelyPoint(float(ptx), float(pty))):
-                valid_cache[key] = False
-                return False
-
-        valid_cache[key] = True
-        return True
+    def _disk_steps_to_goal(x_i: int, y_i: int) -> int:
+        ix = int(x_i) - int(P.minx)
+        iy = int(y_i) - int(P.miny)
+        if ix < 0 or iy < 0 or ix >= P.xw or iy >= P.yw:
+            return _manhattan_xy(x_i, y_i, gx_i, gy_i)
+        d = int(disk_dist[ix, iy])
+        if d >= disk_dist_inf:
+            return _manhattan_xy(x_i, y_i, gx_i, gy_i)
+        return d
 
     def _heuristic_se2(x_i: int, y_i: int, yaw_idx: int) -> float:
-        xy_h = math.hypot(x_i - gx_i, y_i - gy_i)
-        yaw_diff_bins = _yaw_delta_bins(yaw_idx, gyaw_idx)
-        return xy_h + 0.15 * float(yaw_diff_bins)
+        m_steps = _disk_steps_to_goal(x_i, y_i)
+        h_xy = _C_MOVE * float(m_steps)
+        if goal_disk_free:
+            return h_xy
+        d_yaw = _yaw_delta_bins(yaw_idx, gyaw_idx)
+        h_theta = _C_ROT * float(max(0, d_yaw - m_steps))
+        w_yaw = 0.0 if volume.disk_column_free(x_i, y_i) else 1.0
+        return h_xy + w_yaw * h_theta
 
     def goal_reached(x_i: int, y_i: int, yaw_idx: int) -> bool:
         if x_i != gx_i or y_i != gy_i:
             return False
         return _yaw_delta_bins(yaw_idx, gyaw_idx) <= _YAW_GOAL_TOL_BINS
 
-    if not in_bounds(sx_i, sy_i):
-        return [], [], []
-    if not ok_cell_fast(sx_i, sy_i):
-        if not _pose_is_valid(sx_i, sy_i, syaw_idx):
-            return [], [], []
+    if not pose_free(sx_i, sy_i, syaw_idx):
+        if timing is not None:
+            _fill_phase1_timing(
+                timing,
+                t_all=t_all,
+                t_disk0=t_disk0,
+                t_disk1=t_disk1,
+                t_vol0=t_vol0,
+                t_vol1=t_vol1,
+                t_se0=None,
+                vol_timing=vol_timing,
+                disk_goal_reached_flag=disk_goal_reached,
+                reachable_xy=reachable_xy,
+                se_closed=0,
+                path_pts=0,
+                disk_fast_path=False,
+                se_heap_pops=0,
+                se_stale_pops=0,
+                se_max_open=0,
+            )
+        return _p3_phase1_result([], [], [], volume if volume is not None else None, return_volume)
 
-    start_idx = _state_index_se2(sx_i, sy_i, syaw_idx, M_PREV_NONE, P)
-    n_start = _AugNodeSE2(sx_i, sy_i, syaw_idx, M_PREV_NONE, 0.0, -1)
+    t_se0 = time.perf_counter()
+
+    start_idx = _state_index_se2(sx_i, sy_i, syaw_idx, P)
+    n_start = _AugNodeSE2(sx_i, sy_i, syaw_idx, 0.0, -1)
 
     open_entries: Dict[int, _AugNodeSE2] = {start_idx: n_start}
     closed: Dict[int, _AugNodeSE2] = {}
@@ -738,81 +1013,76 @@ def phase1_augmented_astar_se2(
     heapq.heappush(pq, (_heuristic_se2(sx_i, sy_i, syaw_idx), start_idx))
 
     goal_idx_found: Optional[int] = None
+    se_heap_pops = 0
+    se_stale_pops = 0
+    se_max_open = 1
 
     while pq:
+        se_heap_pops += 1
         _, idx = heapq.heappop(pq)
         if idx in closed:
+            se_stale_pops += 1
             continue
         if idx not in open_entries:
             continue
 
         cur = open_entries.pop(idx)
         closed[idx] = cur
+        se_max_open = max(se_max_open, len(open_entries) + 1)
 
         if goal_reached(cur.x, cur.y, cur.yaw_idx):
             goal_idx_found = idx
             break
 
-        # Translation edges (yaw unchanged)
-        for mi, mv in enumerate(motion):
-            nx, ny = cur.x + mv[0], cur.y + mv[1]
+        for dx, dy, dt in _SE2_NEIGHBORS_12:
+            nx, ny = cur.x + dx, cur.y + dy
+            nt = (cur.yaw_idx + dt) % _YAW_BINS
             if not in_bounds(nx, ny):
                 continue
-            nyaw_idx = cur.yaw_idx
-            # If disk-occupancy says "free", accept without expensive footprint check.
-            # Otherwise, fall back to the true footprint clearance test.
-            if not ok_cell_fast(nx, ny):
-                if not _pose_is_valid(nx, ny, nyaw_idx):
-                    continue
+            if not se2_edge_free_3cell(volume, cur.x, cur.y, cur.yaw_idx, nx, ny, nt):
+                continue
 
-            d_dest = _min_clearance_at_pose(nx, ny, nyaw_idx)
-            c_move = _u_cost(mv)
-            c_risk = _risk_cost(d_dest)
-            c_heading = _HEADING_WEIGHT * _angle_between_moves(cur.m_in, mi, motion)
-            c = c_move + c_risk + c_heading
+            c_move = _C_MOVE
+            c_rot = _C_ROT * float(abs(int(dt))) if int(dt) != 0 else 0.0
+            c = c_move + c_rot
 
-            child_idx = _state_index_se2(nx, ny, nyaw_idx, mi, P)
+            child_idx = _state_index_se2(nx, ny, nt, P)
             g_new = cur.cost + c
 
             if child_idx in closed:
                 continue
+            h = _heuristic_se2(nx, ny, nt)
             if child_idx in open_entries:
                 if g_new < open_entries[child_idx].cost:
-                    open_entries[child_idx] = _AugNodeSE2(nx, ny, nyaw_idx, mi, g_new, idx)
-                    heapq.heappush(pq, (g_new + _heuristic_se2(nx, ny, nyaw_idx), child_idx))
+                    open_entries[child_idx] = _AugNodeSE2(nx, ny, nt, g_new, idx)
+                    heapq.heappush(pq, (g_new + h, child_idx))
             else:
-                open_entries[child_idx] = _AugNodeSE2(nx, ny, nyaw_idx, mi, g_new, idx)
-                heapq.heappush(pq, (g_new + _heuristic_se2(nx, ny, nyaw_idx), child_idx))
-
-        # Rotation edges (in-place)
-        for dyaw in (-1, 1):
-            nyaw = (cur.yaw_idx + dyaw) % _YAW_BINS
-            if not ok_cell_fast(cur.x, cur.y):
-                if not _pose_is_valid(cur.x, cur.y, nyaw):
-                    continue
-
-            d_dest = _min_clearance_at_pose(cur.x, cur.y, nyaw)
-            c_yaw = _ROTATE_COST_PER_BIN * abs(dyaw)
-            c_risk = _risk_cost(d_dest)
-            c = c_yaw + c_risk
-
-            child_idx = _state_index_se2(cur.x, cur.y, nyaw, cur.m_in, P)
-            g_new = cur.cost + c
-
-            if child_idx in closed:
-                continue
-            if child_idx in open_entries:
-                if g_new < open_entries[child_idx].cost:
-                    open_entries[child_idx] = _AugNodeSE2(cur.x, cur.y, nyaw, cur.m_in, g_new, idx)
-                    heapq.heappush(pq, (g_new + _heuristic_se2(cur.x, cur.y, nyaw), child_idx))
-            else:
-                open_entries[child_idx] = _AugNodeSE2(cur.x, cur.y, nyaw, cur.m_in, g_new, idx)
-                heapq.heappush(pq, (g_new + _heuristic_se2(cur.x, cur.y, nyaw), child_idx))
+                open_entries[child_idx] = _AugNodeSE2(nx, ny, nt, g_new, idx)
+                heapq.heappush(pq, (g_new + h, child_idx))
 
     if goal_idx_found is None:
-        return [], [], []
+        if timing is not None:
+            _merge_volume_lazy_timing(vol_timing, volume)
+            _fill_phase1_timing(
+                timing,
+                t_all=t_all,
+                t_disk0=t_disk0,
+                t_disk1=t_disk1,
+                t_vol0=t_vol0,
+                t_vol1=t_vol1,
+                t_se0=t_se0,
+                vol_timing=vol_timing,
+                disk_goal_reached_flag=disk_goal_reached,
+                reachable_xy=reachable_xy,
+                se_closed=len(closed),
+                path_pts=0,
+                disk_fast_path=False,
+                se_heap_pops=se_heap_pops,
+                se_stale_pops=se_stale_pops,
+                se_max_open=se_max_open,
+            )
+        return _p3_phase1_result([], [], [], volume if volume is not None else None, return_volume)
 
-    # Reconstruct.
     path_grid: List[Tuple[int, int, int]] = []
     walk = goal_idx_found
     while walk != -1:
@@ -821,10 +1091,354 @@ def phase1_augmented_astar_se2(
         walk = node.p_ind
     path_grid.reverse()
 
-    pathx = [float(xi) * float(reso) for (xi, _yi, _yaw_i) in path_grid]
-    pathy = [float(yi) * float(reso) for (_xi, yi, _yaw_i) in path_grid]
+    from scenario_obstacles import grid_cell_center_world
+
+    pathx = [grid_cell_center_world(xi, yi, reso)[0] for (xi, yi, _yaw_i) in path_grid]
+    pathy = [grid_cell_center_world(xi, yi, reso)[1] for (xi, yi, _yaw_i) in path_grid]
     pathyaw = [_bin_to_yaw(yaw_i) for (_xi, _yi, yaw_i) in path_grid]
-    return pathx, pathy, pathyaw
+    if timing is not None:
+        _merge_volume_lazy_timing(vol_timing, volume)
+        _fill_phase1_timing(
+            timing,
+            t_all=t_all,
+            t_disk0=t_disk0,
+            t_disk1=t_disk1,
+            t_vol0=t_vol0,
+            t_vol1=t_vol1,
+            t_se0=t_se0,
+            vol_timing=vol_timing,
+            disk_goal_reached_flag=disk_goal_reached,
+            reachable_xy=reachable_xy,
+            se_closed=len(closed),
+            path_pts=len(pathx),
+            disk_fast_path=False,
+            se_heap_pops=se_heap_pops,
+            se_stale_pops=se_stale_pops,
+            se_max_open=se_max_open,
+        )
+    return _p3_phase1_result(pathx, pathy, pathyaw, volume, return_volume)
+
+
+def _p3_interp_yaw_bin_samples(theta1: float, theta2: float) -> int:
+    d = _angle_wrap(float(theta2) - float(theta1))
+    return max(1, int(math.ceil(abs(d) / max(1e-9, _YAW_STEP_RAD))))
+
+
+def _p3_interp_sample_count(length_m: float, theta1: float, theta2: float, reso: float) -> int:
+    # Half-cell / half-yaw-bin spacing keeps straight chords from stepping over
+    # thin occupied bins between endpoint samples.
+    n_len = max(2, int(math.ceil(float(length_m) / max(0.5 * float(reso), 1e-9))) + 1)
+    n_yaw = max(2, 2 * _p3_interp_yaw_bin_samples(theta1, theta2) + 1)
+    return min(480, max(4, n_len, n_yaw))
+
+
+def _p3_interp_edge_length(typ: str, params: dict) -> float:
+    if typ == "S":
+        return math.hypot(
+            float(params["x1"]) - float(params["x0"]),
+            float(params["y1"]) - float(params["y0"]),
+        )
+    return abs(float(params["sweep"])) * max(float(params["r"]), 1e-9)
+
+
+def _p3_verify_s_interp(
+    volume: Any,
+    x0: float,
+    y0: float,
+    t0: float,
+    x1: float,
+    y1: float,
+    t1: float,
+    reso: float,
+    collision_mode: str,
+) -> bool:
+    dx = float(x1) - float(x0)
+    dy = float(y1) - float(y0)
+    dtheta = _angle_wrap(float(t1) - float(t0))
+    length = math.hypot(dx, dy)
+    n = _p3_interp_sample_count(length, t0, t1, reso)
+    for k in range(n):
+        u = float(k) / float(n - 1) if n > 1 else 0.0
+        x = float(x0) + u * dx
+        y = float(y0) + u * dy
+        th = float(t0) + u * dtheta
+        if volume.pose_world_blocked(x, y, th, collision_mode):
+            return False
+    return True
+
+
+def _p3_verify_c_interp(
+    volume: Any,
+    x0: float,
+    y0: float,
+    t0: float,
+    x1: float,
+    y1: float,
+    t1: float,
+    ocx: float,
+    ocy: float,
+    r: float,
+    a0: float,
+    sweep: float,
+    reso: float,
+    collision_mode: str,
+) -> bool:
+    arc_len = abs(float(sweep)) * max(float(r), 1e-9)
+    dtheta = _angle_wrap(float(t1) - float(t0))
+    n = _p3_interp_sample_count(arc_len, t0, t1, reso)
+    for k in range(n):
+        u = float(k) / float(n - 1) if n > 1 else 0.0
+        ang = float(a0) + u * float(sweep)
+        x = float(ocx) + float(r) * math.cos(ang)
+        y = float(ocy) + float(r) * math.sin(ang)
+        th = float(t0) + u * dtheta
+        if volume.pose_world_blocked(x, y, th, collision_mode):
+            return False
+    return True
+
+
+def _p3_output_polyline_clear(
+    px: List[float],
+    py: List[float],
+    pyaw: List[float],
+    volume: Any,
+    reso: float,
+    collision_mode: str,
+) -> bool:
+    if len(px) < 2:
+        return True
+    step_xy = max(float(reso) / 20.0, 1e-4)
+    step_yaw = max(_YAW_STEP_RAD / 10.0, 1e-6)
+    for i in range(len(px) - 1):
+        x0 = float(px[i])
+        y0 = float(py[i])
+        t0 = float(pyaw[i])
+        x1 = float(px[i + 1])
+        y1 = float(py[i + 1])
+        t1 = float(pyaw[i + 1])
+        length = math.hypot(x1 - x0, y1 - y0)
+        dtheta = _angle_wrap(t1 - t0)
+        n = max(2, int(math.ceil(length / step_xy)) + 1, int(math.ceil(abs(dtheta) / step_yaw)) + 1)
+        for k in range(n):
+            u = float(k) / float(n - 1) if n > 1 else 0.0
+            x = x0 + u * (x1 - x0)
+            y = y0 + u * (y1 - y0)
+            th = t0 + u * dtheta
+            if volume.pose_world_blocked(x, y, th, collision_mode):
+                return False
+    return True
+
+
+def polyline_path_length_m(px: Sequence[float], py: Sequence[float]) -> float:
+    """Centerline arc length of a sampled polyline [m]."""
+    if len(px) < 2 or len(py) != len(px):
+        return 0.0
+    total = 0.0
+    for i in range(len(px) - 1):
+        total += math.hypot(float(px[i + 1]) - float(px[i]), float(py[i + 1]) - float(py[i]))
+    return total
+
+
+def primitive_list_length_m(prims: Sequence[Tuple[str, dict]]) -> float:
+    total = 0.0
+    for typ, params in prims:
+        total += _p3_interp_edge_length(str(typ), params)
+    return total
+
+
+def _fill_phase3_stats(
+    stats: Optional[Dict[str, Any]],
+    *,
+    p1_spine_pts: int,
+    output_pts: int,
+    prims: Sequence[Tuple[str, dict]],
+    px_out: Sequence[float],
+    py_out: Sequence[float],
+    fallback: bool,
+) -> None:
+    if stats is None:
+        return
+    n_prims = len(prims)
+    n_s = sum(1 for typ, _ in prims if typ == "S")
+    n_c = sum(1 for typ, _ in prims if typ == "C")
+    prim_len = primitive_list_length_m(prims) if prims else 0.0
+    stats.clear()
+    stats.update(
+        {
+            "p1_spine_pts": int(p1_spine_pts),
+            "output_pts": int(output_pts),
+            "n_primitives": int(n_prims if not fallback else max(0, p1_spine_pts - 1)),
+            "n_straight": int(n_s),
+            "n_arc": int(n_c),
+            "primitive_length_m": float(prim_len),
+            "polyline_length_m": float(polyline_path_length_m(px_out, py_out)),
+            "p3_fallback": bool(fallback),
+            "p3_compressed": bool(not fallback and n_prims < max(0, p1_spine_pts - 1)),
+        }
+    )
+    if prims:
+        stats["primitives"] = [{"type": str(t), "params": dict(p)} for t, p in prims]
+
+
+def phase3_interp_yaw_dp(
+    px: List[float],
+    py: List[float],
+    pyaw: List[float],
+    volume: Any,
+    reso: float,
+    collision_mode: str = SE_P3_COLLISION_VOLUME_BIN,
+    dp_objective: str = "length",
+    stats: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Decoupled SE(2) phase-3 DP on the phase-1 spine.
+
+    Primitives:
+      - ``S``: straight chord with yaw linear in arc-length parameter.
+      - ``C``: circular arc through (i, mid, j) with yaw linear in arc length.
+
+    Collision along each primitive is verified by dense sampling through
+    ``volume.pose_world_blocked`` (volume bin or direct SAT).
+    """
+    from HybridAstarPlanner.mod_grid import DP_OBJECTIVE_LENGTH, DP_OBJECTIVE_MIN_SEGMENTS
+
+    if collision_mode not in (SE_P3_COLLISION_VOLUME_BIN, SE_P3_COLLISION_SAT_DIRECT):
+        raise ValueError(
+            f"collision_mode must be {SE_P3_COLLISION_VOLUME_BIN!r} or {SE_P3_COLLISION_SAT_DIRECT!r} "
+            f"(got {collision_mode!r})"
+        )
+    if dp_objective not in (DP_OBJECTIVE_LENGTH, DP_OBJECTIVE_MIN_SEGMENTS):
+        raise ValueError(f"dp_objective must be 'length' or 'min_segments' (got {dp_objective!r})")
+
+    n = len(px)
+    if n < 2:
+        _fill_phase3_stats(stats, p1_spine_pts=n, output_pts=n, prims=(), px_out=px, py_out=py, fallback=False)
+        return px, py, pyaw
+    if len(py) != n or len(pyaw) != n:
+        raise ValueError("phase3_interp_yaw_dp: px/py/pyaw length mismatch")
+
+    def _edge_cost(typ: str, params: dict) -> float:
+        if dp_objective == DP_OBJECTIVE_MIN_SEGMENTS:
+            return 1.0
+        return _p3_interp_edge_length(typ, params)
+
+    INF = 10**9
+    best_cost = [INF] * n
+    best_prev: List[Optional[Tuple[int, str, dict]]] = [None] * n
+    best_cost[0] = 0.0
+    max_span = min(30, n - 1)
+
+    for j in range(1, n):
+        i_min = max(0, j - max_span)
+        for i in range(i_min, j):
+            if best_cost[i] >= INF:
+                continue
+            xi, yi, ti = float(px[i]), float(py[i]), float(pyaw[i])
+            xj, yj, tj = float(px[j]), float(py[j]), float(pyaw[j])
+
+            s_params = {"x0": xi, "y0": yi, "x1": xj, "y1": yj, "t0": ti, "t1": tj}
+            if _p3_verify_s_interp(volume, xi, yi, ti, xj, yj, tj, reso, collision_mode):
+                c = best_cost[i] + _edge_cost("S", s_params)
+                if c < best_cost[j]:
+                    best_cost[j] = c
+                    best_prev[j] = (i, "S", s_params)
+
+            if j - i >= 2:
+                for k in {i + 1, (i + j) // 2, j - 1}:
+                    if not (i < k < j):
+                        continue
+                    circ = _circle_from_3pts(xi, yi, float(px[k]), float(py[k]), xj, yj)
+                    if circ is None:
+                        continue
+                    ocx, ocy, r = circ
+                    arc_par = _arc_params_through_mid(
+                        ocx, ocy, xi, yi, xj, yj, float(px[k]), float(py[k])
+                    )
+                    if arc_par is None:
+                        continue
+                    a0, _a1, sweep = arc_par
+                    c_params = {
+                        "ocx": ocx,
+                        "ocy": ocy,
+                        "r": r,
+                        "a0": a0,
+                        "sweep": sweep,
+                        "t0": ti,
+                        "t1": tj,
+                    }
+                    if not _p3_verify_c_interp(
+                        volume, xi, yi, ti, xj, yj, tj, ocx, ocy, r, a0, sweep, reso, collision_mode
+                    ):
+                        continue
+                    c = best_cost[i] + _edge_cost("C", c_params)
+                    if c < best_cost[j]:
+                        best_cost[j] = c
+                        best_prev[j] = (i, "C", c_params)
+
+    if best_prev[-1] is None:
+        _fill_phase3_stats(stats, p1_spine_pts=n, output_pts=n, prims=(), px_out=px, py_out=py, fallback=True)
+        return px, py, pyaw
+
+    prims: List[Tuple[str, dict]] = []
+    cur = n - 1
+    while cur != 0:
+        prev = best_prev[cur]
+        if prev is None:
+            _fill_phase3_stats(stats, p1_spine_pts=n, output_pts=n, prims=(), px_out=px, py_out=py, fallback=True)
+            return px, py, pyaw
+        _i, typ, params = prev
+        prims.append((typ, params))
+        cur = _i
+    prims.reverse()
+
+    outx: List[float] = [float(px[0])]
+    outy: List[float] = [float(py[0])]
+    outyaw: List[float] = [float(pyaw[0])]
+
+    def emit(x: float, y: float, th: float) -> None:
+        if (
+            outx
+            and abs(outx[-1] - x) < 1e-9
+            and abs(outy[-1] - y) < 1e-9
+            and abs(_angle_wrap(outyaw[-1] - th)) < 1e-9
+        ):
+            return
+        outx.append(float(x))
+        outy.append(float(y))
+        outyaw.append(float(th))
+
+    for typ, p in prims:
+        t0 = float(p["t0"])
+        t1 = float(p["t1"])
+        dtheta = _angle_wrap(t1 - t0)
+        if typ == "S":
+            x0 = float(p["x0"])
+            y0 = float(p["y0"])
+            x1 = float(p["x1"])
+            y1 = float(p["y1"])
+            length = math.hypot(x1 - x0, y1 - y0)
+            n_s = _p3_interp_sample_count(length, t0, t1, reso)
+            for kk in range(1, n_s + 1):
+                u = float(kk) / float(n_s)
+                emit(x0 + u * (x1 - x0), y0 + u * (y1 - y0), t0 + u * dtheta)
+        else:
+            ocx = float(p["ocx"])
+            ocy = float(p["ocy"])
+            r = float(p["r"])
+            a0 = float(p["a0"])
+            sweep = float(p["sweep"])
+            arc_len = abs(sweep) * max(r, 1e-9)
+            n_c = _p3_interp_sample_count(arc_len, t0, t1, reso)
+            for kk in range(1, n_c + 1):
+                u = float(kk) / float(n_c)
+                ang = a0 + u * sweep
+                emit(ocx + r * math.cos(ang), ocy + r * math.sin(ang), t0 + u * dtheta)
+
+    if not _p3_output_polyline_clear(outx, outy, outyaw, volume, reso, collision_mode):
+        _fill_phase3_stats(stats, p1_spine_pts=n, output_pts=n, prims=prims, px_out=px, py_out=py, fallback=True)
+        return px, py, pyaw
+    _fill_phase3_stats(stats, p1_spine_pts=n, output_pts=len(outx), prims=prims, px_out=outx, py_out=outy, fallback=False)
+    return outx, outy, outyaw
 
 
 def phase1_augmented_astar(
@@ -925,8 +1539,10 @@ def phase1_augmented_astar(
         walk = node.p_ind
     path_grid.reverse()
 
-    pathx = [float(x) * reso for x, _ in path_grid]
-    pathy = [float(y) * reso for _, y in path_grid]
+    from scenario_obstacles import grid_cell_center_world
+
+    pathx = [grid_cell_center_world(x, y, reso)[0] for x, y in path_grid]
+    pathy = [grid_cell_center_world(x, y, reso)[1] for x, y in path_grid]
     return pathx, pathy
 
 
@@ -1568,6 +2184,23 @@ def _arc_from_start_tangent_discrete(
     return ocx, ocy, r, a0, sweep
 
 
+def _robot_bounding_radius(robot_vertices_local: List[Tuple[float, float]]) -> float:
+    if not robot_vertices_local:
+        return 0.5
+    return float(max(math.hypot(x, y) for (x, y) in robot_vertices_local))
+
+
+def _phase3_body_twist_sample_count(
+    dist_end: float, theta_end_rel: float, reso: float, rb: float, sample_mult: float = 1.0
+) -> int:
+    """Pose samples along one constant body-twist segment (scale up for validation passes)."""
+    mult = max(1.0, float(sample_mult))
+    trans_step = max(0.06, min(0.3 * float(reso), 0.15 * float(rb))) / mult
+    n_len = int(math.ceil(dist_end / trans_step)) + 1
+    n_yaw = int(math.ceil(abs(theta_end_rel) / max(1e-6, 0.35 * _YAW_STEP_RAD))) + 1
+    return min(240, max(14, n_len, n_yaw))
+
+
 def phase3_min_segments(
     px: List[float],
     py: List[float],
@@ -1609,6 +2242,7 @@ def phase3_min_segments(
     robot_boundary = _sample_polygon_boundary(
         robot_vertices_local, sample_step=sample_step, max_samples=_SHAPE_MAX_BOUNDARY_SAMPLES
     )  # (N,2)
+    rb = _robot_bounding_radius(robot_vertices_local)
 
     # Obstacles structure for fast nearest-neighbor queries.
     if ox and oy and _HAS_KDTREE:
@@ -1714,99 +2348,117 @@ def phase3_min_segments(
         c, s = math.cos(theta), math.sin(theta)
         return np.array([[c, -s], [s, c]], dtype=np.float64)
 
-    def _edge_feasible(i: int, j: int) -> bool:
+    def _footprint_clear_at_world_pose(pxk: float, pyk: float, yawk: float) -> bool:
+        ck, sk = math.cos(yawk), math.sin(yawk)
+
+        if _HAS_SHAPELY and (map_inner is not None or obstacle_geoms):
+            world_vertices = [
+                (ck * vx - sk * vy + pxk, sk * vx + ck * vy + pyk) for (vx, vy) in robot_vertices_local
+            ]
+            poly = _ShapelyPolygon(world_vertices)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty:
+                return False
+            if map_inner is not None:
+                if map_inner.is_empty or (not map_inner.covers(poly)):
+                    return False
+            query_bounds = _expand_bounds(tuple(map(float, poly.bounds)), float(clearance))
+            obstacle_candidates = _query_spatial_candidates(
+                query_bounds, obstacle_geoms, obstacle_tree, obstacle_bounds
+            )
+            for vx, vy in world_vertices:
+                p = _ShapelyPoint(float(vx), float(vy))
+                for og in obstacle_candidates:
+                    if og.covers(p):
+                        return False
+            for og in obstacle_candidates:
+                for ovx, ovy in obstacle_vertices_xy.get(id(og), []):
+                    if poly.covers(_ShapelyPoint(float(ovx), float(ovy))):
+                        return False
+            for og in obstacle_candidates:
+                if poly.distance(og) <= float(clearance) + 1e-9:
+                    return False
+
+            if tree is not None and obs_arr is None:
+                query_r = float(rb + clearance + max(0.05, 0.25 * float(reso)))
+                idxs = tree.query_ball_point([pxk, pyk], r=query_r)
+                if idxs:
+                    near_pts = np.asarray(tree.data[idxs], dtype=np.float64)
+                    for ptx, pty in near_pts:
+                        if poly.covers(_ShapelyPoint(float(ptx), float(pty))):
+                            return False
+            elif obs_arr is not None and obs_arr.shape[0] > 0:
+                query_r = float(rb + clearance + max(0.05, 0.25 * float(reso)))
+                dx = obs_arr[:, 0] - pxk
+                dy = obs_arr[:, 1] - pyk
+                mask = (dx * dx + dy * dy) <= (query_r * query_r)
+                if np.any(mask):
+                    for ptx, pty in obs_arr[mask]:
+                        if poly.covers(_ShapelyPoint(float(ptx), float(pty))):
+                            return False
+
+        bx = robot_boundary[:, 0]
+        by = robot_boundary[:, 1]
+        world_pts = np.stack([ck * bx - sk * by + pxk, sk * bx + ck * by + pyk], axis=1)
+
+        if tree is not None:
+            d, _ = tree.query(world_pts, k=1)
+            d_arr = np.asarray(d, dtype=np.float64).reshape(-1)
+        else:
+            if obs_arr is None or obs_arr.shape[0] == 0:
+                d_arr = np.full(world_pts.shape[0], np.inf, dtype=np.float64)
+            else:
+                diff = world_pts[:, None, :] - obs_arr[None, :, :]
+                dist = np.hypot(diff[..., 0], diff[..., 1])
+                d_arr = np.min(dist, axis=1)
+
+        if rect_polys:
+            for ii in range(world_pts.shape[0]):
+                d_rect = _min_dist_point_to_rect_polys(
+                    float(world_pts[ii, 0]), float(world_pts[ii, 1]), rect_polys
+                )
+                d_arr[ii] = min(d_arr[ii], d_rect)
+
+        return float(np.min(d_arr)) > float(clearance)
+
+    def _body_twist_edge_clear(i: int, j: int, sample_mult: float = 1.0) -> bool:
         xi, yi, yawi = float(px[i]), float(py[i]), float(pyaw[i])
         xj, yj, yawj = float(px[j]), float(py[j]), float(pyaw[j])
 
         dx_w = xj - xi
         dy_w = yj - yi
-        # End position expressed in i's body frame.
         c, s = math.cos(yawi), math.sin(yawi)
         dx_b = c * dx_w + s * dy_w
         dy_b = -s * dx_w + c * dy_w
-
-        # Default phase1 yaw wrap choice.
         theta_end_rel = _angle_wrap(yawj - yawi)
 
         v_body, omega, T = _solve_constant_body_twist_from_SE2_no_fixed_speed(dx_b, dy_b, theta_end_rel)
-
-        # Sample density: enough for both translation and rotation.
         dist_end = math.hypot(dx_w, dy_w)
-        n_len = int(dist_end / max(1e-6, 0.4 * float(reso))) + 1
-        n_yaw = int(abs(theta_end_rel) / max(1e-6, 0.5 * _YAW_STEP_RAD)) + 1
-        n_steps = max(10, n_len, n_yaw)
-        n_steps = min(80, n_steps)
+        n_steps = _phase3_body_twist_sample_count(dist_end, theta_end_rel, reso, rb, sample_mult)
 
         positions_rel, theta_rel = _propagate_body_twist_rel(v_body, omega, T, n_steps=n_steps)
-
         R_i = _rot2d_matrix(yawi)
         centers_world = (R_i @ positions_rel.T).T + np.array([xi, yi], dtype=np.float64)
         yaws_world = yawi + theta_rel
 
-        # Clearance check by sampling robot boundary points against obstacle point cloud.
         for k in range(centers_world.shape[0]):
-            pxk, pyk = float(centers_world[k, 0]), float(centers_world[k, 1])
-            yawk = float(yaws_world[k])
-            ck, sk = math.cos(yawk), math.sin(yawk)
-
-            if _HAS_SHAPELY and (map_inner is not None or obstacle_geoms):
-                world_vertices = [(ck * vx - sk * vy + pxk, sk * vx + ck * vy + pyk) for (vx, vy) in robot_vertices_local]
-                poly = _ShapelyPolygon(world_vertices)
-                if not poly.is_valid:
-                    poly = poly.buffer(0)
-                if poly.is_empty:
-                    return False
-                if map_inner is not None:
-                    if map_inner.is_empty or (not map_inner.covers(poly)):
-                        return False
-                query_bounds = _expand_bounds(tuple(map(float, poly.bounds)), float(clearance))
-                obstacle_candidates = _query_spatial_candidates(
-                    query_bounds, obstacle_geoms, obstacle_tree, obstacle_bounds
-                )
-
-                # Cheap early reject before expensive distance:
-                # 1) robot vertices inside candidate obstacles
-                for vx, vy in world_vertices:
-                    p = _ShapelyPoint(float(vx), float(vy))
-                    for og in obstacle_candidates:
-                        if og.covers(p):
-                            return False
-                # 2) candidate obstacle vertices inside robot polygon
-                for og in obstacle_candidates:
-                    for ovx, ovy in obstacle_vertices_xy.get(id(og), []):
-                        if poly.covers(_ShapelyPoint(float(ovx), float(ovy))):
-                            return False
-
-                for og in obstacle_candidates:
-                    if poly.distance(og) <= float(clearance) + 1e-9:
-                        return False
-
-            # Rotate local boundary points by yawk and translate to world.
-            bx = robot_boundary[:, 0]
-            by = robot_boundary[:, 1]
-            world_pts = np.stack([ck * bx - sk * by + pxk, sk * bx + ck * by + pyk], axis=1)
-
-            if tree is not None:
-                d, _ = tree.query(world_pts, k=1)
-                d_arr = np.asarray(d, dtype=np.float64).reshape(-1)
-            else:
-                if obs_arr.shape[0] == 0:
-                    d_arr = np.full(world_pts.shape[0], np.inf, dtype=np.float64)
-                else:
-                    diff = world_pts[:, None, :] - obs_arr[None, :, :]
-                    dist = np.hypot(diff[..., 0], diff[..., 1])
-                    d_arr = np.min(dist, axis=1)
-
-            if rect_polys:
-                for ii in range(world_pts.shape[0]):
-                    d_rect = _min_dist_point_to_rect_polys(
-                        float(world_pts[ii, 0]), float(world_pts[ii, 1]), rect_polys
-                    )
-                    d_arr[ii] = min(d_arr[ii], d_rect)
-
-            if float(np.min(d_arr)) <= float(clearance):
+            if not _footprint_clear_at_world_pose(
+                float(centers_world[k, 0]), float(centers_world[k, 1]), float(yaws_world[k])
+            ):
                 return False
+            if k + 1 < centers_world.shape[0]:
+                mid_x = 0.5 * (float(centers_world[k, 0]) + float(centers_world[k + 1, 0]))
+                mid_y = 0.5 * (float(centers_world[k, 1]) + float(centers_world[k + 1, 1]))
+                mid_yaw = float(yaws_world[k]) + 0.5 * _angle_wrap(
+                    float(yaws_world[k + 1]) - float(yaws_world[k])
+                )
+                if not _footprint_clear_at_world_pose(mid_x, mid_y, mid_yaw):
+                    return False
         return True
+
+    def _edge_feasible(i: int, j: int) -> bool:
+        return _body_twist_edge_clear(i, j, sample_mult=1.0)
 
     # DP over SE nodes.
     INF = 10**9
@@ -1841,6 +2493,10 @@ def phase3_min_segments(
         cur = prev
     edges.reverse()
 
+    for i, j in edges:
+        if not _body_twist_edge_clear(i, j, sample_mult=2.5):
+            return px, py, pyaw
+
     # Emit sampled SE points along each chosen primitive.
     outx: List[float] = [float(px[0])]
     outy: List[float] = [float(py[0])]
@@ -1869,10 +2525,7 @@ def phase3_min_segments(
         v_body, omega, T = _solve_constant_body_twist_from_SE2_no_fixed_speed(dx_b, dy_b, theta_end_rel)
 
         dist_end = math.hypot(dx_w, dy_w)
-        n_len = int(dist_end / max(1e-6, 0.4 * float(reso))) + 1
-        n_yaw = int(abs(theta_end_rel) / max(1e-6, 0.5 * _YAW_STEP_RAD)) + 1
-        n_steps = max(10, n_len, n_yaw)
-        n_steps = min(80, n_steps)
+        n_steps = _phase3_body_twist_sample_count(dist_end, theta_end_rel, reso, rb, sample_mult=1.0)
 
         positions_rel, theta_rel = _propagate_body_twist_rel(v_body, omega, T, n_steps=n_steps)
         R_i = _rot2d_matrix(yawi)
@@ -1901,19 +2554,28 @@ def astar_planning(
     obstacle_rects: Optional[List[Tuple[float, float, float, float]]] = None,
     obstacle_polygons: Optional[List[List[Tuple[float, float]]]] = None,
     map_bounds: Optional[Tuple[float, float, float, float]] = None,
+    timing: Optional[Dict[str, float]] = None,
+    se_p3_primitive: str = SE_P3_PRIMITIVE_LINEAR_YAW,
+    se_p3_collision_mode: str = SE_P3_COLLISION_VOLUME_BIN,
+    dp_objective: str = "length",
+    path_stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[float], List[float], List[float]]:
     """
     SE(2) mod_grid_SE pipeline.
 
     Currently supported:
-      - stop_phase == 1: SE(2) Phase 1 augmented A* using footprint boundary clearance.
+      - stop_phase == 1: SE(2) Phase 1 augmented A* on a 3D conservative occupancy volume.
+      - stop_phase == 3: primitive compression (linear-yaw DP or legacy body-twist).
     """
-    if stop_phase != 1:
-        if stop_phase != 3:
-            raise NotImplementedError("mod_grid_SE Phase 2 is not yet implemented. Use stop_phase=1 or stop_phase=3.")
+    if stop_phase not in (1, 3):
+        raise NotImplementedError("mod_grid_SE Phase 2 is not yet implemented. Use stop_phase=1 or stop_phase=3.")
 
-        # Phase 3: SE(2) primitive compression using constant body-twist trajectories.
-        px0, py0, pyaw0 = phase1_augmented_astar_se2(
+    from scenario_obstacles import clamp_safety_margin
+
+    safety_margin = clamp_safety_margin(safety_margin)
+
+    if stop_phase == 3:
+        px0, py0, pyaw0, volume = phase1_augmented_astar_se2(
             sx=sx,
             sy=sy,
             syaw_rad=syaw_rad,
@@ -1928,25 +2590,44 @@ def astar_planning(
             obstacle_rects=obstacle_rects,
             obstacle_polygons=obstacle_polygons,
             map_bounds=map_bounds,
+            timing=timing,
+            return_volume=True,
         )
         if len(px0) < 2:
             return px0, py0, pyaw0
-        hard_pad = (
-            max(_SHAPE_MIN_HARD_CLEARANCE_PAD, _SHAPE_HARD_CLEARANCE_PAD_FACTOR * float(reso)) + float(safety_margin)
-        )
-        return phase3_min_segments(
+        if se_p3_primitive == SE_P3_PRIMITIVE_BODY_TWIST:
+            hard_pad = (
+                max(_SHAPE_MIN_HARD_CLEARANCE_PAD, _SHAPE_HARD_CLEARANCE_PAD_FACTOR * float(reso))
+                + float(safety_margin)
+            )
+            return phase3_min_segments(
+                px0,
+                py0,
+                pyaw0,
+                ox=ox,
+                oy=oy,
+                robot_vertices_local=robot_vertices_local,
+                reso=reso,
+                clearance=hard_pad,
+                obstacle_rects=obstacle_rects,
+                obstacle_polygons=obstacle_polygons,
+                map_bounds=map_bounds,
+            )
+        if volume is None:
+            return px0, py0, pyaw0
+        out = phase3_interp_yaw_dp(
             px0,
             py0,
             pyaw0,
-            ox=ox,
-            oy=oy,
-            robot_vertices_local=robot_vertices_local,
+            volume,
             reso=reso,
-            clearance=hard_pad,
-            obstacle_rects=obstacle_rects,
-            obstacle_polygons=obstacle_polygons,
-            map_bounds=map_bounds,
+            collision_mode=se_p3_collision_mode,
+            dp_objective=dp_objective,
+            stats=path_stats,
         )
+        if path_stats is not None:
+            path_stats["direct_sat_queries"] = int(getattr(volume, "direct_sat_queries", 0))
+        return out
 
     return phase1_augmented_astar_se2(
         sx=sx,
@@ -1963,87 +2644,20 @@ def astar_planning(
         obstacle_rects=obstacle_rects,
         obstacle_polygons=obstacle_polygons,
         map_bounds=map_bounds,
+        timing=timing,
     )
 
 
 def _obstacle_points_from_app_scenario(
     scenario: dict,
 ) -> Tuple[List[float], List[float], float, float, float]:
-    """
-    Reconstruct obstacle point cloud exactly like `HA_draw/app.py`:
-    - boundary points along the map box edges
-    - rectangle obstacles: grid-sampled points within each rect
-    - polyline obstacles: thickened line samples
+    """Delegate to shared HA_draw scenario obstacle rasterizer."""
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import obstacle_points_for_disk_planner
 
-    Returns:
-        (ox, oy, reso, map_w, map_h)
-    """
-    m = scenario.get("map", {})
-    map_w = float(m.get("width", 60.0))
-    map_h = float(m.get("height", 40.0))
-    reso = float(m.get("resolution", 1.0))
-
-    draw = scenario.get("draw", {})
-    line_thickness = float(draw.get("line_thickness", 1.0))
-
-    obs = scenario.get("obstacles", {})
-    rects: Dict[str, List[float]] = obs.get("rects", {})
-    lines: Dict[str, List[List[float]]] = obs.get("lines", {})
-
-    # Boundary obstacle points (same as app._boundary_points).
-    ox: List[float] = []
-    oy: List[float] = []
-    w = int(map_w / reso)
-    h = int(map_h / reso)
-    r = reso
-    for i in range(w + 1):
-        x = i * r
-        ox += [x, x]
-        oy += [0.0, h * r]
-    for j in range(h + 1):
-        y = j * r
-        ox += [0.0, w * r]
-        oy += [y, y]
-
-    # Rectangle obstacles (same as app._obstacle_points rect sampling).
-    for rect in rects.values():
-        if len(rect) != 4:
-            continue
-        x, y, w_rect, h_rect = map(float, rect)
-        x0 = max(0.0, x)
-        y0 = max(0.0, y)
-        x1 = min(map_w, x + w_rect)
-        y1 = min(map_h, y + h_rect)
-        xi = np.arange(x0, x1 + 1e-6, r)
-        yi = np.arange(y0, y1 + 1e-6, r)
-        for xx in xi:
-            for yy in yi:
-                ox.append(float(xx))
-                oy.append(float(yy))
-
-    # Polyline obstacles (same as app._obstacle_points line thickening).
-    thick = max(0.2, line_thickness)
-    samples = max(2, int(thick / r))
-    for pts in lines.values():
-        if not pts or len(pts) < 2:
-            continue
-        for i in range(len(pts) - 1):
-            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
-            x0 = float(x0)
-            y0 = float(y0)
-            x1 = float(x1)
-            y1 = float(y1)
-            seg_len = max(math.hypot(x1 - x0, y1 - y0), 1e-6)
-            n = max(2, int(seg_len / r) * 2)
-            for t in np.linspace(0.0, 1.0, n):
-                cx = x0 + t * (x1 - x0)
-                cy = y0 + t * (y1 - y0)
-                for dx in np.linspace(-thick / 2.0, thick / 2.0, samples):
-                    for dy in np.linspace(-thick / 2.0, thick / 2.0, samples):
-                        ox.append(float(cx + dx))
-                        oy.append(float(cy + dy))
-
-    return ox, oy, reso, map_w, map_h
+    return obstacle_points_for_disk_planner(scenario)
 
 
 def run_mod_grid_on_scenario(
@@ -2066,9 +2680,17 @@ def run_mod_grid_on_scenario(
     gy = float(gx0[1])
 
     robot = scenario.get("robot", {})
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_planner_bridge import _resolve_robot_dict
+
+    robot = _resolve_robot_dict(robot)
     syaw_rad = math.radians(float(px0[2]) if len(px0) >= 3 else 0.0)
     gyaw_rad = math.radians(float(gx0[2]) if len(gx0) >= 3 else 0.0)
-    safety_margin = float(robot.get("safety_margin", 0.0))
+    from scenario_obstacles import clamp_safety_margin
+
+    safety_margin = clamp_safety_margin(float(robot.get("safety_margin", 0.0)))
     robot_vertices_local = _extract_robot_footprint_vertices_local(
         robot,
         reso=float(scenario.get("map", {}).get("resolution", 1.0)),
@@ -2077,11 +2699,15 @@ def run_mod_grid_on_scenario(
     ox, oy, reso, map_w, map_h = _obstacle_points_from_app_scenario(scenario)
 
     obs = scenario.get("obstacles", {})
-    rects_raw = obs.get("rects", {})
-    obstacle_rects: List[Tuple[float, float, float, float]] = []
-    for v in rects_raw.values():
-        if len(v) == 4:
-            obstacle_rects.append(tuple(map(float, v)))  # type: ignore[arg-type]
+    rects_raw = obs.get("rects", {}) or {}
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import parse_scenario_rects
+
+    parsed_rects = parse_scenario_rects(rects_raw, map_w=map_w, map_h=map_h)
+    obstacle_rects = list(parsed_rects.values()) if parsed_rects else []
+    obstacle_polygons = None
 
     px, py, pyaw = astar_planning(
         sx=sx,
@@ -2097,6 +2723,7 @@ def run_mod_grid_on_scenario(
         stop_phase=stop_phase,
         safety_margin=safety_margin,
         obstacle_rects=obstacle_rects if obstacle_rects else None,
+        obstacle_polygons=obstacle_polygons,
         map_bounds=(0.0, 0.0, float(map_w), float(map_h)),
     )
     if px:

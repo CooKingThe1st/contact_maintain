@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "map": {
+    "width": 14.0,
+    "height": 14.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 0.8,
+    "length": 1.0,
+    "shape_name": "hourglass",
+    "safety_margin": 0.05
+  },
+  "pose": {
+    "start": [2.0, 2.0, 0.0],
+    "goal": [11.5, 11.5, 90.0]
+  },
+  "draw": {
+    "line_thickness": 1.0
+  },
+  "planner": {
+    "yaw_fill_mode": "none"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [7.0, 2.0, 1.0, 10.0],
+      "RECT_002": [2.5, 5.5, 3.5, 0.8],
+      "RECT_003": [9.0, 5.5, 3.5, 0.8],
+      "RECT_004": [4.5, 9.0, 5.0, 0.8]
+    },
+    "lines": {},
+    "rect_count": 4,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "scenario_obj_shapes_bottleneck.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

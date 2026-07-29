@@ -1,21 +1,18 @@
 """
-Two-phase holonomic planner (mod_grid):
+Holonomic disk planner (mod_grid):
 
-Phase 1 — Augmented grid A*
-    State: (grid_x, grid_y, m_prev) with m_prev = motion index used to enter the cell, or -1 at start.
-    Edge cost: c_move + c_risk(d_min) + c_heading(m_prev, m_new)
-    - c_risk: piecewise penalty from EDT clearance to obstacles (3 bands, increasing).
-    - c_heading: penalty for turning away from previous move (encourages long straight legs).
+Phase 1 — Grid A* on (x, y) with unit edge cost
+    State: (grid_x, grid_y) only — feasible path fast; phase 3 polishes geometry.
+    Edge cost: 1 per step (cardinal and diagonal).
+    Collision: offline (prebuilt disk bitmap) or online (lazy per-cell checks + cache).
 
-Phase 2 — CHOMP-style trajectory refinement
-    Resamples the polyline, then gradient descent on smoothness + soft obstacle barrier
-    using the same distance field; endpoints fixed.
+Phase 3 — Path polishing (shortcut + primitive DP)
+    Greedy line-of-sight shortcut on the phase-1 polyline, then DP over straight segments and
+    circular arcs validated analytically against OBB obstacles (hierarchical spatial funnel).
 
-Phase 3 — Straight + circular arc decomposition
-    Rounds polyline corners with tangent fillets (G1), clamped by edge length; optional
-    clearance check vs obstacle points falls back to the sharp corner if unsafe.
-
-Optional: line-of-sight shortcut after CHOMP (fewer vertices).
+Phase 2 (CHOMP) is deprecated: gradient-based smoothing is a poor fit for this 2D disk-on-grid
+problem and is not exposed in the UI. ``stop_phase=2`` raises ``NotImplementedError``.
+Legacy ``phase2_chomp`` remains in this file for reference only.
 """
 
 from __future__ import annotations
@@ -25,8 +22,9 @@ import heapq
 import math
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -88,15 +86,46 @@ _CHOMP_OBS_GRAD_CLIP = 8.0  # clip obstacle gradient magnitude per point (stabil
 _CHOMP_HARD_CLEARANCE_PAD = 0.25  # meters; extra clearance target for hard projection
 _CHOMP_POINTS = 64
 
-# Phase 3 — arc fillets (straight + tangent arc)
+# Phase 3 — arc primitives (straight + circular arc DP)
 _ARC_RADIUS = 0.35  # m; clamped down if edges are short
 _ARC_MIN_TURN = math.radians(4.0)  # below this |angle|, keep sharp vertex
-_ARC_POINTS_PER_RAD = 10.0  # arc samples ~ proportional to sweep angle
-_ARC_CHECK_OBSTACLES = True  # if False, skip clearance validation on fillets
+_ARC_POINTS_PER_RAD = 10.0  # arc samples for dense polyline output
+
+# Phase 3 DP objective modes
+DP_OBJECTIVE_LENGTH = "length"
+DP_OBJECTIVE_MIN_SEGMENTS = "min_segments"
 
 
 M_PREV_NONE = -1
 _NUM_MOTION = 8
+
+DISK_COLLISION_OFFLINE = "offline"
+DISK_COLLISION_ONLINE = "online"
+
+
+def _disk_validation_ctx(
+    clearance: float,
+    reso: float,
+    ox: List[float],
+    oy: List[float],
+    obstacle_rects=None,
+):
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import DiskValidationContext, build_disk_validation_context
+
+    rects = list(obstacle_rects) if obstacle_rects else []
+    return build_disk_validation_context(clearance, reso, ox, oy, rects)
+
+
+def _primitive_length(typ: str, params: dict) -> float:
+    if typ == "S":
+        return math.hypot(
+            float(params["x1"]) - float(params["x0"]),
+            float(params["y1"]) - float(params["y0"]),
+        )
+    return abs(float(params["sweep"])) * max(float(params["r"]), 1e-9)
 
 
 def _get_motion() -> List[List[int]]:
@@ -161,11 +190,25 @@ def _build_clearance_meters(obsmap: List[List[bool]], reso: float) -> np.ndarray
     return dist
 
 
+def _grid_state_index(x: int, y: int, P: base_astar.Para) -> int:
+    return (y - P.miny) * P.xw + (x - P.minx)
+
+
 def _state_index(x: int, y: int, m_in: int, P: base_astar.Para) -> int:
-    """Unique int for (x,y,m_in), m_in in -1..7 encoded as 0..8."""
+    """Legacy augmented index (x,y,m_in); retained for reference only."""
     cell = (y - P.miny) * P.xw + (x - P.minx)
-    mk = m_in + 1  # -1 -> 0, 0..7 -> 1..8
+    mk = m_in + 1
     return cell * 9 + mk
+
+
+class _DiskNode:
+    __slots__ = ("x", "y", "cost", "p_ind")
+
+    def __init__(self, x: int, y: int, cost: float, p_ind: int):
+        self.x = x
+        self.y = y
+        self.cost = cost
+        self.p_ind = p_ind
 
 
 class _AugNode:
@@ -180,7 +223,404 @@ class _AugNode:
 
 
 def _heuristic(x: int, y: int, gx: int, gy: int) -> float:
-    return math.hypot(x - gx, y - gy)
+    """Chebyshev distance — admissible for 8-way unit-cost moves."""
+    return float(max(abs(x - gx), abs(y - gy)))
+
+
+def _calc_grid_para(ox_g: List[float], oy_g: List[float], reso: float) -> base_astar.Para:
+    minx, miny = round(min(ox_g)), round(min(oy_g))
+    maxx, maxy = round(max(ox_g)), round(max(oy_g))
+    xw, yw = maxx - minx, maxy - miny
+    return base_astar.Para(minx, miny, maxx, maxy, xw, yw, float(reso), _get_motion())
+
+
+def _explored_xy_from_disk_nodes(
+    closed: Dict[int, _DiskNode],
+    open_entries: Dict[int, _DiskNode],
+) -> Set[Tuple[int, int]]:
+    out: Set[Tuple[int, int]] = set()
+    for node in closed.values():
+        out.add((node.x, node.y))
+    for node in open_entries.values():
+        out.add((node.x, node.y))
+    return out
+
+
+def _explored_xy_from_nodes(
+    closed: Dict[int, _AugNode],
+    open_entries: Dict[int, _AugNode],
+) -> Set[Tuple[int, int]]:
+    out: Set[Tuple[int, int]] = set()
+    for node in closed.values():
+        out.add((node.x, node.y))
+    for node in open_entries.values():
+        out.add((node.x, node.y))
+    return out
+
+
+def _reconstruct_phase1_path(
+    goal_idx_found: int,
+    closed: Dict[int, _DiskNode],
+    reso: float,
+) -> Tuple[List[float], List[float]]:
+    path_grid: List[Tuple[int, int]] = []
+    walk = goal_idx_found
+    while walk != -1:
+        node = closed[walk]
+        path_grid.append((node.x, node.y))
+        walk = node.p_ind
+    path_grid.reverse()
+
+    from scenario_obstacles import grid_cell_center_world
+
+    pathx = [grid_cell_center_world(x, y, reso)[0] for x, y in path_grid]
+    pathy = [grid_cell_center_world(x, y, reso)[1] for x, y in path_grid]
+    return pathx, pathy
+
+
+def _path_reaches_goal_grid(
+    px: List[float],
+    py: List[float],
+    gx_i: int,
+    gy_i: int,
+    reso: float,
+) -> bool:
+    if not px:
+        return False
+    return round(px[-1] / reso) == gx_i and round(py[-1] / reso) == gy_i
+
+
+def _reachable_xy_from_closed(closed: Dict[int, _DiskNode]) -> Set[Tuple[int, int]]:
+    return {(node.x, node.y) for node in closed.values()}
+
+
+def _best_disk_cost_by_xy(closed: Dict[int, _DiskNode]) -> Dict[Tuple[int, int], Tuple[float, int]]:
+    """Minimum grid A* cost per ``(gx, gy)``; ``m_in`` slot kept at -1 for SE bootstrap compat."""
+    out: Dict[Tuple[int, int], Tuple[float, int]] = {}
+    for node in closed.values():
+        key = (node.x, node.y)
+        prev = out.get(key)
+        if prev is None or node.cost < prev[0]:
+            out[key] = (float(node.cost), M_PREV_NONE)
+    return out
+
+
+def _ms(seconds: float) -> float:
+    return 1000.0 * float(seconds)
+
+
+def format_disk_phase1_report(
+    timing: Dict[str, float],
+    *,
+    meta: Optional[Dict[str, object]] = None,
+    wall_s: Optional[float] = None,
+) -> List[str]:
+    """Human-readable Phase 1 disk pipeline lines for the app status log."""
+    meta = meta or {}
+    lines: List[str] = []
+    lines.append("[timing] mod_grid phase1 pipeline (disk grid A*)")
+    mode = str(meta.get("collision_mode", timing.get("collision_mode_label", "offline")))
+    lines.append(
+        f"  design: state=(x,y)  edges=8-way+diag gate  cost=1  collision={mode}"
+    )
+
+    meta_bits = []
+    if "reso" in meta:
+        meta_bits.append(f"reso={meta['reso']}")
+    if "map_w" in meta and "map_h" in meta:
+        meta_bits.append(f"map={meta['map_w']}x{meta['map_h']}m")
+    if "rr" in meta:
+        meta_bits.append(f"rr={meta['rr']}")
+    if "safety_margin" in meta:
+        meta_bits.append(f"margin={meta['safety_margin']}")
+    if "obstacle_pts" in meta:
+        meta_bits.append(f"ox={meta['obstacle_pts']}")
+    if meta_bits:
+        lines.append("  setup: " + " ".join(meta_bits))
+
+    map_ms = _ms(timing.get("disk_map_s", 0.0))
+    astar_ms = _ms(timing.get("astar_s", 0.0))
+    grid_xy = int(timing.get("grid_xy", 0.0))
+    disk_blk = int(timing.get("disk_blocked", 0.0))
+    lines.append(
+        f"  1 disk map: {map_ms:.0f}ms grid={grid_xy} disk_blk={disk_blk}"
+    )
+    online_checks = int(timing.get("online_checks", 0.0))
+    online_cache = int(timing.get("online_cache_hits", 0.0))
+    if online_checks > 0 or online_cache > 0:
+        lines.append(
+            f"     online collision: checks={online_checks} cache_hits={online_cache}"
+        )
+
+    goal = "YES" if timing.get("goal_reached", 0.0) >= 0.5 else "NO"
+    expanded = int(timing.get("expanded_states", 0.0))
+    rate = float(timing.get("states_per_s", 0.0))
+    open_max = int(timing.get("max_open", 0.0))
+    stale = int(timing.get("stale_pops", 0.0))
+    rate_s = f" {rate:.0f} states/s" if rate > 0.0 else ""
+    lines.append(
+        f"  2 grid A*: {astar_ms:.0f}ms expanded={expanded}{rate_s} "
+        f"open_max={open_max} stale_pops={stale} goal={goal}"
+    )
+
+    path_pts = int(timing.get("path_pts", 0.0))
+    plan_ms = _ms(timing.get("total_s", 0.0))
+    wall_ms = _ms(wall_s) if wall_s is not None else plan_ms
+    lines.append(f"  path {path_pts} pts  TOTAL: planner={plan_ms:.0f}ms wall={wall_ms:.0f}ms")
+    return lines
+
+
+def _fill_disk_phase1_timing(
+    timing: Dict[str, float],
+    *,
+    t_all: float,
+    t_map0: float,
+    t_map1: float,
+    t_astar0: float,
+    t_astar1: float,
+    goal_reached: bool,
+    expanded: int,
+    heap_pops: int,
+    stale_pops: int,
+    max_open: int,
+    path_pts: int,
+    grid_xy: int,
+    disk_blocked: int,
+    collision_mode: str,
+    online_checks: int = 0,
+    online_cache_hits: int = 0,
+) -> None:
+    astar_s = t_astar1 - t_astar0
+    timing.clear()
+    timing.update(
+        {
+            "disk_map_s": t_map1 - t_map0,
+            "astar_s": astar_s,
+            "goal_reached": 1.0 if goal_reached else 0.0,
+            "expanded_states": float(expanded),
+            "heap_pops": float(heap_pops),
+            "stale_pops": float(stale_pops),
+            "max_open": float(max_open),
+            "states_per_s": float(expanded) / astar_s if astar_s > 1e-9 and expanded > 0 else 0.0,
+            "path_pts": float(path_pts),
+            "grid_xy": float(grid_xy),
+            "disk_blocked": float(disk_blocked),
+            "collision_mode_label": collision_mode,
+            "online_checks": float(online_checks),
+            "online_cache_hits": float(online_cache_hits),
+            "total_s": time.perf_counter() - t_all,
+        }
+    )
+
+
+def phase1_augmented_astar_with_meta(
+    sx: float,
+    sy: float,
+    gx: float,
+    gy: float,
+    ox: List[float],
+    oy: List[float],
+    reso: float,
+    rr: float,
+    safety_margin: float = 0.0,
+    obstacle_rects=None,
+    timing: Optional[Dict[str, float]] = None,
+    disk_collision_mode: str = DISK_COLLISION_OFFLINE,
+) -> Tuple[
+    List[float],
+    List[float],
+    bool,
+    Set[Tuple[int, int]],
+    Dict[Tuple[int, int], Tuple[float, int]],
+]:
+    """
+    Phase 1 disk grid A* plus search metadata for SE(2) bootstrapping.
+
+    Returns ``(px, py, goal_reached, reachable_xy, reachable_cost)``.
+
+    ``disk_collision_mode`` is ``offline`` (full bitmap) or ``online`` (lazy checks).
+    SE bootstrap always uses ``offline``; non-SE mod_grid may choose ``online``.
+    """
+    from scenario_obstacles import clamp_safety_margin, grid_cell_disk_blocked
+
+    t_all = time.perf_counter()
+    safety_margin = clamp_safety_margin(safety_margin)
+    motion = _get_motion()
+    occ_rr = float(rr) + float(safety_margin)
+    r_eff_grid = occ_rr / float(reso)
+    rects_list = list(obstacle_rects) if obstacle_rects else []
+
+    mode = str(disk_collision_mode).lower().strip()
+    if mode not in (DISK_COLLISION_OFFLINE, DISK_COLLISION_ONLINE):
+        raise ValueError(f"disk_collision_mode must be 'offline' or 'online' (got {disk_collision_mode!r})")
+    online = mode == DISK_COLLISION_ONLINE
+
+    t_map0 = time.perf_counter()
+    ox_g = [float(x) / reso for x in ox]
+    oy_g = [float(y) / reso for y in oy]
+
+    obsmap: Optional[List[List[bool]]] = None
+    if online:
+        P = _calc_grid_para(ox_g, oy_g, reso)
+        disk_blocked = 0
+    else:
+        P, obsmap = base_astar.calc_parameters(ox_g, oy_g, occ_rr, reso)
+        if rects_list:
+            base_astar._apply_rect_disk_obstacles(obsmap, P, rects_list, occ_rr, reso)
+        disk_blocked = sum(1 for row in obsmap for cell in row if cell)
+    t_map1 = time.perf_counter()
+    grid_xy = int(P.xw * P.yw)
+
+    sx_i, sy_i = round(sx / reso), round(sy / reso)
+    gx_i, gy_i = round(gx / reso), round(gy / reso)
+
+    occ_cache: Dict[Tuple[int, int], bool] = {}
+    online_checks = 0
+    online_cache_hits = 0
+
+    def _in_bounds(x: int, y: int) -> bool:
+        return P.minx < x < P.maxx and P.miny < y < P.maxy
+
+    def _cell_blocked(x: int, y: int) -> bool:
+        nonlocal online_checks, online_cache_hits
+        if not _in_bounds(x, y):
+            return True
+        if obsmap is not None:
+            return bool(obsmap[x - P.minx][y - P.miny])
+        key = (int(x), int(y))
+        if key in occ_cache:
+            online_cache_hits += 1
+            return occ_cache[key]
+        online_checks += 1
+        blocked = grid_cell_disk_blocked(
+            key[0],
+            key[1],
+            ox_g=ox_g,
+            oy_g=oy_g,
+            r_eff_grid=r_eff_grid,
+            r_eff_world=occ_rr,
+            reso=reso,
+            rects=rects_list,
+        )
+        occ_cache[key] = blocked
+        return blocked
+
+    def _diagonal_clear(x: int, y: int, dx: int, dy: int) -> bool:
+        if dx == 0 or dy == 0:
+            return True
+        for nx, ny in ((x + dx, y), (x, y + dy)):
+            if not _in_bounds(nx, ny) or _cell_blocked(nx, ny):
+                return False
+        return True
+
+    if not _in_bounds(sx_i, sy_i):
+        if timing is not None:
+            _fill_disk_phase1_timing(
+                timing,
+                t_all=t_all,
+                t_map0=t_map0,
+                t_map1=t_map1,
+                t_astar0=t_map1,
+                t_astar1=t_map1,
+                goal_reached=False,
+                expanded=0,
+                heap_pops=0,
+                stale_pops=0,
+                max_open=0,
+                path_pts=0,
+                grid_xy=grid_xy,
+                disk_blocked=disk_blocked,
+                collision_mode=mode,
+                online_checks=online_checks,
+                online_cache_hits=online_cache_hits,
+            )
+        return [], [], False, set(), {}
+
+    n_start = _DiskNode(sx_i, sy_i, 0.0, -1)
+    start_idx = _grid_state_index(sx_i, sy_i, P)
+
+    open_entries: Dict[int, _DiskNode] = {start_idx: n_start}
+    closed: Dict[int, _DiskNode] = {}
+    pq: List[Tuple[float, int]] = []
+    heapq.heappush(pq, (_heuristic(sx_i, sy_i, gx_i, gy_i), start_idx))
+
+    goal_idx_found: Optional[int] = None
+    heap_pops = 0
+    stale_pops = 0
+    max_open = 1
+
+    t_astar0 = time.perf_counter()
+    while pq:
+        heap_pops += 1
+        _, idx = heapq.heappop(pq)
+        if idx in closed:
+            stale_pops += 1
+            continue
+        if idx not in open_entries:
+            continue
+        cur = open_entries.pop(idx)
+        closed[idx] = cur
+        max_open = max(max_open, len(open_entries) + 1)
+
+        if cur.x == gx_i and cur.y == gy_i:
+            goal_idx_found = idx
+            break
+
+        for mv in motion:
+            dx, dy = int(mv[0]), int(mv[1])
+            nx, ny = cur.x + dx, cur.y + dy
+            if not _in_bounds(nx, ny) or _cell_blocked(nx, ny):
+                continue
+            if not _diagonal_clear(cur.x, cur.y, dx, dy):
+                continue
+
+            g_new = cur.cost + 1.0
+            child_idx = _grid_state_index(nx, ny, P)
+            if child_idx in closed:
+                continue
+            h = _heuristic(nx, ny, gx_i, gy_i)
+            if child_idx in open_entries:
+                if g_new < open_entries[child_idx].cost:
+                    open_entries[child_idx] = _DiskNode(nx, ny, g_new, idx)
+                    heapq.heappush(pq, (g_new + h, child_idx))
+            else:
+                open_entries[child_idx] = _DiskNode(nx, ny, g_new, idx)
+                heapq.heappush(pq, (g_new + h, child_idx))
+    t_astar1 = time.perf_counter()
+
+    reachable_xy = _reachable_xy_from_closed(closed)
+    reachable_cost = _best_disk_cost_by_xy(closed)
+
+    if online and online_checks > 0:
+        disk_blocked = sum(1 for v in occ_cache.values() if v)
+
+    goal_reached = goal_idx_found is not None
+    if goal_reached:
+        px, py = _reconstruct_phase1_path(goal_idx_found, closed, reso)
+    else:
+        px, py = [], []
+
+    if timing is not None:
+        _fill_disk_phase1_timing(
+            timing,
+            t_all=t_all,
+            t_map0=t_map0,
+            t_map1=t_map1,
+            t_astar0=t_astar0,
+            t_astar1=t_astar1,
+            goal_reached=goal_reached,
+            expanded=len(closed),
+            heap_pops=heap_pops,
+            stale_pops=stale_pops,
+            max_open=max_open,
+            path_pts=len(px),
+            grid_xy=grid_xy,
+            disk_blocked=disk_blocked,
+            collision_mode=mode,
+            online_checks=online_checks,
+            online_cache_hits=online_cache_hits,
+        )
+    return px, py, goal_reached, reachable_xy, reachable_cost
 
 
 def phase1_augmented_astar(
@@ -193,98 +633,25 @@ def phase1_augmented_astar(
     reso: float,
     rr: float,
     safety_margin: float = 0.0,
+    obstacle_rects=None,
+    timing: Optional[Dict[str, float]] = None,
+    disk_collision_mode: str = DISK_COLLISION_OFFLINE,
 ) -> Tuple[List[float], List[float]]:
-    motion = _get_motion()
-    # Phase 1 should not be more conservative than the baseline grid A*.
-    # So we build the hard occupancy map using exactly `rr` (no extra margin).
-    # Additional clearance preferences are handled via risk/heading costs.
-    occ_rr = float(rr) + float(safety_margin)
-
-    ox_g = [float(x) / reso for x in ox]
-    oy_g = [float(y) / reso for y in oy]
-
-    P, obsmap = base_astar.calc_parameters(ox_g, oy_g, occ_rr, reso)
-    clearance_m = _build_clearance_meters(obsmap, reso)
-
-    sx_i, sy_i = round(sx / reso), round(sy / reso)
-    gx_i, gy_i = round(gx / reso), round(gy / reso)
-
-    def ok_cell(x: int, y: int) -> bool:
-        if x <= P.minx or x >= P.maxx or y <= P.miny or y >= P.maxy:
-            return False
-        return not obsmap[x - P.minx][y - P.miny]
-
-    n_start = _AugNode(sx_i, sy_i, M_PREV_NONE, 0.0, -1)
-    start_idx = _state_index(sx_i, sy_i, M_PREV_NONE, P)
-
-    open_entries: Dict[int, _AugNode] = {start_idx: n_start}
-    closed: Dict[int, _AugNode] = {}
-    pq: List[Tuple[float, int]] = []
-    heapq.heappush(pq, (0.0 + _heuristic(sx_i, sy_i, gx_i, gy_i), start_idx))
-
-    goal_idx_found: Optional[int] = None
-
-    while pq:
-        f_pop, idx = heapq.heappop(pq)
-        if idx in closed:
-            continue
-        if idx not in open_entries:
-            continue
-        cur = open_entries.pop(idx)
-        closed[idx] = cur
-
-        if cur.x == gx_i and cur.y == gy_i:
-            goal_idx_found = idx
-            break
-
-        ix, iy = cur.x - P.minx, cur.y - P.miny
-        d_here = float(clearance_m[ix, iy])
-
-        for mi, mv in enumerate(motion):
-            nx, ny = cur.x + mv[0], cur.y + mv[1]
-            if not ok_cell(nx, ny):
-                continue
-
-            nix, niy = nx - P.minx, ny - P.miny
-            d_there = float(clearance_m[nix, niy])
-            # Use destination clearance for risk (what we enter)
-            c = (
-                _u_cost(mv)
-                + _risk_cost(d_there)
-                + _HEADING_WEIGHT * _angle_between_moves(cur.m_in, mi, motion)
-            )
-            g_new = cur.cost + c
-            child_idx = _state_index(nx, ny, mi, P)
-            if child_idx in closed:
-                continue
-            h = _heuristic(nx, ny, gx_i, gy_i)
-            if child_idx in open_entries:
-                if g_new < open_entries[child_idx].cost:
-                    open_entries[child_idx] = _AugNode(nx, ny, mi, g_new, idx)
-                    heapq.heappush(pq, (g_new + h, child_idx))
-            else:
-                open_entries[child_idx] = _AugNode(nx, ny, mi, g_new, idx)
-                heapq.heappush(pq, (g_new + h, child_idx))
-
-    if goal_idx_found is None:
-        # No full path; try vanilla A* fallback
-        try:
-            return base_astar.astar_planning(sx, sy, gx, gy, ox, oy, reso, occ_rr)
-        except Exception:
-            # Baseline implementation can raise (e.g., KeyError) when no path exists.
-            return [], []
-
-    path_grid: List[Tuple[int, int]] = []
-    walk = goal_idx_found
-    while walk != -1:
-        node = closed[walk]
-        path_grid.append((node.x, node.y))
-        walk = node.p_ind
-    path_grid.reverse()
-
-    pathx = [float(x) * reso for x, _ in path_grid]
-    pathy = [float(y) * reso for _, y in path_grid]
-    return pathx, pathy
+    px, py, _reached, _reachable, _cost = phase1_augmented_astar_with_meta(
+        sx,
+        sy,
+        gx,
+        gy,
+        ox,
+        oy,
+        reso,
+        rr,
+        safety_margin=safety_margin,
+        obstacle_rects=obstacle_rects,
+        timing=timing,
+        disk_collision_mode=disk_collision_mode,
+    )
+    return px, py
 
 
 # --- Phase 2: CHOMP helpers ------------------------------------------------
@@ -402,6 +769,7 @@ def phase2_chomp(
     reso: float,
     rr: float,
     safety_margin: float = 0.0,
+    obstacle_rects=None,
 ) -> Tuple[List[float], List[float]]:
     if len(px) < 2:
         return px, py
@@ -410,6 +778,8 @@ def phase2_chomp(
     ox_g = [float(x) / reso for x in ox]
     oy_g = [float(y) / reso for y in oy]
     P, obsmap = base_astar.calc_parameters(ox_g, oy_g, safe_rr, reso)
+    if obstacle_rects:
+        base_astar._apply_rect_disk_obstacles(obsmap, P, obstacle_rects, safe_rr, reso)
     clearance_m = _build_clearance_meters(obsmap, reso)
     xw, yw = clearance_m.shape
     # Clamp CHOMP interior points inside the sampling-safe region.
@@ -477,6 +847,33 @@ def phase2_chomp(
                 np.zeros_like(xs, dtype=np.float64),
             )
 
+    target_clear = float(rr) + float(safety_margin) + max(float(_CHOMP_HARD_CLEARANCE_PAD), 0.25 * float(reso))
+    rects = list(obstacle_rects) if obstacle_rects else []
+
+    def _augment_cloud_clearance(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+        dcloud, oxn, oyn = _nearest_obs_pts(xs, ys)
+        if rects:
+            _ha_draw = Path(__file__).resolve().parents[1]
+            if str(_ha_draw) not in sys.path:
+                sys.path.insert(0, str(_ha_draw))
+            from scenario_obstacles import min_distance_point_to_rects
+
+            for ii in range(xs.shape[0]):
+                d_rect = min_distance_point_to_rects(float(xs[ii]), float(ys[ii]), rects)
+                if d_rect < dcloud[ii]:
+                    dcloud[ii] = d_rect
+                    # Push away from nearest rect surface along center->sample ray.
+                    if d_rect > 1e-9:
+                        # Approximate outward direction using nearest cloud obstacle if available.
+                        vx = xs[ii] - oxn[ii]
+                        vy = ys[ii] - oyn[ii]
+                    else:
+                        vx, vy = 1.0, 0.0
+                    vn = max(math.hypot(vx, vy), 1e-9)
+                    oxn[ii] = xs[ii] - d_rect * (vx / vn)
+                    oyn[ii] = ys[ii] - d_rect * (vy / vn)
+        return dcloud, oxn, oyn
+
     for _ in range(_CHOMP_ITERS):
         gx_total = np.zeros(n, dtype=np.float64)
         gy_total = np.zeros(n, dtype=np.float64)
@@ -529,11 +926,9 @@ def phase2_chomp(
                 qx[i] = qx_prev[i]
                 qy[i] = qy_prev[i]
 
-        # Hard projection: if a point is too close to the obstacle point set,
+        # Hard projection: if a point is too close to obstacles (points + rects),
         # push it outward to the target clearance rather than just reverting.
-        # This fixes cases where the initial (Phase 1) path already grazes obstacles.
-        target_clear = float(rr) + float(safety_margin) + max(float(_CHOMP_HARD_CLEARANCE_PAD), 0.25 * float(reso))
-        dcloud, oxn, oyn = _nearest_obs_pts(qx[1:-1], qy[1:-1])
+        dcloud, oxn, oyn = _augment_cloud_clearance(qx[1:-1], qy[1:-1])
         bad = dcloud < target_clear
         if np.any(bad):
             xs = qx[1:-1].copy()
@@ -553,7 +948,13 @@ def phase2_chomp(
             qx[1:-1] = xs
             qy[1:-1] = ys
 
-    return qx.tolist(), qy.tolist()
+    out_x, out_y = qx.tolist(), qy.tolist()
+    eff_rr = float(rr) + float(safety_margin)
+    if _path_violates_disk_clearance(
+        out_x, out_y, ox, oy, eff_rr, obstacle_rects=obstacle_rects, reso=reso
+    ):
+        return px, py
+    return out_x, out_y
 
 
 def _segment_min_distance_to_points(
@@ -577,15 +978,132 @@ def _segment_min_distance_to_points(
     return best
 
 
+def _phase3_arc_sample_count(
+    sweep: float,
+    arc_radius: float,
+    clearance: float,
+    reso: float,
+    sample_mult: float = 1.0,
+) -> int:
+    """Number of angular samples for disk centerline clearance along an arc."""
+    mult = max(1.0, float(sample_mult))
+    arc_len = abs(float(sweep)) * max(float(arc_radius), 1e-6)
+    along_step = max(0.06, min(0.2 * float(clearance), 0.35 * float(reso))) / mult
+    n_len = int(math.ceil(arc_len / along_step)) + 1
+    n_ang = int(math.ceil(abs(float(sweep)) * _ARC_POINTS_PER_RAD * mult)) + 1
+    return min(240, max(8, n_len, n_ang))
+
+
+def _segment_disk_clear(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    ox: List[float],
+    oy: List[float],
+    clearance: float,
+    reso: float = 0.2,
+    sample_mult: float = 1.0,
+    obstacle_rects=None,
+    validation_ctx=None,
+) -> bool:
+    """True if a disk of radius ``clearance`` can traverse the straight segment."""
+    del sample_mult
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import line_disk_feasible
+
+    ctx = validation_ctx or _disk_validation_ctx(clearance, reso, ox, oy, obstacle_rects)
+    return line_disk_feasible(x0, y0, x1, y1, ctx)
+
+
+def _arc_clear(
+    ox_c: float,
+    oy_c: float,
+    r: float,
+    a0: float,
+    sweep: float,
+    ox: List[float],
+    oy: List[float],
+    clearance: float,
+    reso: float = 0.2,
+    sample_mult: float = 1.0,
+    obstacle_rects=None,
+    validation_ctx=None,
+) -> bool:
+    """Planning-only arc gate (phase 3 DP / shortcut). Viz uses ``densify_polyline``."""
+    del sample_mult
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import arc_disk_feasible
+
+    ctx = validation_ctx or _disk_validation_ctx(clearance, reso, ox, oy, obstacle_rects)
+    return arc_disk_feasible(ox_c, oy_c, r, a0, sweep, ctx)
+
+
+def _primitives_disk_valid(
+    prims: List[Tuple[str, dict]],
+    ox: List[float],
+    oy: List[float],
+    clearance: float,
+    reso: float = 0.2,
+    obstacle_rects=None,
+    validation_ctx=None,
+) -> bool:
+    """True when every primitive passes the hierarchical disk-vs-OBB funnel."""
+    if not prims:
+        return True
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import primitive_disk_feasible
+
+    ctx = validation_ctx or _disk_validation_ctx(clearance, reso, ox, oy, obstacle_rects)
+    return all(primitive_disk_feasible(typ, p, ctx) for typ, p in prims)
+
+
+def _primitives_min_clearance(
+    prims: List[Tuple[str, dict]],
+    ox: List[float],
+    oy: List[float],
+    clearance: float,
+    reso: float = 0.2,
+    sample_mult: float = 1.0,
+    obstacle_rects=None,
+    validation_ctx=None,
+) -> float:
+    """Minimum centerline clearance along primitives (returns ``clearance`` if invalid)."""
+    del sample_mult
+    if not prims:
+        return float("inf")
+    if not _primitives_disk_valid(
+        prims, ox, oy, clearance, reso, obstacle_rects=obstacle_rects, validation_ctx=validation_ctx
+    ):
+        return float(clearance)
+    return float(clearance) + 1e-3
+
+
 def _shortcut_path(
     px: List[float],
     py: List[float],
     ox: List[float],
     oy: List[float],
     clearance: float,
+    *,
+    obstacle_rects=None,
+    reso: float = 0.2,
+    validation_ctx=None,
 ) -> Tuple[List[float], List[float]]:
     if len(px) <= 2:
         return px, py
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import line_disk_feasible
+
+    ctx = validation_ctx or _disk_validation_ctx(clearance, reso, ox, oy, obstacle_rects)
     outx = [px[0]]
     outy = [py[0]]
     i = 0
@@ -593,7 +1111,7 @@ def _shortcut_path(
     while i < n - 1:
         j = n - 1
         while j > i + 1:
-            if _segment_min_distance_to_points(px[i], py[i], px[j], py[j], ox, oy) > clearance:
+            if line_disk_feasible(px[i], py[i], px[j], py[j], ctx):
                 break
             j -= 1
         outx.append(px[j])
@@ -603,16 +1121,48 @@ def _shortcut_path(
 
 
 def _path_min_segment_clearance(
-    px: List[float], py: List[float], ox: List[float], oy: List[float]
+    px: List[float], py: List[float], ox: List[float], oy: List[float], *, obstacle_rects=None, reso: float = 0.2
 ) -> float:
     if len(px) < 2:
         return float("inf")
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import segment_min_clearance
+
+    rects = list(obstacle_rects) if obstacle_rects else []
     best = float("inf")
     for i in range(len(px) - 1):
-        d = _segment_min_distance_to_points(px[i], py[i], px[i + 1], py[i + 1], ox, oy)
+        d = segment_min_clearance(
+            px[i], py[i], px[i + 1], py[i + 1], ox, oy, obstacle_rects=rects, reso=reso
+        )
         if d < best:
             best = d
     return best
+
+
+def _path_violates_disk_clearance(
+    px: List[float],
+    py: List[float],
+    ox: List[float],
+    oy: List[float],
+    eff_rr: float,
+    *,
+    obstacle_rects=None,
+    reso: float = 0.2,
+) -> bool:
+    """True when a disk of radius ``eff_rr`` overlaps obstacle points or scenario rects."""
+    if _path_min_segment_clearance(px, py, ox, oy, obstacle_rects=obstacle_rects, reso=reso) <= float(eff_rr):
+        return True
+    if obstacle_rects:
+        _ha_draw = Path(__file__).resolve().parents[1]
+        if str(_ha_draw) not in sys.path:
+            sys.path.insert(0, str(_ha_draw))
+        from scenario_obstacles import disk_path_min_clearance_to_rects
+
+        if disk_path_min_clearance_to_rects(px, py, float(eff_rr), obstacle_rects, reso) < 0.0:
+            return True
+    return False
 
 
 def _min_dist_point_to_obstacles(x: float, y: float, ox: List[float], oy: List[float]) -> float:
@@ -729,7 +1279,7 @@ def phase3_straight_arc(
         a_end = a_start + gamma  # signed sweep matches tangent fillet geometry
 
         use_fillet = True
-        if _ARC_CHECK_OBSTACLES and ox:
+        if ox:
             if _segment_min_distance_to_points(cur_x, cur_y, p0x, p0y, ox, oy) <= clearance:
                 use_fillet = False
             elif _segment_min_distance_to_points(p1x, p1y, bx, by, ox, oy) <= clearance:
@@ -828,27 +1378,6 @@ def _arc_params_through_mid(
     # choose smaller magnitude sweep
     cand.sort(key=lambda t: abs(t[2]))
     return cand[0]
-
-
-def _arc_clear(
-    ox_c: float,
-    oy_c: float,
-    r: float,
-    a0: float,
-    sweep: float,
-    ox: List[float],
-    oy: List[float],
-    clearance: float,
-) -> bool:
-    n = max(5, int(abs(sweep) * _ARC_POINTS_PER_RAD) + 1)
-    for k in range(n):
-        t = k / float(n - 1) if n > 1 else 0.0
-        ang = a0 + t * sweep
-        x = ox_c + r * math.cos(ang)
-        y = oy_c + r * math.sin(ang)
-        if _min_dist_point_to_obstacles(x, y, ox, oy) <= clearance:
-            return False
-    return True
 
 
 def _unit(dx: float, dy: float) -> Optional[Tuple[float, float]]:
@@ -950,43 +1479,66 @@ def phase3_min_segments(
     oy: List[float],
     clearance: float,
     return_primitives: bool = False,
+    reso: float = 0.2,
+    obstacle_rects=None,
+    dp_objective: str = DP_OBJECTIVE_LENGTH,
 ) -> Tuple[List[float], List[float]]:
     """
-    Alternative to fillets: fit a sequence of straight segments and circular arcs
-    that minimizes the number of primitives (each straight or arc counts as 1).
+    Shortcut waypoint DP: straight segments and circular arcs between sparse vertices.
 
-    Implementation is a constrained DP over the given polyline vertices.
-    - Straight candidate: connect i->j if clearance holds for the segment.
-    - Arc candidate: connect i->j via circle through (i, k, j) for a limited set
-      of midpoints k; accept if arc passing through k is collision-free.
+    ``dp_objective``:
+      - ``length``: minimize total primitive arc/chord length (default).
+      - ``min_segments``: minimize primitive count (legacy behaviour).
+
+    Primitives use the hierarchical disk-vs-OBB funnel in ``scenario_obstacles``.
     """
+    if dp_objective not in (DP_OBJECTIVE_LENGTH, DP_OBJECTIVE_MIN_SEGMENTS):
+        raise ValueError(f"dp_objective must be 'length' or 'min_segments' (got {dp_objective!r})")
+
     n = len(px)
     if n < 2:
         if return_primitives:
             return px, py, []
         return px, py
 
-    # DP arrays
+    validation_ctx = _disk_validation_ctx(clearance, reso, ox, oy, obstacle_rects)
+    check_clear = float(clearance)
+
+    def _edge_cost(typ: str, params: dict) -> float:
+        if dp_objective == DP_OBJECTIVE_MIN_SEGMENTS:
+            return 1.0
+        return _primitive_length(typ, params)
+
     INF = 10**9
     best_cost = [INF] * n
     best_prev: List[Optional[Tuple[int, str, dict]]] = [None] * n
-    best_cost[0] = 0
+    best_cost[0] = 0.0
 
-    max_span = min(30, n - 1)  # keep candidate set manageable
+    max_span = min(30, n - 1)
 
     for j in range(1, n):
         i_min = max(0, j - max_span)
         for i in range(i_min, j):
             if best_cost[i] >= INF:
                 continue
-            # Straight candidate
-            if _segment_min_distance_to_points(px[i], py[i], px[j], py[j], ox, oy) > clearance:
-                c = best_cost[i] + 1
+            s_params = {"x0": px[i], "y0": py[i], "x1": px[j], "y1": py[j]}
+            if _segment_disk_clear(
+                px[i],
+                py[i],
+                px[j],
+                py[j],
+                ox,
+                oy,
+                check_clear,
+                reso,
+                obstacle_rects=obstacle_rects,
+                validation_ctx=validation_ctx,
+            ):
+                c = best_cost[i] + _edge_cost("S", s_params)
                 if c < best_cost[j]:
                     best_cost[j] = c
-                    best_prev[j] = (i, "S", {"x0": px[i], "y0": py[i], "x1": px[j], "y1": py[j]})
+                    best_prev[j] = (i, "S", s_params)
 
-            # Arc candidate: choose a few midpoints k between i and j
             if j - i >= 2:
                 for k in {i + 1, (i + j) // 2, j - 1}:
                     if not (i < k < j):
@@ -999,18 +1551,26 @@ def phase3_min_segments(
                     if arc_par is None:
                         continue
                     a0, _a1, sweep = arc_par
-                    if not _arc_clear(ocx, ocy, r, a0, sweep, ox, oy, clearance):
+                    a_params = {"ocx": ocx, "ocy": ocy, "r": r, "a0": a0, "sweep": sweep}
+                    if not _arc_clear(
+                        ocx,
+                        ocy,
+                        r,
+                        a0,
+                        sweep,
+                        ox,
+                        oy,
+                        check_clear,
+                        reso,
+                        obstacle_rects=obstacle_rects,
+                        validation_ctx=validation_ctx,
+                    ):
                         continue
-                    c = best_cost[i] + 1
+                    c = best_cost[i] + _edge_cost("A", a_params)
                     if c < best_cost[j]:
                         best_cost[j] = c
-                        best_prev[j] = (
-                            i,
-                            "A",
-                            {"ocx": ocx, "ocy": ocy, "r": r, "a0": a0, "sweep": sweep},
-                        )
+                        best_prev[j] = (i, "A", a_params)
 
-                # Additional arc family: endpoint tangency + small discrete radii.
                 chord = math.hypot(px[j] - px[i], py[j] - py[i])
                 if chord > 1e-6:
                     r_min = 0.5 * chord + 1e-4
@@ -1025,36 +1585,48 @@ def phase3_min_segments(
                             if cand is None:
                                 continue
                             ocx, ocy, r, a0, sweep = cand
-                            if not _arc_clear(ocx, ocy, r, a0, sweep, ox, oy, clearance):
+                            a_params = {"ocx": ocx, "ocy": ocy, "r": r, "a0": a0, "sweep": sweep}
+                            if not _arc_clear(
+                                ocx,
+                                ocy,
+                                r,
+                                a0,
+                                sweep,
+                                ox,
+                                oy,
+                                check_clear,
+                                reso,
+                                obstacle_rects=obstacle_rects,
+                                validation_ctx=validation_ctx,
+                            ):
                                 continue
-                            c = best_cost[i] + 1
+                            c = best_cost[i] + _edge_cost("A", a_params)
                             if c < best_cost[j]:
                                 best_cost[j] = c
-                                best_prev[j] = (
-                                    i,
-                                    "A",
-                                    {"ocx": ocx, "ocy": ocy, "r": r, "a0": a0, "sweep": sweep},
-                                )
+                                best_prev[j] = (i, "A", a_params)
 
     if best_prev[-1] is None:
-        # No compression found; fall back to original polyline.
         if return_primitives:
-            return [float(x) for x in px], [float(y) for y in py], _polyline_straight_primitives(
-                px, py
-            )
+            return [float(x) for x in px], [float(y) for y in py], _polyline_straight_primitives(px, py)
         return px, py
 
-    # Reconstruct primitives backward
     prims: List[Tuple[str, dict]] = []
     cur = n - 1
     while cur != 0:
         prev = best_prev[cur]
         if prev is None:
             break
-        i, typ, params = prev
+        _i, typ, params = prev
         prims.append((typ, params))
-        cur = i
+        cur = _i
     prims.reverse()
+
+    if not _primitives_disk_valid(
+        prims, ox, oy, check_clear, reso, obstacle_rects=obstacle_rects, validation_ctx=validation_ctx
+    ):
+        if return_primitives:
+            return [float(x) for x in px], [float(y) for y in py], _polyline_straight_primitives(px, py)
+        return px, py
 
     # Emit sampled points
     outx: List[float] = [float(px[0])]
@@ -1075,7 +1647,8 @@ def phase3_min_segments(
             r = p["r"]
             a0 = p["a0"]
             sweep = p["sweep"]
-            n_arc = max(5, int(abs(sweep) * _ARC_POINTS_PER_RAD) + 1)
+            arc_len = abs(float(sweep)) * max(float(r), 1e-9)
+            n_arc = max(2, int(math.ceil(arc_len / max(float(reso), 1e-9))))
             for kk in range(1, n_arc + 1):
                 t = kk / float(n_arc)
                 ang = a0 + t * sweep
@@ -1084,6 +1657,253 @@ def phase3_min_segments(
     if return_primitives:
         return outx, outy, prims
     return outx, outy
+
+
+def _primitive_start_xy(typ: str, params: dict) -> Tuple[float, float]:
+    if typ == "S":
+        return float(params["x0"]), float(params["y0"])
+    ocx = float(params["ocx"])
+    ocy = float(params["ocy"])
+    r = float(params["r"])
+    a0 = float(params["a0"])
+    return ocx + r * math.cos(a0), ocy + r * math.sin(a0)
+
+
+def densify_polyline(
+    px: Sequence[float],
+    py: Sequence[float],
+    reso: float,
+) -> Tuple[List[float], List[float]]:
+    """Resample a polyline at roughly ``reso`` spacing for footprint visualization."""
+    if len(px) < 2 or len(py) != len(px):
+        return list(px), list(py)
+    step = max(float(reso), 1e-6)
+    outx: List[float] = [float(px[0])]
+    outy: List[float] = [float(py[0])]
+    for i in range(len(px) - 1):
+        x0, y0 = float(px[i]), float(py[i])
+        x1, y1 = float(px[i + 1]), float(py[i + 1])
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        n = max(1, int(math.ceil(seg_len / step)))
+        for k in range(1, n + 1):
+            t = k / float(n)
+            xf = x0 + t * (x1 - x0)
+            yf = y0 + t * (y1 - y0)
+            if abs(outx[-1] - xf) < 1e-9 and abs(outy[-1] - yf) < 1e-9:
+                continue
+            outx.append(xf)
+            outy.append(yf)
+    return outx, outy
+
+
+def _point_segment_distance_and_t(
+    px: float, py: float, x0: float, y0: float, x1: float, y1: float
+) -> Tuple[float, float]:
+    dx = x1 - x0
+    dy = y1 - y0
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(px - x0, py - y0), 0.0
+    t = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    cx = x0 + t * dx
+    cy = y0 + t * dy
+    return math.hypot(px - cx, py - cy), t
+
+
+def _normalize_angle_delta(a0: float, a1: float) -> float:
+    return float(math.atan2(math.sin(a1 - a0), math.cos(a1 - a0)))
+
+
+def _angle_on_arc_sweep(ang: float, a0: float, sweep: float) -> Optional[float]:
+    """Return fraction t in [0,1] along signed sweep if ``ang`` lies on the arc."""
+    if abs(sweep) < 1e-12:
+        return 0.0 if abs(_normalize_angle_delta(a0, ang)) < 1e-6 else None
+    delta = _normalize_angle_delta(a0, ang)
+    if sweep > 0.0:
+        if delta < -1e-6 or delta > sweep + 1e-6:
+            return None
+        return max(0.0, min(1.0, delta / sweep))
+    if delta > 1e-6 or delta < sweep - 1e-6:
+        return None
+    return max(0.0, min(1.0, delta / sweep))
+
+
+def _point_arc_distance_and_fraction(
+    px: float, py: float, ocx: float, ocy: float, r: float, a0: float, sweep: float
+) -> Tuple[float, float]:
+    ang = math.atan2(py - ocy, px - ocx)
+    frac = _angle_on_arc_sweep(ang, a0, sweep)
+    radial = abs(math.hypot(px - ocx, py - ocy) - r)
+    if frac is not None:
+        return radial, frac
+    # Distance to arc endpoints when projection falls outside sweep.
+    x_start = ocx + r * math.cos(a0)
+    y_start = ocy + r * math.sin(a0)
+    x_end = ocx + r * math.cos(a0 + sweep)
+    y_end = ocy + r * math.sin(a0 + sweep)
+    d0 = math.hypot(px - x_start, py - y_start)
+    d1 = math.hypot(px - x_end, py - y_end)
+    if d0 <= d1:
+        return d0, 0.0
+    return d1, 1.0
+
+
+def _yaw_at_point_on_primitives(
+    px: float,
+    py: float,
+    prims: Sequence[Tuple[str, dict]],
+    syaw: float,
+) -> float:
+    cur_yaw = float(syaw)
+    best_d = float("inf")
+    best_yaw = cur_yaw
+    for typ, p in prims:
+        if typ == "S":
+            d, _t = _point_segment_distance_and_t(
+                px, py, float(p["x0"]), float(p["y0"]), float(p["x1"]), float(p["y1"])
+            )
+            if d < best_d:
+                best_d = d
+                best_yaw = cur_yaw
+        else:
+            d, frac = _point_arc_distance_and_fraction(
+                px,
+                py,
+                float(p["ocx"]),
+                float(p["ocy"]),
+                float(p["r"]),
+                float(p["a0"]),
+                float(p["sweep"]),
+            )
+            if d < best_d:
+                best_d = d
+                best_yaw = cur_yaw + frac * float(p["sweep"])
+        if typ == "A":
+            cur_yaw += float(p["sweep"])
+    return float(math.atan2(math.sin(best_yaw), math.cos(best_yaw)))
+
+
+def yaw_on_polyline_samples(
+    px: Sequence[float],
+    py: Sequence[float],
+    prims: Sequence[Tuple[str, dict]],
+    syaw: float,
+) -> List[float]:
+    """Assign yaw at existing polyline samples (no geometry change)."""
+    return [_yaw_at_point_on_primitives(float(x), float(y), prims, syaw) for x, y in zip(px, py)]
+
+
+def yaw_fill_from_primitives_on_polyline(
+    px: Sequence[float],
+    py: Sequence[float],
+    prims: Sequence[Tuple[str, dict]],
+    syaw: float,
+    reso: float,
+) -> List[float]:
+    """Densify ``px, py`` then assign yaw from phase-3 primitives."""
+    dx, dy = densify_polyline(px, py, reso)
+    return yaw_on_polyline_samples(dx, dy, prims, syaw)
+
+
+def path_and_yaw_from_primitives(
+    prims: List[Tuple[str, dict]],
+    syaw: float,
+    reso: float,
+) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Legacy helper: densify primitives to (px, py, pyaw).
+
+    Prefer ``yaw_fill_from_primitives_on_polyline`` when the planner path is
+    already fixed and only yaw is needed.
+    """
+    if not prims:
+        return [], [], []
+
+    outx: List[float] = []
+    outy: List[float] = []
+    outyaw: List[float] = []
+    cur_yaw = float(syaw)
+
+    def emit(x: float, y: float, yaw: float) -> None:
+        xf, yf, yf_yaw = float(x), float(y), float(yaw)
+        if outx and abs(outx[-1] - xf) < 1e-9 and abs(outy[-1] - yf) < 1e-9:
+            return
+        outx.append(xf)
+        outy.append(yf)
+        outyaw.append(yf_yaw)
+
+    t0, p0 = prims[0]
+    sx, sy = _primitive_start_xy(t0, p0)
+    emit(sx, sy, cur_yaw)
+
+    for typ, p in prims:
+        if typ == "S":
+            emit(float(p["x1"]), float(p["y1"]), cur_yaw)
+            continue
+        ocx = float(p["ocx"])
+        ocy = float(p["ocy"])
+        r = max(float(p["r"]), 1e-9)
+        a0 = float(p["a0"])
+        sweep = float(p["sweep"])
+        arc_len = abs(sweep) * r
+        n_arc = max(2, int(math.ceil(arc_len / max(float(reso), 1e-9))))
+        for kk in range(1, n_arc + 1):
+            t = kk / float(n_arc)
+            ang = a0 + t * sweep
+            emit(ocx + r * math.cos(ang), ocy + r * math.sin(ang), cur_yaw + t * sweep)
+        cur_yaw = outyaw[-1]
+
+    pyaw = [float(math.atan2(math.sin(y), math.cos(y))) for y in outyaw]
+    return outx, outy, pyaw
+
+
+def phase3_polish(
+    px: List[float],
+    py: List[float],
+    ox: List[float],
+    oy: List[float],
+    rr: float,
+    *,
+    safety_margin: float = 0.0,
+    reso: float = 0.2,
+    obstacle_rects=None,
+    dp_objective: str = DP_OBJECTIVE_LENGTH,
+    return_primitives: bool = False,
+):
+    """Greedy shortcut + primitive DP; falls back to shortcut then phase-1 polyline."""
+    from scenario_obstacles import clamp_safety_margin
+
+    safety_margin = clamp_safety_margin(safety_margin)
+    eff_rr = float(rr) + float(safety_margin)
+    p1x, p1y = list(px), list(py)
+    validation_ctx = _disk_validation_ctx(eff_rr, reso, ox, oy, obstacle_rects)
+    spx, spy = _shortcut_path(
+        px, py, ox, oy, eff_rr, obstacle_rects=obstacle_rects, reso=reso, validation_ctx=validation_ctx
+    )
+
+    out_x, out_y, prims = phase3_min_segments(
+        spx,
+        spy,
+        ox,
+        oy,
+        eff_rr,
+        return_primitives=True,
+        reso=reso,
+        obstacle_rects=obstacle_rects,
+        dp_objective=dp_objective,
+    )
+    if _primitives_disk_valid(
+        prims, ox, oy, eff_rr, reso, obstacle_rects=obstacle_rects, validation_ctx=validation_ctx
+    ):
+        if return_primitives:
+            return out_x, out_y, prims
+        return out_x, out_y
+
+    if return_primitives:
+        return list(spx), list(spy), _polyline_straight_primitives(spx, spy)
+    if len(spx) >= 2:
+        return spx, spy
+    return p1x, p1y
 
 
 def astar_planning(
@@ -1098,18 +1918,44 @@ def astar_planning(
     stop_phase: int = 3,
     safety_margin: float = 0.0,
     return_primitives: bool = False,
+    obstacle_rects=None,
+    dp_objective: str = DP_OBJECTIVE_LENGTH,
+    timing: Optional[Dict[str, float]] = None,
+    disk_collision_mode: str = DISK_COLLISION_OFFLINE,
 ) -> Tuple[List[float], List[float]]:
     """
-    mod_grid pipeline with early exit / alternatives:
-    Phase 1: augmented A*
-    Phase 2: Phase 1 → CHOMP → shortcut (final optimization)
-    Phase 3: Phase 1 → shortcut → straight+arc fillets (alternative, skips CHOMP)
+    mod_grid pipeline:
+      Phase 1: augmented A*
+      Phase 3: shortcut + primitive DP (``dp_objective``: ``length`` or ``min_segments``)
+
+    Phase 2 (CHOMP) is not supported — use ``stop_phase=3``.
     """
-    if stop_phase not in (1, 2, 3):
-        raise ValueError(f"stop_phase must be 1, 2, or 3 (got {stop_phase})")
+    if stop_phase == 2:
+        raise NotImplementedError(
+            "mod_grid Phase 2 (CHOMP) is disabled. Use stop_phase=1 or stop_phase=3."
+        )
+    if stop_phase not in (1, 3):
+        raise ValueError(f"stop_phase must be 1 or 3 (got {stop_phase})")
+    if dp_objective not in (DP_OBJECTIVE_LENGTH, DP_OBJECTIVE_MIN_SEGMENTS):
+        raise ValueError(f"dp_objective must be 'length' or 'min_segments' (got {dp_objective!r})")
+
+    from scenario_obstacles import clamp_safety_margin
+
+    safety_margin = clamp_safety_margin(safety_margin)
 
     px, py = phase1_augmented_astar(
-        sx, sy, gx, gy, ox, oy, reso, rr, safety_margin=float(safety_margin)
+        sx,
+        sy,
+        gx,
+        gy,
+        ox,
+        oy,
+        reso,
+        rr,
+        safety_margin=float(safety_margin),
+        obstacle_rects=obstacle_rects,
+        timing=timing,
+        disk_collision_mode=disk_collision_mode,
     )
     if len(px) < 2:
         return px, py
@@ -1117,123 +1963,67 @@ def astar_planning(
     if stop_phase == 1:
         return px, py
 
-    safe_rr = float(rr) + float(safety_margin) + max(_INFLATION_RESO_FACTOR * reso, 0.15)
-    eff_rr = float(rr) + float(safety_margin)
-    if stop_phase == 2:
-        p1x, p1y = px, py
-        cpx, cpy = phase2_chomp(px, py, ox, oy, reso, rr, safety_margin=float(safety_margin))
-        # CHOMP may still be problematic in sparse/thickened line maps; enforce
-        # segment-level clearance and fall back to phase-1 path if violated.
-        if _path_min_segment_clearance(cpx, cpy, ox, oy) <= eff_rr:
-            cpx, cpy = p1x, p1y
-        spx, spy = _shortcut_path(cpx, cpy, ox, oy, safe_rr)
-        if _path_min_segment_clearance(spx, spy, ox, oy) <= eff_rr:
-            return cpx, cpy
-        return spx, spy
-
-    # stop_phase == 3: alternative corner rounding path (skip CHOMP)
-    # Long chord shortcuts use a slightly inflated clearance (same as phase 2).
-    safe_rr = float(rr) + float(safety_margin) + 0.05
-    eff_rr = float(rr) + float(safety_margin)
-    spx, spy = _shortcut_path(px, py, ox, oy, safe_rr)
-    # phase3_min_segments must use eff_rr: consecutive vertices on the shortcut path are
-    # only guaranteed to satisfy phase-1 / disk-rr feasibility. _shortcut_path does not
-    # re-check clearance on forced single-step hops, so requiring safe_rr here can make
-    # the DP fail to chain through narrow corridors while phase 1 still succeeds.
     if return_primitives:
-        px, py, prims = phase3_min_segments(spx, spy, ox, oy, eff_rr, return_primitives=True)
-        if _path_min_segment_clearance(px, py, ox, oy) <= eff_rr:
-            return list(spx), list(spy), _polyline_straight_primitives(spx, spy)
-        return px, py, prims
-    px, py = phase3_min_segments(spx, spy, ox, oy, eff_rr)
-    if _path_min_segment_clearance(px, py, ox, oy) <= eff_rr:
-        return spx, spy
-    return px, py
+        return phase3_polish(
+            px,
+            py,
+            ox,
+            oy,
+            rr,
+            safety_margin=float(safety_margin),
+            reso=reso,
+            obstacle_rects=obstacle_rects,
+            dp_objective=dp_objective,
+            return_primitives=True,
+        )
+    return phase3_polish(
+        px,
+        py,
+        ox,
+        oy,
+        rr,
+        safety_margin=float(safety_margin),
+        reso=reso,
+        obstacle_rects=obstacle_rects,
+        dp_objective=dp_objective,
+        return_primitives=False,
+    )
 
 
 def _obstacle_points_from_app_scenario(
     scenario: dict,
 ) -> Tuple[List[float], List[float], float, float, float]:
-    """
-    Reconstruct obstacle point cloud exactly like `HA_draw/app.py`:
-    - boundary points along the map box edges
-    - rectangle obstacles: grid-sampled points within each rect
-    - polyline obstacles: thickened line samples
+    """Delegate to shared HA_draw scenario obstacle rasterizer."""
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_obstacles import obstacle_points_for_disk_planner
 
-    Returns:
-        (ox, oy, reso, map_w, map_h)
-    """
-    m = scenario.get("map", {})
-    map_w = float(m.get("width", 60.0))
-    map_h = float(m.get("height", 40.0))
-    reso = float(m.get("resolution", 1.0))
+    return obstacle_points_for_disk_planner(scenario)
 
-    draw = scenario.get("draw", {})
-    line_thickness = float(draw.get("line_thickness", 1.0))
 
-    obs = scenario.get("obstacles", {})
-    rects: Dict[str, List[float]] = obs.get("rects", {})
-    lines: Dict[str, List[List[float]]] = obs.get("lines", {})
+def _disk_planner_rr_from_scenario(robot: dict, reso: float) -> float:
+    """Circumradius for disk planner — matches HA_draw app._disk_planner_rr."""
+    try:
+        import HybridAstarPlanner.mod_grid_SE as mod_grid_SE_astar  # type: ignore
+    except ModuleNotFoundError:
+        import mod_grid_SE as mod_grid_SE_astar  # type: ignore
 
-    # Boundary obstacle points (same as app._boundary_points).
-    ox: List[float] = []
-    oy: List[float] = []
-    w = int(map_w / reso)
-    h = int(map_h / reso)
-    r = reso
-    for i in range(w + 1):
-        x = i * r
-        ox += [x, x]
-        oy += [0.0, h * r]
-    for j in range(h + 1):
-        y = j * r
-        ox += [0.0, w * r]
-        oy += [y, y]
+    _ha_draw = Path(__file__).resolve().parents[1]
+    if str(_ha_draw) not in sys.path:
+        sys.path.insert(0, str(_ha_draw))
+    from scenario_planner_bridge import _resolve_robot_dict
 
-    # Rectangle obstacles (same as app._obstacle_points rect sampling).
-    for rect in rects.values():
-        if len(rect) != 4:
-            continue
-        x, y, w_rect, h_rect = map(float, rect)
-        x0 = max(0.0, x)
-        y0 = max(0.0, y)
-        x1 = min(map_w, x + w_rect)
-        y1 = min(map_h, y + h_rect)
-        xi = np.arange(x0, x1 + 1e-6, r)
-        yi = np.arange(y0, y1 + 1e-6, r)
-        for xx in xi:
-            for yy in yi:
-                ox.append(float(xx))
-                oy.append(float(yy))
-
-    # Polyline obstacles (same as app._obstacle_points line thickening).
-    thick = max(0.2, line_thickness)
-    samples = max(2, int(thick / r))
-    for pts in lines.values():
-        if not pts or len(pts) < 2:
-            continue
-        for i in range(len(pts) - 1):
-            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
-            x0 = float(x0)
-            y0 = float(y0)
-            x1 = float(x1)
-            y1 = float(y1)
-            seg_len = max(math.hypot(x1 - x0, y1 - y0), 1e-6)
-            n = max(2, int(seg_len / r) * 2)
-            for t in np.linspace(0.0, 1.0, n):
-                cx = x0 + t * (x1 - x0)
-                cy = y0 + t * (y1 - y0)
-                for dx in np.linspace(-thick / 2.0, thick / 2.0, samples):
-                    for dy in np.linspace(-thick / 2.0, thick / 2.0, samples):
-                        ox.append(float(cx + dx))
-                        oy.append(float(cy + dy))
-
-    return ox, oy, reso, map_w, map_h
+    robot = _resolve_robot_dict(robot)
+    verts = mod_grid_SE_astar._extract_robot_footprint_vertices_local(robot, reso=reso)
+    return max(math.hypot(vx, vy) for vx, vy in verts)
 
 
 def run_mod_grid_on_scenario(
     scenario_path: str,
     stop_phase: int = 3,
+    dp_objective: str = DP_OBJECTIVE_LENGTH,
+    disk_collision_mode: str = DISK_COLLISION_OFFLINE,
 ) -> Tuple[List[float], List[float]]:
     """
     Headless mod_grid runner for the same scenario JSON used by `HA_draw/app.py`.
@@ -1251,16 +2041,55 @@ def run_mod_grid_on_scenario(
     gy = float(gx0[1])
 
     robot = scenario.get("robot", {})
-    safety_margin = float(robot.get("safety_margin", 0.0))
-    width = float(robot.get("width", 2.0))
-    length = float(robot.get("length", 3.0))
-    rr = max(width, length) / 2.0
+    from scenario_obstacles import clamp_safety_margin
+
+    safety_margin = clamp_safety_margin(float(robot.get("safety_margin", 0.0)))
+    reso = float(scenario.get("map", {}).get("resolution", 1.0))
+    rr = _disk_planner_rr_from_scenario(robot, reso=reso)
 
     ox, oy, reso, map_w, map_h = _obstacle_points_from_app_scenario(scenario)
+    from scenario_obstacles import parse_scenario_rects
 
-    px, py = astar_planning(
-        sx, sy, gx, gy, ox, oy, reso, rr, stop_phase=stop_phase, safety_margin=safety_margin
+    rects = list(
+        parse_scenario_rects(
+            scenario.get("obstacles", {}).get("rects", {}) or {},
+            map_w=map_w,
+            map_h=map_h,
+        ).values()
     )
+
+    timing: Dict[str, float] = {}
+    px, py = astar_planning(
+        sx,
+        sy,
+        gx,
+        gy,
+        ox,
+        oy,
+        reso,
+        rr,
+        stop_phase=stop_phase,
+        safety_margin=safety_margin,
+        obstacle_rects=rects,
+        dp_objective=dp_objective,
+        timing=timing if stop_phase == 1 else None,
+        disk_collision_mode=disk_collision_mode,
+    )
+    if stop_phase == 1:
+        for line in format_disk_phase1_report(
+            timing,
+            meta={
+                "reso": reso,
+                "map_w": map_w,
+                "map_h": map_h,
+                "rr": rr,
+                "safety_margin": safety_margin,
+                "obstacle_pts": len(ox),
+                "collision_mode": disk_collision_mode,
+            },
+            wall_s=timing.get("total_s"),
+        ):
+            print(line)
     if px:
         # Diagnostic: how close did the path get to the box boundary?
         dmin = min(
@@ -1288,13 +2117,24 @@ def _main_cli() -> None:
         sys.exit(2)
     scenario_path = sys.argv[1]
     stop_phase = 3
+    disk_collision_mode = DISK_COLLISION_OFFLINE
     if "--stop_phase" in sys.argv:
         i = sys.argv.index("--stop_phase")
         try:
             stop_phase = int(sys.argv[i + 1])
         except Exception:
             raise SystemExit("Invalid --stop_phase value")
-    run_mod_grid_on_scenario(scenario_path, stop_phase=stop_phase)
+    if "--disk_collision" in sys.argv:
+        i = sys.argv.index("--disk_collision")
+        try:
+            disk_collision_mode = str(sys.argv[i + 1]).lower().strip()
+        except Exception:
+            raise SystemExit("Invalid --disk_collision value (use offline or online)")
+    run_mod_grid_on_scenario(
+        scenario_path,
+        stop_phase=stop_phase,
+        disk_collision_mode=disk_collision_mode,
+    )
 
 
 if __name__ == "__main__":

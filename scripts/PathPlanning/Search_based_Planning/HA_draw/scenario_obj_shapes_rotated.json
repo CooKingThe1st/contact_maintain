@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "map": {
+    "width": 14.0,
+    "height": 14.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 0.8,
+    "length": 1.0,
+    "shape_name": "right_triangle",
+    "safety_margin": 0.05
+  },
+  "pose": {
+    "start": [2.5, 2.5, 0.0],
+    "goal": [11.0, 11.0, 45.0]
+  },
+  "draw": {
+    "line_thickness": 1.0
+  },
+  "planner": {
+    "yaw_fill_mode": "none"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [7.0, 7.0, 5.0, 0.6, 35.0],
+      "RECT_002": [7.0, 7.0, 5.0, 0.6, -35.0],
+      "RECT_003": [2.0, 10.0, 2.0, 0.5],
+      "RECT_004": [10.5, 3.0, 2.0, 0.5, 25.0]
+    },
+    "lines": {},
+    "rect_count": 4,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "scenario_obj_shapes_rotated.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "map": {
+    "width": 8.0,
+    "height": 5.0,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 0.8,
+    "length": 1.0,
+    "shape_name": "right_triangle",
+    "safety_margin": 0.05,
+    "obj_path": "/home/docker_user/catkin_ws/src/contact_maintain/urdf/right_triangle.obj"
+  },
+  "pose": {
+    "start": [
+      1.0,
+      1.0,
+      0.0
+    ],
+    "goal": [
+      7.0,
+      4.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 5.0
+  },
+  "planner": {
+    "yaw_fill_mode": "differential_flatness"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [
+        2.453334478280004,
+        0.020732479632472156,
+        0.8779451069630646,
+        2.337065143887595
+      ],
+      "RECT_002": [
+        5.977480330173996,
+        0.11965587196633853,
+        1.112888163755998,
+        2.411257688137995
+      ],
+      "RECT_003": [
+        3.3722807281182887,
+        3.853208290054002,
+        1.1096126497361074,
+        1.1198765182926587
+      ]
+    },
+    "lines": {},
+    "rect_count": 3,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "lineObs_scenario_buggy_case.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

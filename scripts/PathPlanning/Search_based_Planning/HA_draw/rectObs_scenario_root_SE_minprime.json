@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "map": {
+    "width": 5.5,
+    "height": 3.6,
+    "resolution": 0.2
+  },
+  "robot": {
+    "type": "holonomic",
+    "width": 0.8,
+    "length": 1.0,
+    "shape_name": "root",
+    "safety_margin": 0.2,
+    "margin_ge_robot_size": true,
+    "obj_path": "/home/docker_user/catkin_ws/src/contact_maintain/urdf/root.obj"
+  },
+  "pose": {
+    "start": [
+      0.9,
+      1.9,
+      90.0
+    ],
+    "goal": [
+      4.5,
+      1.0,
+      90.0
+    ]
+  },
+  "draw": {
+    "line_thickness": 5.0
+  },
+  "planner": {
+    "yaw_fill_mode": "linear"
+  },
+  "obstacles": {
+    "rects": {
+      "RECT_001": [
+        1.9670554443380626,
+        2.5108973801027066,
+        1.2494560013926366,
+        1.0081817390547476
+      ],
+      "RECT_002": [
+        2.004668432709428,
+        0.10177617579363363,
+        1.1006210101185565,
+        0.6276979198332392
+      ]
+    },
+    "lines": {},
+    "rect_count": 2,
+    "line_count": 0
+  },
+  "metadata": {
+    "filename": "rectObs_scenario_root_SE_minprime.json",
+    "obstacle_id_prefixes": {
+      "rectangles": "RECT_",
+      "polylines": "LINE_"
+    }
+  }
+}

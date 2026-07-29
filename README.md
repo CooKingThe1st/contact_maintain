@@ -273,10 +273,10 @@ obj = standard_objects['star']
 result = find_the_magnum_stochastic(
     obj,
     threshold=1.0,              # 100% LS coverage (default)
-    max_batches=30,             # Max Latin square batches
-    timeout=10.0,               # Timeout in seconds
+    timeout=10.0,               # Search budget in seconds
     force_range_scalar=2.0,     # Robots can exert 2× static friction
-    robot_radius=0.06,          # Robot radius for spacing checks
+    robot_radius=0.06,          # Robot radius for spacing checks (engineering mode)
+    theory_mode=False,          # True: skip robot/FC prune; keep sufficiency check
     verbose=True
 )
 

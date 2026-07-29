@@ -1,5 +1,8 @@
 import heapq
 import math
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -24,7 +27,7 @@ class Para:
         self.motion = motion  # motion set
 
 
-def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr):
+def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr, obstacle_rects=None):
     """
     return path of A*.
     :param sx: starting node x [m]
@@ -45,6 +48,8 @@ def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr):
     oy = [y / reso for y in oy]
 
     P, obsmap = calc_parameters(ox, oy, rr, reso)
+    if obstacle_rects:
+        _apply_rect_disk_obstacles(obsmap, P, obstacle_rects, rr, reso)
 
     open_set, closed_set = dict(), dict()
     open_set[calc_index(n_start, P)] = n_start
@@ -52,6 +57,8 @@ def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr):
     q_priority = []
     heapq.heappush(q_priority,
                    (fvalue(n_start, n_goal), calc_index(n_start, P)))
+
+    motion = P.motion
 
     while True:
         if not open_set:
@@ -62,12 +69,16 @@ def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr):
         closed_set[ind] = n_curr
         open_set.pop(ind)
 
-        for i in range(len(P.motion)):
-            node = Node(n_curr.x + P.motion[i][0],
-                        n_curr.y + P.motion[i][1],
-                        n_curr.cost + u_cost(P.motion[i]), ind)
+        for i in range(len(motion)):
+            dx, dy = motion[i][0], motion[i][1]
+            node = Node(n_curr.x + dx,
+                        n_curr.y + dy,
+                        n_curr.cost + u_cost(motion[i]), ind)
 
             if not check_node(node, P, obsmap):
+                continue
+
+            if not _diagonal_move_clear(n_curr.x, n_curr.y, dx, dy, P, obsmap):
                 continue
 
             n_ind = calc_index(node, P)
@@ -80,6 +91,10 @@ def astar_planning(sx, sy, gx, gy, ox, oy, reso, rr):
                     open_set[n_ind] = node
                     heapq.heappush(q_priority,
                                    (fvalue(node, n_goal), calc_index(node, P)))
+
+    n_goal_ind = calc_index(n_goal, P)
+    if n_goal_ind not in closed_set:
+        return [], []
 
     pathx, pathy = extract_path(closed_set, n_start, n_goal, P)
 
@@ -175,18 +190,47 @@ def calc_parameters(ox, oy, rr, reso):
 
 
 def calc_obsmap(ox, oy, rr, P):
+    ha_draw = Path(__file__).resolve().parents[1]
+    if str(ha_draw) not in sys.path:
+        sys.path.insert(0, str(ha_draw))
+    from scenario_obstacles import cell_square_disk_hits_point_grid
+
     obsmap = [[False for _ in range(P.yw)] for _ in range(P.xw)]
+    r_eff_grid = float(rr) / float(P.reso)
 
     for x in range(P.xw):
-        xx = x + P.minx
+        gx = x + P.minx
         for y in range(P.yw):
-            yy = y + P.miny
+            gy = y + P.miny
             for oxx, oyy in zip(ox, oy):
-                if math.hypot(oxx - xx, oyy - yy) <= rr / P.reso:
+                if cell_square_disk_hits_point_grid(gx, gy, float(oxx), float(oyy), r_eff_grid):
                     obsmap[x][y] = True
                     break
 
     return obsmap
+
+
+def _diagonal_move_clear(x, y, dx, dy, P, obsmap):
+    """Delegate to shared scenario_obstacles helper."""
+    ha_draw = Path(__file__).resolve().parents[1]
+    if str(ha_draw) not in sys.path:
+        sys.path.insert(0, str(ha_draw))
+    from scenario_obstacles import grid_diagonal_move_clear
+
+    return grid_diagonal_move_clear(x, y, dx, dy, P, obsmap)
+
+
+def _apply_rect_disk_obstacles(obsmap, P, obstacle_rects, rr, reso):
+    """Delegate rect-aware disk inflation to shared scenario_obstacles helper."""
+    import sys
+    from pathlib import Path
+
+    ha_draw = Path(__file__).resolve().parents[1]
+    if str(ha_draw) not in sys.path:
+        sys.path.insert(0, str(ha_draw))
+    from scenario_obstacles import apply_rect_disk_obstacles_to_obsmap
+
+    apply_rect_disk_obstacles_to_obsmap(obsmap, P, obstacle_rects, rr, reso)
 
 
 def extract_path(closed_set, n_start, n_goal, P):
@@ -202,8 +246,8 @@ def extract_path(closed_set, n_start, n_goal, P):
         if node == n_start:
             break
 
-    pathx = [x * P.reso for x in reversed(pathx)]
-    pathy = [y * P.reso for y in reversed(pathy)]
+    pathx = [(x + 0.5) * P.reso for x in reversed(pathx)]
+    pathy = [(y + 0.5) * P.reso for y in reversed(pathy)]
 
     return pathx, pathy
 

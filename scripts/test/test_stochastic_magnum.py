@@ -2,10 +2,13 @@
 """
 Comprehensive test script for find_the_magnum_stochastic.
 
-Tests the stochastic Latin square-based search on all standard objects
-and records success rate, elapsed time, and other statistics.
+Tests the stochastic Latin square-based search on all standard objects,
+runs Section 11 degeneracy screening (D, σ₃) before search, enables tangent
+fallback when recommended, and records success rate and statistics to CSV.
 """
 
+import argparse
+import csv
 import sys
 import time
 import os
@@ -27,13 +30,20 @@ pkg_path = Path(rospack.get_path("contact_maintain"))
 sys.path.insert(0, str(pkg_path / "src"))
 sys.path.insert(0, str(pkg_path / "src" / "legacy"))
 
-from contact_optimizer_utils_test_ver import find_the_magnum_stochastic  # noqa: E402
+from stochastic_magnum_finder import find_the_magnum_stochastic  # noqa: E402
 from object_utils import create_standard_objects, WrenchSpaceVisualizer  # noqa: E402
+from grasp_covariance import (  # noqa: E402
+    DEFAULT_SOFT_DEGENERACY_THRESHOLD,
+    calculate_grasp_covariance,
+    format_grasp_covariance_report,
+    recommend_tangent_fallback,
+    screening_fields_for_log,
+)
 from scipy.spatial import ConvexHull  # noqa: E402
 
 
 def visualize_stochastic_solution(obj, contacts, shape_name, save_path, threshold=1.0, force_range_scalar=2.0,
-                                   enable_tangent_forces=False):
+                                   enable_tangent_forces=False, show_friction_cones=False):
     """
     Visualize the object shape with contact points and 2D wrench space projections.
     
@@ -45,13 +55,14 @@ def visualize_stochastic_solution(obj, contacts, shape_name, save_path, threshol
         threshold: LS coverage threshold (default 1.0)
         force_range_scalar: Force range scalar (default 2.0)
         enable_tangent_forces: If True, build GWS with tangent forces (match solution found via tangent fallback).
+        show_friction_cones: If True, draw ±atan(μ) friction-cone rays at each contact.
     """
     # Create 2x2 subplot layout
     fig = plt.figure(figsize=(16, 12))
     gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
     
     # =====================================================================
-    # TOP LEFT: Object with contact points
+    # TOP LEFT: Object with contact points  
     # =====================================================================
     ax_obj = fig.add_subplot(gs[0, 0])
     
@@ -60,6 +71,17 @@ def visualize_stochastic_solution(obj, contacts, shape_name, save_path, threshol
     
     # Color map for contact points
     contact_colors = ['red', 'blue', 'green', 'purple']
+    
+    # Friction cone half-angle φ = atan(μ_contact)
+    mu_contact = 0.0
+    if show_friction_cones:
+        if hasattr(obj, "get_contact_friction"):
+            mu_contact = float(obj.get_contact_friction())
+        else:
+            mu_contact = float(getattr(obj, "lateral_friction", 0.0) or 0.0)
+    cone_angle = np.arctan(mu_contact) if mu_contact > 0.0 else 0.0
+    cone_length = 0.08
+    drew_cone_legend = False
     
     # Draw contact points and normal vectors
     for i, contact in enumerate(contacts):
@@ -95,6 +117,36 @@ def visualize_stochastic_solution(obj, contacts, shape_name, save_path, threshol
                 fc=color, 
                 ec='black',
                 alpha=0.8)
+
+        # Friction cone: two rays at ±atan(μ) about the inward normal
+        if show_friction_cones and cone_angle > 0.0:
+            normal_angle = np.arctan2(normal[1], normal[0])
+            for cone_dir in (normal_angle + cone_angle, normal_angle - cone_angle):
+                dx = cone_length * np.cos(cone_dir)
+                dy = cone_length * np.sin(cone_dir)
+                ax_obj.annotate(
+                    "",
+                    xy=(pos[0] + dx, pos[1] + dy),
+                    xytext=(pos[0], pos[1]),
+                    arrowprops=dict(
+                        arrowstyle="->",
+                        color="orange",
+                        lw=1.8,
+                        alpha=0.75,
+                        linestyle="--",
+                    ),
+                )
+            if not drew_cone_legend:
+                ax_obj.plot(
+                    [],
+                    [],
+                    color="orange",
+                    linestyle="--",
+                    linewidth=1.8,
+                    alpha=0.75,
+                    label=f"Friction cone (μ={mu_contact:g})",
+                )
+                drew_cone_legend = True
     
     # Add centroid
     centroid = obj.get_centroid()
@@ -265,10 +317,99 @@ def visualize_stochastic_solution(obj, contacts, shape_name, save_path, threshol
     
     return save_path
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Stochastic Magnum search with D/σ₃ degeneracy screening.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("/tmp/basic_test"),
+        help="Directory for visualizations and CSV (default: /tmp/basic_test)",
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="CSV results path (default: <output-dir>/stochastic_magnum_results.csv)",
+    )
+    parser.add_argument(
+        "--soft-threshold",
+        type=float,
+        default=DEFAULT_SOFT_DEGENERACY_THRESHOLD,
+        help=f"D >= this ⇒ recommend tangent fallback (default {DEFAULT_SOFT_DEGENERACY_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--samples-per-edge",
+        type=int,
+        default=4,
+        help="Interior boundary samples per edge for grasp covariance (default 4)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Per-shape search timeout in seconds (default 10)",
+    )
+    parser.add_argument(
+        "--force-range-scalar",
+        type=float,
+        default=2.0,
+        help="force_range_scalar passed to search (default 2.0)",
+    )
+    parser.add_argument(
+        "--ignore-degeneracy-gate",
+        action="store_true",
+        help="Do not enable tangent from D screening (legacy: normal-only only)",
+    )
+    parser.add_argument(
+        "--force-tangent",
+        action="store_true",
+        help="Always enable used_tangent_as_fallback regardless of D",
+    )
+    parser.add_argument(
+        "--retry-tangent-on-failure",
+        action="store_true",
+        default=False,
+        help=(
+            "Also enable used_tangent_as_fallback when D gate says normal-only "
+            "(Section 11 step 3: retry with friction if normal-only fails)"
+        ),
+    )
+    return parser.parse_args()
+
+
+def write_results_csv(csv_path: Path, rows):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\n📄 Wrote CSV: {csv_path}")
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    csv_path = args.csv or (args.output_dir / "stochastic_magnum_results.csv")
+
     print("\n" + "=" * 80)
     print("🧪 COMPREHENSIVE STOCHASTIC MAGNUM SEARCH TEST")
     print("=" * 80)
+    print(
+        f"Degeneracy gate: D_soft={args.soft_threshold:.1f}, "
+        f"samples_per_edge={args.samples_per_edge}, "
+        f"λ_hw={args.force_range_scalar}"
+    )
+    if args.force_tangent:
+        print("Tangent mode: FORCED ON (--force-tangent)")
+    elif args.ignore_degeneracy_gate:
+        print("Tangent mode: gate disabled (--ignore-degeneracy-gate)")
+    else:
+        print("Tangent mode: Section 11 gate (D, σ₃) → used_tangent_as_fallback")
     
     # Get all standard objects
     standard_objects = create_standard_objects()
@@ -278,7 +419,7 @@ if __name__ == "__main__":
     print("\n" + "-" * 80)
     
     # Create output directory for visualizations
-    output_dir = Path("/tmp/basic_test")
+    output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"📁 Saving visualizations to: {output_dir}")
     
@@ -292,18 +433,54 @@ if __name__ == "__main__":
         
         print(f"\n[{idx}/{len(shape_names)}] Testing: {shape_name.upper()}")
         print("-" * 80)
-        
+
+        # Section 11: wrench covariance screening before search
+        cov = calculate_grasp_covariance(
+            obj,
+            samples_per_edge=args.samples_per_edge,
+            soft_degeneracy_threshold=args.soft_threshold,
+        )
+        tangent_rec = recommend_tangent_fallback(
+            cov,
+            soft_degeneracy_threshold=args.soft_threshold,
+        )
+        screening = screening_fields_for_log(cov, tangent_rec)
+        print(f"   {format_grasp_covariance_report(cov, shape_name)}")
+        if tangent_rec["recommend_tangent_fallback"]:
+            print(
+                f"   🔶 Tangent recommended: {tangent_rec['reason']} "
+                f"(D={screening['degeneracy_index']:.2f}, σ₃={screening['sigma3']:.4e})"
+            )
+        else:
+            print(
+                f"   🟢 Normal-only OK by D gate "
+                f"(D={screening['degeneracy_index']:.2f}, class={screening['degeneracy_classification']})"
+            )
+
+        if args.force_tangent:
+            tangent_required = True
+            use_tangent_fallback = True
+        elif args.ignore_degeneracy_gate:
+            tangent_required = False
+            use_tangent_fallback = args.retry_tangent_on_failure
+        else:
+            tangent_required = tangent_rec["recommend_tangent_fallback"]
+            use_tangent_fallback = (
+                tangent_required or args.retry_tangent_on_failure
+            )
+
         # Run stochastic search
         test_start_time = time.time()
         find_magnum_result = find_the_magnum_stochastic(
-            obj, 
-            verbose=False,  # Set to False to reduce per-shape output
+            obj,
+            verbose=False,
             threshold=1,
-            max_batches=20,
-            timeout=10.0,
-            force_range_scalar=2,
+            timeout=args.timeout,
+            force_range_scalar=args.force_range_scalar,
             robot_radius=0.06,
-            used_tangent_as_fallback=True
+            theory_mode=False,
+            used_tangent_as_fallback=use_tangent_fallback and not tangent_required,
+            tangent_required=tangent_required,
         )
         test_elapsed_time = time.time() - test_start_time
         
@@ -313,6 +490,7 @@ if __name__ == "__main__":
         batches_tested = find_magnum_result.get('batches_tested', 0)
         pruned_count = find_magnum_result.get('pruned_count', {})
         found_by = find_magnum_result.get('found_by', None)
+        search_used_tangent = find_magnum_result.get('used_tangent_fallback', False)
         
         # Calculate total pruned
         total_pruned = sum(pruned_count.values()) if pruned_count else 0
@@ -327,11 +505,10 @@ if __name__ == "__main__":
                 try:
                     # Get threshold and force_range_scalar from the search result
                     threshold = find_magnum_result.get('threshold', 1.0)
-                    used_tangent_fallback = find_magnum_result.get('used_tangent_fallback', False)
-                    # Note: force_range_scalar is not in result, use default 2.0
+                    used_tangent_fallback = search_used_tangent
                     visualize_stochastic_solution(
                         obj, contacts, shape_name, str(viz_path),
-                        threshold=threshold, force_range_scalar=2.0,
+                        threshold=threshold, force_range_scalar=args.force_range_scalar,
                         enable_tangent_forces=used_tangent_fallback,
                     )
                     print(f"   💾 Saved visualization: {viz_filename}")
@@ -347,15 +524,29 @@ if __name__ == "__main__":
             'configs_tested': configs_tested,
             'batches_tested': batches_tested,
             'total_pruned': total_pruned,
-            'pruned_count': pruned_count.copy(),
+            'pruned_count': str(pruned_count.copy()),
             'found_by': found_by,
             'viz_path': str(viz_path) if viz_path else None,
+            'force_range_scalar': args.force_range_scalar,
+            'timeout_s': args.timeout,
+            'tangent_required': tangent_required,
+            'used_tangent_as_fallback_requested': use_tangent_fallback,
+            'search_used_tangent_fallback': search_used_tangent,
+            **screening,
         }
         results.append(result)
         
         # Print per-shape summary
         status = "✅ SUCCESS" if success else "❌ FAILED"
-        print(f"   {status} | Time: {test_elapsed_time:.3f}s | Configs: {configs_tested} | Batches: {batches_tested}")
+        tangent_note = ""
+        if search_used_tangent:
+            tangent_note = " [tangent]"
+        elif use_tangent_fallback and not success:
+            tangent_note = " [tangent requested, not used]"
+        print(
+            f"   {status}{tangent_note} | Time: {test_elapsed_time:.3f}s | "
+            f"Configs: {configs_tested} | Batches: {batches_tested}"
+        )
         if total_pruned > 0:
             print(f"   Pruned: {total_pruned} ({pruned_count})")
     
@@ -418,13 +609,25 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("📋 DETAILED RESULTS")
     print("=" * 80)
-    print(f"\n{'Shape':<20} {'Status':<10} {'Time (s)':<10} {'Configs':<10} {'Batches':<10} {'Pruned':<10}")
-    print("-" * 80)
+    print(
+        f"\n{'Shape':<18} {'Status':<8} {'D':<8} {'Class':<16} "
+        f"{'TanRec':<7} {'TanUsed':<8} {'Time':<8} {'Configs':<8}"
+    )
+    print("-" * 100)
     
     for r in results:
-        status = "✅ PASS" if r['success'] else "❌ FAIL"
-        print(f"{r['shape_name']:<20} {status:<10} {r['elapsed_time']:<10.3f} "
-              f"{r['configs_tested']:<10} {r['batches_tested']:<10} {r['total_pruned']:<10}")
+        status = "PASS" if r['success'] else "FAIL"
+        d_val = r['degeneracy_index']
+        d_str = "inf" if not np.isfinite(d_val) else f"{d_val:.1f}"
+        tan_rec = "yes" if r['recommend_tangent_fallback'] else "no"
+        tan_used = "yes" if r['search_used_tangent_fallback'] else "no"
+        print(
+            f"{r['shape_name']:<18} {status:<8} {d_str:<8} "
+            f"{r['degeneracy_classification']:<16} {tan_rec:<7} {tan_used:<8} "
+            f"{r['elapsed_time']:<8.3f} {r['configs_tested']:<8}"
+        )
+
+    write_results_csv(csv_path, results)
     
     print("\n" + "=" * 80)
     print(f"✅ Test suite completed in {total_elapsed_time:.3f} seconds")
