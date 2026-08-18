@@ -567,4 +567,54 @@ So the \(n=3\) shortfall at \(\mu = 0.2\) is **not** explained by the degeneracy
 
 ---
 
-*Generated from the implementation in `contact_maintain` (updated July 2026). For extended proofs and worked examples, see `docs/afc_problem_B.md`.*
+## 14. \(n=3\) AFC is binary; *pushing quality* is not (open)
+
+**Observation (2026-08-17, `root`, holonomic stick).** Two 3-contact placements both pass `check_wrench_space_sufficiency` with tangent forces (\(T=1\), \(\lambda=2\), \(\mu_{\mathrm{contact}}=0.5\)). Only one can execute the first planned SE(2) primitive. So “still AFC” is necessary but not sufficient for multi-robot pushing.
+
+### 14.1 Same equations, different numbers
+
+Recall \(\mathbf{g}_i = (n_{i,x},\, n_{i,y},\, \tau_i)\) with \(\tau_i = r_{i,x}n_{i,y}-r_{i,y}n_{i,x}\) and
+
+$$
+\kappa_{xy}(c) = \min_{\|u\|=1}\sum_i \max(0,\, u\cdot\mathbf{n}_i).
+$$
+
+AFC (GWS \(\supseteq\) LS) can hold via the **friction cone** even when \(\kappa_{xy}=0\) (a hole in the *normal-only* force cone). Pushing feed-forward is mostly **normal + rigid twist**; a \(\kappa_{xy}=0\) slot then produces the wrong planar wrench as soon as one bumper drops.
+
+| Placement | \(t\) | AFC \(N\) | AFC \(N{+}\tau\) | \(\kappa_{xy}\) | \(\min_i |r_i|\) | \(\min_i \mathbf{n}_{\mathrm{out}}\cdot\hat{r}_i\) | First segment |
+|-----------|-------|-----------|------------------|-----------------|-------------------|-----------------------------------------------------|---------------|
+| Stochastic first-hit (cache) | \(0.388,\,0.721,\,0.944\) | no | **yes** | **0** | \(0.10\) m (notch) | **\(-0.98\)** | fail (wrong \(\omega\), \(+y\)) |
+| Mid-edge search (e3,e5,e8) | \(0.312,\,0.492,\,0.701\) | no | **yes** | **0.63** | \(0.35\) m | **\(+0.63\)** | pass \((1.00,1.53)@120^\circ\) |
+
+The miserably failing contact is **mid-edge of a concave notch**, not a corner: \(t=0.944\) has local \(t=0.5\) on e10, but \(\mathbf{n}_{\mathrm{out}}\) points **toward** the COM. Then \(\mathbf{n}_{\mathrm{in}}\approx -\hat{r}\), so \(\tau \approx 0\), the robot sits near the COM, and \(\kappa_{xy}=0\).
+
+**What changed in the equation:** not the AFC predicate (both True with tangent). \(\kappa_{xy}\), \(\min|r|\), and \(\mathbf{n}_{\mathrm{out}}\cdot\hat{r}\) changed. Those are the current “good” metrics.
+
+### 14.2 How to compare two \(n=3\) configs (working list)
+
+Use after the binary AFC test, in this order:
+
+1. \(\kappa_{xy}(c)\) — reject \(\approx 0\) even if AFC+\(\tau\) passes.
+2. \(\min_i \mathbf{n}_{\mathrm{out},i}\cdot\hat{r}_i\) — reject \(\le 0\) (notch / inward “outward”).
+3. \(\min_i |r_i|\) — reject contacts whose intended disk overlaps the COM.
+4. Corner clearance \(\min(\alpha,1-\alpha)\) on the logical edge — prefer mid-edge on *convex* edges.
+5. Robot-center gap \(> 2R+\delta\).
+
+Script: `scripts/test/audit_n3_root_contacts.py`.
+
+### 14.3 How to find a better one *inside* Latin square (not done yet)
+
+`find_the_magnum_stochastic` is **anytime**: it returns the **first** AFC hit. That is why the notch triple was cached.
+
+To keep stochastic + Latin square but rank:
+
+- Do **not** return on first `satisfied`.
+- Keep a bounded elite set; score with §14.2.
+- Optionally bias the strategic sampler: down-weight samples with \(\mathbf{n}_{\mathrm{out}}\cdot\hat{r}\le 0\) or \(|r|\) below a fraction of the mean radius (still sample them — they can be AFC, just not “good”).
+- For \(n=3\), prefer 3 **distinct logical edges**.
+
+This section is a note for a later dive, not a finished ranking theory.
+
+---
+
+*Generated from the implementation in `contact_maintain` (updated August 2026). For extended proofs and worked examples, see `docs/afc_problem_B.md`.*

@@ -742,6 +742,14 @@ def export_histories(
             "desired_contact_point_speeds": [float(s) for s in history.desired_contact_point_speeds],
             "wheel_velocities": [wv.tolist() if len(wv) > 0 else [] for wv in history.wheel_velocities],
             "wheel_cmd_velocities": [wv.tolist() if len(wv) > 0 else [] for wv in getattr(history, "wheel_cmd_velocities", [])],
+            "error_along_history": [float(x) for x in getattr(history, "error_along_history", [])],
+            "error_perp_history": [float(x) for x in getattr(history, "error_perp_history", [])],
+            "v_along_pos_history": [float(x) for x in getattr(history, "v_along_pos_history", [])],
+            "v_along_damp_history": [float(x) for x in getattr(history, "v_along_damp_history", [])],
+            "v_form_history": [
+                v.tolist() if hasattr(v, "tolist") else list(v)
+                for v in getattr(history, "v_form_history", [])
+            ],
         }
         export_data["histories"][name] = history_dict
     
@@ -807,6 +815,11 @@ def import_histories(
             desired_contact_point_speeds=history_dict["desired_contact_point_speeds"],
             wheel_velocities=[np.array(wv) if len(wv) > 0 else np.array([]) for wv in history_dict.get("wheel_velocities", [])],
             wheel_cmd_velocities=[np.array(wv) if len(wv) > 0 else np.array([]) for wv in history_dict.get("wheel_cmd_velocities", [])],
+            error_along_history=history_dict.get("error_along_history", []),
+            error_perp_history=history_dict.get("error_perp_history", []),
+            v_along_pos_history=history_dict.get("v_along_pos_history", []),
+            v_along_damp_history=history_dict.get("v_along_damp_history", []),
+            v_form_history=[np.array(v, dtype=float) for v in history_dict.get("v_form_history", [])],
         )
         histories[name] = history
     

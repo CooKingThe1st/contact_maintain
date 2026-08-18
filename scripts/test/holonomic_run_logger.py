@@ -50,6 +50,14 @@ def _history_to_dict(history) -> dict:
             wv.tolist() if len(wv) > 0 else []
             for wv in getattr(history, "wheel_cmd_velocities", [])
         ],
+        "error_along_history": [float(x) for x in getattr(history, "error_along_history", [])],
+        "error_perp_history": [float(x) for x in getattr(history, "error_perp_history", [])],
+        "v_along_pos_history": [float(x) for x in getattr(history, "v_along_pos_history", [])],
+        "v_along_damp_history": [float(x) for x in getattr(history, "v_along_damp_history", [])],
+        "v_form_history": [
+            v.tolist() if hasattr(v, "tolist") else list(v)
+            for v in getattr(history, "v_form_history", [])
+        ],
     }
 
 
@@ -131,7 +139,7 @@ class HolonomicRunLogger:
                 f"# holonomic run log  tag={run_tag}  object={object_name}\n"
                 f"# started {meta_out['started_at']}\n"
                 f"# columns: wall_t  sim_t  obj_xy  yaw_deg  |v|  omega  "
-                f"per-robot(c=in_contact F=force)  n_hist\n"
+                f"cmd(vx*,vy*,w*)  per-robot(c=in_contact F=force)  n_hist\n"
             )
             f.flush()
         self.status(
@@ -176,6 +184,9 @@ class HolonomicRunLogger:
         robot_contact: Dict[str, bool],
         robot_force: Dict[str, float],
         n_hist: int,
+        desired_vx: float = 0.0,
+        desired_vy: float = 0.0,
+        desired_omega: float = 0.0,
     ) -> str:
         import math
 
@@ -186,6 +197,7 @@ class HolonomicRunLogger:
             f"yaw={yaw_deg:6.1f}°",
             f"|v|={obj_speed:.3f}",
             f"ω={obj_omega:.3f}",
+            f"cmd=({desired_vx:+.3f},{desired_vy:+.3f},w*{desired_omega:+.3f})",
         ]
         for name in sorted(robot_contact.keys()):
             c = 1 if robot_contact.get(name) else 0
@@ -221,6 +233,9 @@ class HolonomicRunLogger:
         obj_state: dict,
         robot_agents: dict,
         n_hist: int,
+        desired_vx: float = 0.0,
+        desired_vy: float = 0.0,
+        desired_omega: float = 0.0,
         force: bool = False,
     ) -> None:
         now = time.time()
@@ -241,6 +256,9 @@ class HolonomicRunLogger:
                 robot_contact=contacts,
                 robot_force=forces,
                 n_hist=n_hist,
+                desired_vx=float(desired_vx),
+                desired_vy=float(desired_vy),
+                desired_omega=float(desired_omega),
             )
             self.status(line)
             self._last_status = now

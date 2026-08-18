@@ -14,14 +14,18 @@ Friction model (PyBullet product):
   object material µ × robot bumper µ = effective contact µ (search + sim cone).
 
 Usage:
+  # 4-contact benchmark (default Phase7 is the original FF-only along law)
   python3 revised_test_magnum_holonomic_control.py \
     --n-contacts 4 --planned-path HA_draw/rectObs_scenario_root_SE_minprime.planned.json \
     --planner hybrid --theta-mode waypoint --duration 60 --no-boundary-walls \
     --headless --save-dir /tmp/revised_holo/
 
-  # Debug: reuse / write n-contact t_params in urdf/magnum_afc_cache.json
+  # Force the original controller even for n=3
+  python3 revised_test_magnum_holonomic_control.py --legacy-phase7 --n-contacts 3 ...
+
+  # 3-contact stick: FF + along-delta when contact is lost (--formation optional)
   python3 revised_test_magnum_holonomic_control.py \
-    --debug --n-contacts 3 --planned-path ... --headless --save-dir /tmp/revised_holo/
+    --debug --n-contacts 3 --contact-stick --planned-path ... --headless --save-dir /tmp/revised_holo/
 
   # After Ctrl-C (or full run), replot from live checkpoint:
   python3 plot_revised_holonomic_histories.py \
@@ -100,6 +104,7 @@ from revised_holonomic_core import (
     PID_DECIMATION,
     ROBOT_RADIUS,
     TIMESTEP,
+    ContactIncidenceFormation,
     Phase7BetaVerDecouple,
     get_object_as_obstacle,
     get_object_state,
@@ -344,17 +349,88 @@ def _stochastic_contacts(
     return contacts, t_params, meta
 
 
+def _closest_on_polyline(
+    pos: np.ndarray, px: List[float], py: List[float]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (closest_point, unit_tangent, path_point - pos)."""
+    pos = np.asarray(pos, dtype=float).reshape(2)
+    best_d2 = 1e18
+    best_p = pos.copy()
+    best_t = np.array([1.0, 0.0], dtype=float)
+    nseg = min(len(px), len(py)) - 1
+    for i in range(max(nseg, 0)):
+        a = np.array([float(px[i]), float(py[i])], dtype=float)
+        b = np.array([float(px[i + 1]), float(py[i + 1])], dtype=float)
+        ab = b - a
+        l2 = float(np.dot(ab, ab))
+        if l2 < 1e-18:
+            p = a
+            tang = best_t
+        else:
+            t = float(np.clip(np.dot(pos - a, ab) / l2, 0.0, 1.0))
+            p = a + t * ab
+            tang = ab / math.sqrt(l2)
+        d2 = float(np.sum((pos - p) ** 2))
+        if d2 < best_d2:
+            best_d2 = d2
+            best_p = p
+            best_t = tang
+    return best_p, best_t, best_p - pos
+
+
+def _stick_polyline_velocity(
+    pos: np.ndarray,
+    v_path: np.ndarray,
+    px: List[float],
+    py: List[float],
+    *,
+    v_cruise: float = 0.10,
+) -> np.ndarray:
+    """Closest-point tracking: cruise on the tangent, correct laterally.
+
+    n=4 stays ~7 cm north of y=1.5. n=3 with a 4 cm/s cap drifted 20 cm south
+    and hit RECT_002 (top ≈ y=0.73; root radius ~0.7 m). Slow the along-track
+    speed when off the line so the correction can actually win.
+    """
+    closest, tang, path_err = _closest_on_polyline(pos, px, py)
+    tang = np.asarray(tang, dtype=float)
+    # n=4 rides ~7 cm left of the polyline (y≈1.57 on the y=1.5 run).
+    # Track that offset so root stays north of RECT_002 (top ≈ y=0.73).
+    left = np.array([-tang[1], tang[0]], dtype=float)
+    path_err = (closest + 0.05 * left) - np.asarray(pos, dtype=float)[:2]
+    v_path = np.asarray(v_path, dtype=float).reshape(-1)[:2]
+    speed = float(np.dot(v_path, tang))
+    if speed < 0.04:
+        speed = float(v_cruise)
+    speed = float(np.clip(speed, 0.0, v_cruise))
+    lat = path_err - tang * float(np.dot(path_err, tang))
+    e_lat = float(np.linalg.norm(lat))
+    dead = 0.03
+    if e_lat <= dead:
+        slow = 1.0
+        corr = 0.8 * np.asarray(lat, dtype=float)
+    else:
+        e_eff = e_lat - dead
+        slow = float(np.clip(1.0 - e_eff / 0.12, 0.45, 1.0))
+        corr = 1.5 * np.asarray(lat, dtype=float)
+        cn = float(np.linalg.norm(corr))
+        if cn > 0.12:
+            corr = corr * (0.12 / cn)
+    return (speed * slow) * tang + corr
+
+
 def _build_path_followers(
     planned: PlannedPath,
     start_xy: np.ndarray,
     *,
     planner_mode: str,
     pyaw: Optional[List[float]] = None,
+    look_ahead_hybrid: int = 0,
+    use_tracking: bool = False,
 ) -> Tuple[Optional[PathFollowingController], Optional[HolonomicPurePursuitPolyline], object, List[float], List[float], List]:
     a_max = 0.15
     a_lat_max = 0.08
     v_user_max = 0.1
-    look_ahead_hybrid = 0
 
     path_following_controller = None
     pursuit_controller = None
@@ -380,8 +456,8 @@ def _build_path_followers(
             a_max=a_max,
             a_lat_max=a_lat_max,
             v_user_max=v_user_max,
-            look_ahead=look_ahead_hybrid,
-            use_tracking=False,
+            look_ahead=int(look_ahead_hybrid),
+            use_tracking=bool(use_tracking),
         )
         if df_prims:
             s_milestones, theta_milestones = theta_milestones_from_df_primitives(df_prims)
@@ -556,7 +632,94 @@ def main() -> None:
         action="store_true",
         help="Skip spawning map boundary walls (rect obstacles still spawn)",
     )
+    parser.add_argument(
+        "--legacy-phase7",
+        action="store_true",
+        help=(
+            "Old-style Phase7 (v_along=FF only, v_perp=FF+P, hybrid retouch on). "
+            "Use this for the 4-contact path-following benchmark."
+        ),
+    )
+    parser.add_argument(
+        "--contact-stick",
+        action="store_true",
+        help=(
+            "Force the stick controller (along delta + cycle formation). "
+            "Default: ON for n_contacts<4, OFF (legacy) for n_contacts>=4."
+        ),
+    )
+    parser.add_argument(
+        "--no-along-fb",
+        action="store_true",
+        help="Disable longitudinal position/damping delta (stick mode only)",
+    )
+    parser.add_argument(
+        "--along-pi",
+        action="store_true",
+        help="Add object-twist PI on the along-normal axis (off: sign fights contact recovery)",
+    )
+    parser.add_argument("--kd-along", type=float, default=0.3, help="Along-normal velocity damping")
+    parser.add_argument("--kd-perp", type=float, default=0.0, help="Tangent velocity damping (0=legacy perp law)")
+    parser.add_argument(
+        "--k-recover",
+        type=float,
+        default=1.2,
+        help="Extra inward gain on positive along-error when not in contact (stick mode)",
+    )
+    parser.add_argument(
+        "--max-along-correction",
+        type=float,
+        default=0.10,
+        help="Clip on along-normal feedback (m/s), not including feed-forward",
+    )
+    parser.add_argument(
+        "--no-formation",
+        action="store_true",
+        help="Disable cycle-graph incidence formation term (stick mode)",
+    )
+    parser.add_argument(
+        "--formation",
+        action="store_true",
+        help="Enable cycle-graph formation (off by default in stick mode; FF+along-delta only)",
+    )
+    parser.add_argument(
+        "--k-form",
+        type=float,
+        default=0.25,
+        help="Formation gain k_f on -B̄(d-d_d) = -(L⊗I2) e",
+    )
+    parser.add_argument(
+        "--kd-form",
+        type=float,
+        default=0.1,
+        help="Formation Laplacian damping on relative velocities",
+    )
+    parser.add_argument("--max-form-speed", type=float, default=0.04)
+    parser.add_argument(
+        "--form-normal-scale",
+        type=float,
+        default=0.0,
+        help="Scale formation along inward normal when in contact (0=tangent-only, avoids squeeze)",
+    )
+    parser.add_argument(
+        "--form-tangent-scale",
+        type=float,
+        default=1.0,
+        help="Scale formation along tangent (contact-point stick / neighbor gap)",
+    )
     args = parser.parse_args()
+
+    if args.legacy_phase7 and args.contact_stick:
+        parser.error("use only one of --legacy-phase7 or --contact-stick")
+    # n>=4 defaults to the old FF-only law so 4-contact benchmarks stay comparable.
+    args.use_legacy_phase7 = bool(
+        args.legacy_phase7 or ((not args.contact_stick) and args.n_contacts >= 4)
+    )
+    if args.use_legacy_phase7:
+        args.no_along_fb = True
+        args.no_formation = True
+        args.formation = False
+    args.use_formation = bool(args.formation) and (not args.no_formation) and (not args.use_legacy_phase7)
 
     if args.headless:
         args.no_gui = True
@@ -588,6 +751,9 @@ def main() -> None:
         print(f"  Planned-path mode: {planned_ctx['planned_file'].name}")
     print(f"  F_robot_max (derived/override) = {f_robot:.2f} N")
     print(f"  n_contacts = {args.n_contacts}")
+    print(
+        f"  Phase7 = {'legacy/benchmark (FF-only along, retouch on, look_ahead=0)' if args.use_legacy_phase7 else 'stick (in-contact = n=4 FF signs; lost = spring to t_param; freeze s if e_lat large)'}"
+    )
 
     ground_uid = setup_pybullet(gui=not args.no_gui)
 
@@ -687,9 +853,19 @@ def main() -> None:
 
     obj_state_init = get_object_state(object_uid)
     start_xy = np.asarray(obj_state_init["position"], dtype=float)
+    # Keep look_ahead=0 for both: n=3 with blended corners popped the high-µ
+    # bumpers. Segment clock is frozen separately when contacts drop.
+    path_look_ahead = 0
 
     path_following_controller, pursuit_controller, holonomic_hybrid_path, s_milestones, theta_milestones, segment_theta_specs = (
-        _build_path_followers(planned, start_xy, planner_mode=tracking_mode, pyaw=planned.pyaw)
+        _build_path_followers(
+            planned,
+            start_xy,
+            planner_mode=tracking_mode,
+            pyaw=planned.pyaw,
+            look_ahead_hybrid=path_look_ahead,
+            use_tracking=False,
+        )
     )
 
     theta_mode_enum = {
@@ -746,7 +922,45 @@ def main() -> None:
             t_param=t_params[idx],
             desired_object_velocity=np.array([0.0, 0.0]),
             desired_object_angular_velocity=0.0,
+            apply_along_feedback=not args.no_along_fb,
+            apply_along_pi=bool(args.along_pi),
+            kd_along=args.kd_along,
+            kd_perp=0.0 if args.use_legacy_phase7 else args.kd_perp,
+            k_recover=args.k_recover,
+            max_along_correction=args.max_along_correction,
+            force_inward_sat=80.0 if not args.use_legacy_phase7 else 25.0,
+            legacy_phase7=bool(args.use_legacy_phase7),
         )
+        if not args.use_legacy_phase7:
+            phase7_controllers[name].target_penetration = 0.001
+            phase7_controllers[name].k_recover = 0.5
+            phase7_controllers[name].kp_along = 0.8
+
+    t_params_by_name = {name: float(t_params[i]) for i, name in enumerate(robots.keys())}
+    formation = None
+    if args.use_formation:
+        formation = ContactIncidenceFormation(
+            list(robots.keys()),
+            t_params_by_name,
+            k_form=args.k_form,
+            kd_form=args.kd_form,
+            max_speed=args.max_form_speed,
+            form_normal_scale=args.form_normal_scale,
+            form_tangent_scale=args.form_tangent_scale,
+        )
+        print(
+            f"  Formation: cycle incidence B̄=B⊗I2  k_f={args.k_form:g}  "
+            f"k_d={args.kd_form:g}  |u|_max={args.max_form_speed:g}  "
+            f"scale(n,τ)=({args.form_normal_scale:g},{args.form_tangent_scale:g})"
+        )
+    print(
+        f"  Phase7 mode={'LEGACY (FF along, FF+P perp, no formation)' if args.use_legacy_phase7 else 'STICK (FF signs, recede gated by actual, tangent FF if lost)'}  "
+        f"formation={'ON' if args.use_formation else 'OFF'}  "
+        f"along-fb={'ON' if not args.no_along_fb else 'OFF'}  "
+        f"along-PI={'ON' if args.along_pi else 'OFF'}  "
+        f"kd_along={args.kd_along:g}  kd_perp={0.0 if args.use_legacy_phase7 else args.kd_perp:g}  "
+        f"k_recover={args.k_recover:g}"
+    )
 
     host = SwarmHost(
         robot_agents=robot_agents,
@@ -775,6 +989,22 @@ def main() -> None:
                 "planner": args.planner,
                 "theta_mode": args.theta_mode,
                 "force_range_scalar": args.force_range_scalar,
+                "legacy_phase7": bool(args.use_legacy_phase7),
+                "along_feedback": not args.no_along_fb,
+                "along_pi": bool(args.along_pi),
+                "kd_along": args.kd_along,
+                "kd_perp": args.kd_perp,
+                "k_recover": args.k_recover,
+                "formation": None
+                if not args.use_formation
+                else {
+                    "k_form": args.k_form,
+                    "kd_form": args.kd_form,
+                    "max_form_speed": args.max_form_speed,
+                    "form_normal_scale": args.form_normal_scale,
+                    "form_tangent_scale": args.form_tangent_scale,
+                    "graph": "cycle",
+                },
                 "afc": {
                     "mu_contact": afc_meta.get("mu_contact"),
                     "bumper_plan": afc_meta.get("bumper_plan"),
@@ -803,6 +1033,10 @@ def main() -> None:
     t = 0.0
     pid_cycle_count = 0
     holonomic_motion_started = False
+    path_xy_done_latched = False
+    scenario_done_latched = False
+    path_xy_hold = None
+    held_final_theta = None
     hybrid_retouch_active = False
     hybrid_retouch_t0 = 0.0
     hybrid_retouch_consumed_boundaries = set()
@@ -813,6 +1047,11 @@ def main() -> None:
         orientation_tol=float(args.orientation_complete_tol),
     )
     tracking_prev_s = 0.0
+    last_des_vx = 0.0
+    last_des_vy = 0.0
+    last_des_w = 0.0
+    motion_t0 = None
+    STICK_SETTLE_S = 0.25
 
     stray_timer = 0.0
     replan_count = 0
@@ -832,13 +1071,19 @@ def main() -> None:
 
                     if not holonomic_motion_started and all_pushing:
                         holonomic_motion_started = True
+                        motion_t0 = float(t)
                         if path_following_controller is not None:
                             path_following_controller.reset()
                         if pursuit_controller is not None:
                             pursuit_controller.reset()
                         print(f"\nALL ROBOTS PUSHING — START SCENARIO PATH (t={t:.2f}s)\n")
 
-                    if holonomic_motion_started and all_pushing and args.stray_threshold > 0:
+                    if (
+                        holonomic_motion_started
+                        and all_pushing
+                        and args.stray_threshold > 0
+                        and args.use_legacy_phase7
+                    ):
                         e_lat = lateral_error_to_polyline(
                             np.asarray(obj_state["position"], dtype=float), ref_px, ref_py
                         )
@@ -872,6 +1117,8 @@ def main() -> None:
                                     np.asarray(obj_state["position"]),
                                     planner_mode=tracking_mode,
                                     pyaw=planned.pyaw,
+                                    look_ahead_hybrid=path_look_ahead,
+                                    use_tracking=False,
                                 )
                                 if path_following_controller is not None:
                                     path_following_controller.reset()
@@ -889,10 +1136,38 @@ def main() -> None:
 
                     if holonomic_motion_started:
                         dt_pid = (1.0 / CTRL_FREQ) * PID_DECIMATION
+                        settling = False
+                        s_ahead = False
+                        path_xy_done = bool(path_xy_done_latched)
+                        if not args.use_legacy_phase7:
+                            e_lat_now = lateral_error_to_polyline(
+                                np.asarray(obj_state["position"], dtype=float), ref_px, ref_py
+                            )
+                            elapsed_push = 0.0 if motion_t0 is None else (t - motion_t0)
+                            settling = elapsed_push < STICK_SETTLE_S
+                            if path_following_controller is not None:
+                                s_ref = float(path_following_controller.current_s)
+                                s_obj = nearest_s_on_hybrid_path(
+                                    path_following_controller.hybrid_path,
+                                    np.asarray(obj_state["position"], dtype=float),
+                                )
+                                s_ahead = s_ref > (s_obj + 0.06)
+                                at_vertex = any(
+                                    abs(s_ref - float(b)) < 0.05
+                                    for b in path_following_controller.segment_start_s[1:]
+                                )
+                                if s_ahead and at_vertex:
+                                    s_ahead = False
+                            if e_lat_now > 0.08 or settling or s_ahead or path_xy_done_latched:
+                                dt_pid = 0.0
                         vx = vy = w_path = 0.0
                         current_s = 0.0
 
-                        do_hybrid_retouch = tracking_mode == "hybrid" and path_following_controller is not None
+                        do_hybrid_retouch = (
+                            tracking_mode == "hybrid"
+                            and path_following_controller is not None
+                            and args.use_legacy_phase7
+                        )
                         if do_hybrid_retouch and hybrid_retouch_active:
                             all_in_c = all(a.in_contact for a in robot_agents.values())
                             theta_ok = segment_orient_gate.retouch_may_resume(
@@ -1068,7 +1343,9 @@ def main() -> None:
                                                 segment_orient_gate.clear_gate()
                                             vx, vy = 0.0, 0.0
 
-                        if segment_orient_gate.gate_active:
+                        if path_xy_done_latched and segment_orient_gate.gate_active:
+                            segment_orient_gate.clear_gate()
+                        if segment_orient_gate.gate_active and not path_xy_done_latched:
                             desired_obj_velocity, desired_obj_omega, gate_ok = apply_orientation_hold(
                                 current_orientation=obj_state["orientation"],
                                 current_angular_velocity=obj_state["angular_velocity"],
@@ -1119,9 +1396,39 @@ def main() -> None:
                                 s_total = float(pursuit_controller.L)
                             else:
                                 s_total = float(current_s)
-                            path_xy_done = holonomic_path_xy_completed(
+                            path_xy_done = bool(path_xy_done_latched) or holonomic_path_xy_completed(
                                 path_following_controller, pursuit_controller
                             )
+                            if (
+                                (not path_xy_done)
+                                and (not args.use_legacy_phase7)
+                                and ref_px
+                                and ref_py
+                            ):
+                                goal_xy = np.array(
+                                    [float(ref_px[-1]), float(ref_py[-1])], dtype=float
+                                )
+                                pos_xy = np.asarray(obj_state["position"], dtype=float)[:2]
+                                if float(np.linalg.norm(pos_xy - goal_xy)) < 0.08:
+                                    path_xy_done = True
+                                elif path_following_controller is not None:
+                                    s_here = nearest_s_on_hybrid_path(
+                                        path_following_controller.hybrid_path, pos_xy
+                                    )
+                                    if s_here >= float(s_total) - 0.05:
+                                        path_xy_done = True
+                            if path_xy_done and not path_xy_done_latched:
+                                path_xy_done_latched = True
+                                path_xy_hold = np.asarray(
+                                    obj_state["position"], dtype=float
+                                )[:2].copy()
+                                print(
+                                    f"[path xy] latched done at t={t:.2f}s  "
+                                    f"obj=({obj_state['position'][0]:.3f},"
+                                    f"{obj_state['position'][1]:.3f})  "
+                                    f"yaw={math.degrees(obj_state['orientation']):.1f}°",
+                                    flush=True,
+                                )
                             final_theta = final_theta_goal_for_mode(
                                 theta_mode_enum,
                                 s_total=s_total,
@@ -1131,7 +1438,8 @@ def main() -> None:
                                 path_theta_sine_amp=float(args.path_theta_sine_amp),
                                 path_theta_sine_k=float(args.path_theta_sine_k),
                             )
-                            desired_obj_velocity, desired_obj_omega, _scenario_done = (
+                            held_final_theta = float(final_theta)
+                            desired_obj_velocity, desired_obj_omega, scenario_done = (
                                 apply_path_completion_to_desired_motion(
                                     desired_obj_velocity=desired_obj_velocity,
                                     desired_obj_omega=desired_obj_omega,
@@ -1140,35 +1448,147 @@ def main() -> None:
                                     path_xy_done=path_xy_done,
                                     final_theta=final_theta,
                                     orientation_tol=float(args.orientation_complete_tol),
+                                    max_omega=0.10 if not args.use_legacy_phase7 else 0.15,
                                 )
                             )
+                            if scenario_done and not scenario_done_latched:
+                                scenario_done_latched = True
+                                print(
+                                    f"[scenario] XY+yaw done at t={t:.2f}s  "
+                                    f"obj=({obj_state['position'][0]:.3f},"
+                                    f"{obj_state['position'][1]:.3f})  "
+                                    f"yaw={math.degrees(obj_state['orientation']):.1f}°",
+                                    flush=True,
+                                )
 
                         tracking_prev_s = float(current_s)
+
+                        if settling:
+                            desired_obj_velocity = np.array([0.0, 0.0])
+                            desired_obj_omega = 0.0
+                        elif (
+                            path_xy_done
+                            and path_xy_hold is not None
+                            and not args.use_legacy_phase7
+                        ):
+                            # ω*×r with n=3 / 2 contacts walks the COM. Hold the
+                            # latched XY while the final yaw (140°→90°) finishes,
+                            # and keep holding after the yaw latch so residual
+                            # spin does not coast the object off the goal.
+                            hold = 0.8 * (
+                                path_xy_hold
+                                - np.asarray(obj_state["position"], dtype=float)[:2]
+                            )
+                            hn = float(np.linalg.norm(hold))
+                            if hn > 0.08:
+                                hold = hold * (0.08 / hn)
+                            desired_obj_velocity = hold
+                            if held_final_theta is not None:
+                                desired_obj_omega = orientation_pid_omega(
+                                    obj_state["orientation"],
+                                    held_final_theta,
+                                    obj_state["angular_velocity"],
+                                    max_omega=0.10,
+                                )
+                        elif (
+                            not args.use_legacy_phase7
+                            and not path_xy_done
+                            and not segment_orient_gate.gate_active
+                        ):
+                            v_path = np.asarray(desired_obj_velocity, dtype=float).reshape(-1)[:2]
+                            desired_obj_velocity = _stick_polyline_velocity(
+                                obj_state["position"], v_path, ref_px, ref_py
+                            )
 
                         for controller in phase7_controllers.values():
                             controller.desired_object_velocity = desired_obj_velocity
                             controller.desired_object_angular_velocity = desired_obj_omega
+                        last_des_vx = float(np.asarray(desired_obj_velocity, dtype=float)[0])
+                        last_des_vy = float(np.asarray(desired_obj_velocity, dtype=float)[1])
+                        last_des_w = float(desired_obj_omega)
+                        if (
+                            motion_t0 is not None
+                            and (t - motion_t0) < 5.0
+                            and (pid_cycle_count // PID_DECIMATION) % 5 == 0
+                        ):
+                            n_c = sum(1 for a in robot_agents.values() if a.in_contact)
+                            e_lat_dbg = lateral_error_to_polyline(
+                                np.asarray(obj_state["position"], dtype=float), ref_px, ref_py
+                            )
+                            print(
+                                f"[twist] t={t:.2f}s  v*=({last_des_vx:+.3f},{last_des_vy:+.3f}) "
+                                f"w*={last_des_w:+.3f}  yaw={math.degrees(obj_state['orientation']):.1f}° "
+                                f"n_c={n_c}/{len(robot_agents)}  e_lat={e_lat_dbg:.3f}",
+                                flush=True,
+                            )
                     else:
                         for controller in phase7_controllers.values():
                             controller.desired_object_velocity = np.array([0.0, 0.0])
                             controller.desired_object_angular_velocity = 0.0
+                        last_des_vx = last_des_vy = last_des_w = 0.0
                 else:
                     for controller in phase7_controllers.values():
                         controller.desired_object_velocity = np.array([0.0, 0.0])
                         controller.desired_object_angular_velocity = 0.0
+                    last_des_vx = last_des_vy = last_des_w = 0.0
 
-            for name, agent in robot_agents.items():
-                other_positions = [
-                    robot_agents[other_name].robot.get_state()[0]
-                    for other_name in robot_agents.keys()
-                    if other_name != name
-                ]
-                if agent.goal_type == "push" and name in phase7_controllers:
-                    agent.update_contact_state()
-                    robot_pos, robot_heading, _ = agent.robot.get_state()
-                    controller = phase7_controllers[name]
-                    record_history = args.save_dir is not None
-                    cmd = controller.compute_velocity(
+            record_history = args.save_dir is not None
+            pushing_cmds: Dict[str, np.ndarray] = {}
+            if args.use_legacy_phase7:
+                for name, agent in robot_agents.items():
+                    if agent.goal_type == "push" and name in phase7_controllers:
+                        agent.update_contact_state()
+                        robot_pos, robot_heading, _ = agent.robot.get_state()
+                        pushing_cmds[name] = phase7_controllers[name].compute_velocity(
+                            robot_pos=robot_pos,
+                            robot_heading=robot_heading,
+                            object_pos=obj_state["position"],
+                            object_orientation=obj_state["orientation"],
+                            object_velocity=obj_state["velocity"],
+                            object_angular_velocity=obj_state["angular_velocity"],
+                            contact_force=agent.contact_force,
+                            in_contact=agent.in_contact,
+                            t=t,
+                            record_history=record_history,
+                            robot=agent.robot,
+                        )
+            else:
+                pushing_pack: List[Tuple[str, Any, np.ndarray, float, np.ndarray, dict, Any]] = []
+                for name, agent in robot_agents.items():
+                    if agent.goal_type == "push" and name in phase7_controllers:
+                        agent.update_contact_state()
+                        robot_pos, robot_heading, robot_vel = agent.robot.get_state()
+                        controller = phase7_controllers[name]
+                        geo = controller.compute_contact_geometry(
+                            robot_pos, obj_state["position"], obj_state["orientation"]
+                        )
+                        pushing_pack.append(
+                            (name, agent, robot_pos, robot_heading, robot_vel, geo, controller)
+                        )
+
+                form_vels: Dict[str, np.ndarray] = {}
+                if formation is not None and len(pushing_pack) >= 2:
+                    names_p = [p[0] for p in pushing_pack]
+                    q = np.vstack([p[2][:2] for p in pushing_pack])
+                    qd = np.vstack([p[5]["intended_pos"] for p in pushing_pack])
+                    qdot = np.vstack(
+                        [np.asarray(p[4], dtype=float).reshape(-1)[:2] for p in pushing_pack]
+                    )
+                    n_in = np.vstack([p[5]["normal_inward_world"] for p in pushing_pack])
+                    tau = np.vstack([p[5]["tangent_world"] for p in pushing_pack])
+                    ic = [bool(p[1].in_contact) for p in pushing_pack]
+                    form_vels = formation.compute(
+                        names_p,
+                        q,
+                        qd,
+                        qdot,
+                        in_contact=ic,
+                        normals_inward=n_in,
+                        tangents=tau,
+                    )
+
+                for name, agent, robot_pos, robot_heading, robot_vel, geo, controller in pushing_pack:
+                    pushing_cmds[name] = controller.compute_velocity(
                         robot_pos=robot_pos,
                         robot_heading=robot_heading,
                         object_pos=obj_state["position"],
@@ -1180,7 +1600,19 @@ def main() -> None:
                         t=t,
                         record_history=record_history,
                         robot=agent.robot,
+                        robot_velocity=robot_vel,
+                        formation_velocity=form_vels.get(name),
+                        geometry=geo,
                     )
+
+            for name, agent in robot_agents.items():
+                other_positions = [
+                    robot_agents[other_name].robot.get_state()[0]
+                    for other_name in robot_agents.keys()
+                    if other_name != name
+                ]
+                if name in pushing_cmds:
+                    cmd = pushing_cmds[name]
                 else:
                     obstacles = None
                     if agent.goal_type == "navigate":
@@ -1209,6 +1641,9 @@ def main() -> None:
                 obj_state=obj_state_log,
                 robot_agents=robot_agents,
                 n_hist=n_hist,
+                desired_vx=last_des_vx,
+                desired_vy=last_des_vy,
+                desired_omega=last_des_w,
             )
 
     if run_logger is not None:

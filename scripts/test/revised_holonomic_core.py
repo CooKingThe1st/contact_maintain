@@ -10,7 +10,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pybullet as pyb
@@ -78,6 +78,133 @@ class Phase7History:
     desired_contact_point_speeds: List[float] = field(default_factory=list)
     wheel_velocities: List[np.ndarray] = field(default_factory=list)  # Actual wheel velocities from PyBullet
     wheel_cmd_velocities: List[np.ndarray] = field(default_factory=list)  # Commanded wheel velocities (if available)
+    error_along_history: List[float] = field(default_factory=list)
+    error_perp_history: List[float] = field(default_factory=list)
+    v_along_pos_history: List[float] = field(default_factory=list)
+    v_along_damp_history: List[float] = field(default_factory=list)
+    v_form_history: List[np.ndarray] = field(default_factory=list)
+
+
+def cycle_incidence_matrix(n: int) -> np.ndarray:
+    """Oriented cycle graph incidence B ∈ R^{n×n}.
+
+    Edge ``e_i`` goes ``i → (i+1) mod n``: ``B[i, i] = +1`` (tail),
+    ``B[(i+1)%n, i] = -1`` (head).  Laplacian ``L = B Bᵀ`` has 2 on the
+    diagonal and -1 on cycle neighbors.
+    """
+    n = int(n)
+    B = np.zeros((n, n), dtype=float)
+    if n < 2:
+        return B
+    for i in range(n):
+        B[i, i] = 1.0
+        B[(i + 1) % n, i] = -1.0
+    return B
+
+
+class ContactIncidenceFormation:
+    """Shifted-agreement formation on contact robots.
+
+    Stacked positions ``q ∈ R^{2n}``, desired ``q_d`` from intended contact
+    poses.  With incidence ``B`` and Kronecker expansion ``B̄ = B ⊗ I₂``:
+
+        d = B̄ᵀ q ,   d_d = B̄ᵀ q_d
+        u = -k_f B̄ (d - d_d) - k_d B̄ B̄ᵀ q̇
+          = -k_f (L ⊗ I₂)(q - q_d) - k_d (L ⊗ I₂) q̇
+
+    Robots are ordered by boundary ``t_param`` so cycle neighbors are
+    geometrically adjacent.  The graph is rebuilt on the active (pushing)
+    subset each tick.
+    """
+
+    def __init__(
+        self,
+        names: List[str],
+        t_params: Dict[str, float],
+        *,
+        k_form: float = 0.25,
+        kd_form: float = 0.1,
+        max_speed: float = 0.04,
+        form_normal_scale: float = 0.0,
+        form_tangent_scale: float = 1.0,
+    ):
+        self.names = list(names)
+        self.t_params = {str(n): float(t_params[n]) for n in names}
+        self.k_form = float(k_form)
+        self.kd_form = float(kd_form)
+        self.max_speed = float(max_speed)
+        self.form_normal_scale = float(form_normal_scale)
+        self.form_tangent_scale = float(form_tangent_scale)
+
+    @staticmethod
+    def expanded_incidence(B: np.ndarray) -> np.ndarray:
+        """Kronecker expansion B̄ = B ⊗ I₂."""
+        return np.kron(np.asarray(B, dtype=float), np.eye(2, dtype=float))
+
+    def compute(
+        self,
+        names: Sequence[str],
+        positions: np.ndarray,
+        intended: np.ndarray,
+        velocities: Optional[np.ndarray] = None,
+        *,
+        in_contact: Optional[Sequence[bool]] = None,
+        normals_inward: Optional[np.ndarray] = None,
+        tangents: Optional[np.ndarray] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Return world-frame formation velocity for each active robot.
+
+        Parameters
+        ----------
+        names : sequence of robot names (active / pushing subset)
+        positions, intended : (n, 2)
+        velocities : (n, 2) optional, for Laplacian damping
+        in_contact, normals_inward, tangents : optional contact-frame projection
+        """
+        names = [str(n) for n in names]
+        n = len(names)
+        zeros = {nm: np.zeros(2, dtype=float) for nm in names}
+        if n < 2 or (self.k_form == 0.0 and self.kd_form == 0.0):
+            return zeros
+
+        order = np.argsort([self.t_params.get(nm, 0.0) for nm in names])
+        names_ord = [names[int(i)] for i in order]
+        q = np.asarray(positions, dtype=float).reshape(n, 2)[order].reshape(-1)
+        qd = np.asarray(intended, dtype=float).reshape(n, 2)[order].reshape(-1)
+        B = cycle_incidence_matrix(n)
+        B_bar = self.expanded_incidence(B)
+        e = q - qd
+        u = -self.k_form * (B_bar @ (B_bar.T @ e))
+        if velocities is not None and self.kd_form != 0.0:
+            qdot = np.asarray(velocities, dtype=float).reshape(n, 2)[order].reshape(-1)
+            u = u - self.kd_form * (B_bar @ (B_bar.T @ qdot))
+        U = u.reshape(n, 2)
+
+        if normals_inward is not None and tangents is not None:
+            n_in = np.asarray(normals_inward, dtype=float).reshape(n, 2)[order]
+            tau = np.asarray(tangents, dtype=float).reshape(n, 2)[order]
+            ic = (
+                np.ones(n, dtype=bool)
+                if in_contact is None
+                else np.asarray(in_contact, dtype=bool)[order]
+            )
+            for i in range(n):
+                sn = self.form_normal_scale if ic[i] else 1.0
+                st = self.form_tangent_scale
+                u_n = float(np.dot(U[i], n_in[i]))
+                u_t = float(np.dot(U[i], tau[i]))
+                U[i] = sn * u_n * n_in[i] + st * u_t * tau[i]
+
+        out: Dict[str, np.ndarray] = {}
+        for i, nm in enumerate(names_ord):
+            v = U[i]
+            sp = float(np.linalg.norm(v))
+            if sp > self.max_speed > 0.0:
+                v = v * (self.max_speed / sp)
+            out[nm] = v
+        for nm in names:
+            out.setdefault(nm, np.zeros(2, dtype=float))
+        return out
 
 
 class Phase7BetaVerDecouple:
@@ -89,13 +216,14 @@ class Phase7BetaVerDecouple:
     
     Control Structure:
     ------------------
-    1. Longitudinal Axis (v_x, contact frame): Controls pushing force (clamping) against inner normal
-       - v_along = v_along_ff + Kp_pos * error_along + PI_Velocity_Correction
-       - High priority: maintains contact via "Virtual Spring"
-    
-    2. Lateral Axis (v_y, contact frame): Governs lateral position along object's edge
-       - v_perp = v_perp_ff + Kp_perp * error_perp
-       - Prevents "slipping out" by matching object rotation
+    1. Longitudinal Axis (along +n_in):
+       - in contact: v_along = v_along_ff, but recede is gated by actual object motion
+         so robots do not run off a still object (that flipped the first twist)
+       - lost contact: v_along = clip(Kp e_along + k_recover e_along);
+         v_perp keeps v_perp_ff so the rotation field is not abandoned
+    2. Lateral Axis (along tangent):
+       - in contact: v_perp = v_perp_ff + Kp e_perp
+       - lost contact: v_perp = Kp e_perp
     
     3. Angular (ω): Manages robot orientation so force sensor/bumper points along normal
        - Standard heading control toward contact point
@@ -118,6 +246,17 @@ class Phase7BetaVerDecouple:
         t_param: float,
         desired_object_velocity: np.ndarray,
         desired_object_angular_velocity: float,
+        *,
+        apply_along_feedback: bool = True,
+        apply_along_pi: bool = False,
+        kd_along: float = 0.3,
+        kd_perp: float = 0.0,
+        k_recover: float = 1.2,
+        max_along_correction: float = 0.10,
+        kp_along: Optional[float] = None,
+        kp_perp: Optional[float] = None,
+        force_inward_sat: float = 25.0,
+        legacy_phase7: bool = False,
     ):
         """
         Parameters
@@ -157,15 +296,23 @@ class Phase7BetaVerDecouple:
         
         # Longitudinal Axis Controller (The "Cling" Controller)
         # Controls pushing force/clamping along normal_inward
-        self.kp_along = 2.5  # Position error gain along normal (Virtual Spring stiffness)
-        self.kp_vel_along = 1.0  # Velocity error proportional gain
+        self.kp_along = 2.0 if kp_along is None else float(kp_along)
+        self.kp_vel_along = 1.0  # Velocity error proportional gain (object-twist PI)
         self.ki_vel_along = 0.3  # Velocity error integral gain
         self.velocity_error_int_along = 0.0
         self.velocity_error_int_max_along = 0.8
+        self.apply_along_feedback = bool(apply_along_feedback)
+        self.apply_along_pi = bool(apply_along_pi)
+        self.kd_along = float(kd_along)
+        self.k_recover = float(k_recover)
+        self.max_along_correction = float(max_along_correction)
+        self.force_inward_sat = float(force_inward_sat)
+        self.legacy_phase7 = bool(legacy_phase7)
         
         # Lateral Axis Controller (The "Sliding" Controller)
         # Controls lateral position along object's edge (tangent direction)
-        self.kp_perp = 1.5  # Position error gain along tangent
+        self.kp_perp = 1.5 if kp_perp is None else float(kp_perp)
+        self.kd_perp = float(kd_perp)
         
         # Feed-forward gains (plant compensation)
         self.K_static = 0.03  # Static friction compensation
@@ -218,6 +365,59 @@ class Phase7BetaVerDecouple:
         v_cp_desired = R @ v_cp_desired_body
         
         return v_cp_desired
+
+    def _update_filtered_orientation(self, object_orientation: float) -> float:
+        if self.object_orientation_filtered is None:
+            self.object_orientation_filtered = float(object_orientation)
+        else:
+            self.object_orientation_filtered = (
+                self.orientation_filter_alpha * float(object_orientation)
+                + (1.0 - self.orientation_filter_alpha) * self.object_orientation_filtered
+            )
+        return float(self.object_orientation_filtered)
+
+    def compute_contact_geometry(
+        self,
+        robot_pos: np.ndarray,
+        object_pos: np.ndarray,
+        object_orientation: float,
+        *,
+        update_filter: bool = True,
+    ) -> Dict[str, Any]:
+        """Contact frame + intended pose at the assigned t_param (world)."""
+        if update_filter:
+            filtered_orientation = self._update_filtered_orientation(object_orientation)
+        else:
+            filtered_orientation = (
+                float(self.object_orientation_filtered)
+                if self.object_orientation_filtered is not None
+                else float(object_orientation)
+            )
+        cos_t = np.cos(filtered_orientation)
+        sin_t = np.sin(filtered_orientation)
+        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=float)
+        robot_pos = np.asarray(robot_pos, dtype=float)[:2]
+        object_pos = np.asarray(object_pos, dtype=float)[:2]
+        contact_point_world = R @ self.contact_point_body + object_pos
+        normal_outward_world = R @ self.normal_outward
+        normal_inward_world = -normal_outward_world
+        tangent_world = R @ self.tangent
+        intended_pos = (
+            contact_point_world
+            + ROBOT_RADIUS * normal_outward_world
+            - self.target_penetration * normal_inward_world
+        )
+        position_error = intended_pos - robot_pos
+        return {
+            "filtered_orientation": filtered_orientation,
+            "contact_point_world": contact_point_world,
+            "normal_outward_world": normal_outward_world,
+            "normal_inward_world": normal_inward_world,
+            "tangent_world": tangent_world,
+            "intended_pos": intended_pos,
+            "position_error": position_error,
+            "robot_pos": robot_pos,
+        }
     
     def compute_velocity(
         self,
@@ -231,22 +431,17 @@ class Phase7BetaVerDecouple:
         in_contact: bool,
         t: float = 0.0,
         record_history: bool = False,
-        robot: Optional[Any] = None,  # Robot object to get actual wheel velocities
+        robot: Optional[Any] = None,
+        robot_velocity: Optional[np.ndarray] = None,
+        formation_velocity: Optional[np.ndarray] = None,
+        geometry: Optional[Dict[str, Any]] = None,
     ) -> np.ndarray:
-        """Compute velocity command using Tripartite Decoupled Structure.
-        
-        Control Law:
-        ------------
-        In Contact Frame (C_i):
-            v_along = v_along_ff + Kp_along * error_along + PI_velocity_correction
-            v_perp  = v_perp_ff  + Kp_perp * error_perp
-            ω       = Kp_heading * heading_error
-        
-        Where:
-            - v_along_ff: Feed-forward along normal (from desired contact point velocity)
-            - v_perp_ff:  Feed-forward along tangent (from desired contact point velocity)
-            - error_along: Position error along normal (with target penetration)
-            - error_perp:  Position error along tangent
+        """Contact-frame FF + position/damping feedback, plus optional formation.
+
+        Control law in contact frame C_i = (n_in, tau):
+            v_along = v_along_ff + clip(Kp e_along + Kd (v_ff - v_robot) [+ recover])
+            v_perp  = v_perp_ff  + Kp e_perp + Kd (v_ff - v_robot)
+        then add world-frame formation velocity (incidence / Kronecker term).
         """
         # Apply hysteresis-based contact detection
         if self.in_contact_prev:
@@ -256,30 +451,18 @@ class Phase7BetaVerDecouple:
         
         self.in_contact_prev = in_contact_hyst
         in_contact = in_contact_hyst
-        
-        # Filter object orientation to reduce swiggling
-        if self.object_orientation_filtered is None:
-            self.object_orientation_filtered = object_orientation
-        else:
-            self.object_orientation_filtered = (
-                self.orientation_filter_alpha * object_orientation +
-                (1 - self.orientation_filter_alpha) * self.object_orientation_filtered
+
+        if geometry is None:
+            geometry = self.compute_contact_geometry(
+                robot_pos, object_pos, object_orientation, update_filter=True
             )
-        
-        filtered_orientation = self.object_orientation_filtered
-        
-        # Contact point & frame vectors in world (using filtered orientation)
-        cos_t = np.cos(filtered_orientation)
-        sin_t = np.sin(filtered_orientation)
-        R = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
-        contact_point_world = R @ self.contact_point_body + object_pos
-        normal_outward_world = R @ self.normal_outward
-        normal_inward_world = -normal_outward_world
-        tangent_world = R @ self.tangent
-        
-        # Intended position: contact point + robot_radius * normal_outward - target_penetration * normal_inward
-        # The target_penetration creates a "Virtual Spring" that maintains clamping pressure
-        intended_pos = contact_point_world + ROBOT_RADIUS * normal_outward_world - self.target_penetration * normal_inward_world
+        filtered_orientation = geometry["filtered_orientation"]
+        contact_point_world = geometry["contact_point_world"]
+        normal_outward_world = geometry["normal_outward_world"]
+        normal_inward_world = geometry["normal_inward_world"]
+        tangent_world = geometry["tangent_world"]
+        intended_pos = geometry["intended_pos"]
+        robot_pos = np.asarray(geometry["robot_pos"], dtype=float)[:2]
         position_error = intended_pos - robot_pos
         
         # Heading control: point toward contact point
@@ -308,22 +491,35 @@ class Phase7BetaVerDecouple:
         # STEP 2: Decompose position error in contact frame
         error_along = np.dot(position_error, normal_inward_world)  # Error along normal (longitudinal)
         error_perp = np.dot(position_error, tangent_world)         # Error along tangent (lateral)
+
+        robot_vel_xy = np.zeros(2, dtype=float)
+        if robot_velocity is not None:
+            robot_vel_xy = np.asarray(robot_velocity, dtype=float).reshape(-1)[:2]
+        elif robot is not None and hasattr(robot, "get_state"):
+            try:
+                robot_vel_xy = np.asarray(robot.get_state()[2], dtype=float).reshape(-1)[:2]
+            except Exception:
+                robot_vel_xy = np.zeros(2, dtype=float)
+        v_robot_along = float(np.dot(robot_vel_xy, normal_inward_world))
+        v_robot_perp = float(np.dot(robot_vel_xy, tangent_world))
         
         # STEP 3: Longitudinal Axis Controller (The "Cling" Controller)
         # Virtual Spring: maintains constant clamping pressure via position error
         v_along_pos = self.kp_along * error_along
+        v_along_damp = self.kd_along * (v_along_ff - v_robot_along)
+        if float(error_along) > 0.0 and v_along_damp < 0.0:
+            v_along_damp = 0.0
+        v_along_recover = 0.0
+        if (not in_contact) and float(error_along) > 0.02:
+            v_along_recover = self.k_recover * float(error_along)
         
-        # Velocity error along normal (for PI correction)
-        # Actual contact point velocity
         r_cp = contact_point_world - object_pos
         v_rotation = object_angular_velocity * np.array([-r_cp[1], r_cp[0]])
         contact_point_velocity = object_velocity + v_rotation
         
-        # Project actual velocity onto normal
         v_along_actual = np.dot(contact_point_velocity, normal_inward_world)
         velocity_error_along = v_along_actual - v_along_ff
         
-        # PI control on velocity error along normal
         if in_contact:
             self.velocity_error_int_along += velocity_error_along * self.dt_ctrl
             self.velocity_error_int_along = np.clip(
@@ -332,31 +528,48 @@ class Phase7BetaVerDecouple:
                 self.velocity_error_int_max_along
             )
         else:
-            # Decay integral when not in contact
             self.velocity_error_int_along *= self.integral_decay_rate
         
         v_along_pi = self.kp_vel_along * velocity_error_along + self.ki_vel_along * self.velocity_error_int_along
-        
-        # Total longitudinal velocity (feed-forward + position correction + PI)
-        # v_along = v_along_ff + v_along_pos + v_along_pi
-        v_along = v_along_ff
-        v_along = np.clip(v_along, -self.max_along_speed, self.max_along_speed)
-        
-        # STEP 4: Lateral Axis Controller (The "Sliding" Controller)
-        # Simple proportional control along tangent to prevent "slipping out"
         v_perp_pos = self.kp_perp * error_perp
-        
-        # Total lateral velocity (feed-forward + position correction)
-        # v_perp = v_perp_ff + v_perp_pos
-        v_perp = v_perp_ff * 1 + v_perp_pos
+        v_perp_damp = self.kd_perp * (v_perp_ff - v_robot_perp)
+        twist_idle = (
+            float(np.linalg.norm(np.asarray(self.desired_object_velocity, dtype=float)[:2])) < 1e-4
+            and abs(float(self.desired_object_angular_velocity)) < 1e-4
+        )
 
-        v_perp = np.clip(v_perp, -self.max_perp_speed, self.max_perp_speed)
+        if self.legacy_phase7:
+            # Exact old-style law: along = FF only; perp = FF + P. No extra terms.
+            v_along = float(np.clip(v_along_ff, -self.max_along_speed, self.max_along_speed))
+            v_perp = float(np.clip(v_perp_ff + v_perp_pos, -self.max_perp_speed, self.max_perp_speed))
+        elif in_contact:
+            if twist_idle:
+                v_along = 0.0
+                v_perp = 0.0
+            else:
+                # Same signs as n=4: follow the planned contact-point twist.
+                v_along = float(v_along_ff)
+                v_perp = float(v_perp_ff + v_perp_pos)
+            v_along = float(np.clip(v_along, -self.max_along_speed, self.max_along_speed))
+            v_perp = float(np.clip(v_perp, -self.max_perp_speed, self.max_perp_speed))
+        else:
+            v_along_corr = 0.0
+            if self.apply_along_feedback:
+                v_along_corr = v_along_pos + v_along_recover
+            v_along = float(np.clip(v_along_corr, -0.08, 0.08))
+            if twist_idle:
+                v_perp = float(np.clip(v_perp_pos, -self.max_perp_speed, self.max_perp_speed))
+            else:
+                v_perp = float(np.clip(
+                    v_perp_ff + v_perp_pos, -self.max_perp_speed, self.max_perp_speed
+                ))
         
-        # STEP 5: Transform from contact frame to world frame
-        # v_along is along normal_inward, v_perp is along tangent
         vel_cmd_xy = v_along * normal_inward_world + v_perp * tangent_world
+        form_vel = np.zeros(2, dtype=float)
+        if (not self.legacy_phase7) and formation_velocity is not None:
+            form_vel = np.asarray(formation_velocity, dtype=float).reshape(-1)[:2]
+            vel_cmd_xy = vel_cmd_xy + form_vel
         
-        # Clamp total speed
         speed = np.linalg.norm(vel_cmd_xy)
         if speed > self.max_linear_speed:
             vel_cmd_xy = vel_cmd_xy * (self.max_linear_speed / speed)
@@ -405,6 +618,11 @@ class Phase7BetaVerDecouple:
             self.history.v_ff_history.append(np.linalg.norm([v_along_ff, v_perp_ff]))  # Feed-forward magnitude
             self.history.v_pi_history.append(v_along_pi)  # PI correction
             self.history.desired_contact_point_speeds.append(desired_contact_point_speed)
+            self.history.error_along_history.append(float(error_along))
+            self.history.error_perp_history.append(float(error_perp))
+            self.history.v_along_pos_history.append(float(v_along_pos))
+            self.history.v_along_damp_history.append(float(v_along_damp))
+            self.history.v_form_history.append(form_vel.copy())
             # Store actual wheel velocities (or None if not available)
             if actual_wheel_vels is not None:
                 self.history.wheel_velocities.append(actual_wheel_vels.copy())
